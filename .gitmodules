@@ -1,0 +1,9 @@
+[submodule "mobile"]
+	path = mobile
+	url = https://github.com/SeGo-vn/sego-mobile.git
+[submodule "be"]
+	path = be
+	url = https://github.com/SeGo-vn/sego-be.git
+[submodule "fe"]
+	path = fe
+	url = https://github.com/SeGo-vn/sego-fe.git
