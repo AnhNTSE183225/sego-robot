@@ -1,13 +1,25 @@
+import math
+import queue
 import serial
 import threading
 import time
-import math
-import queue
+
+try:
+    from rplidar import RPLidar, RPLidarException
+except ImportError:
+    print("Error: RPLidar library not found. Install with 'pip install rplidar-roboticia'.")
+    RPLidar = None
+
+    class RPLidarException(Exception):
+        pass
 
 
 # Serial configuration
 SERIAL_PORT = '/dev/ttyAMA0'
 BAUD_RATE = 115200
+
+# LIDAR configuration
+LIDAR_PORT = '/dev/ttyUSB0'
 
 # Motion tolerances
 DISTANCE_TOLERANCE_M = 0.02
@@ -20,12 +32,34 @@ ROTATE_TIMEOUT_SEC = 15.0
 # Movement mode: True -> use axis-aligned L-shape moves (X then Y)
 AXIS_ALIGNED_MOVES = True
 
+# Obstacle avoidance parameters
+MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
+CLEARANCE_MARGIN_M = 0.05          # Buffer added to the intended step distance
+OBSTACLE_STOP_DISTANCE_M = 0.45    # Anything closer than this in the corridor blocks motion
+OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
+FORWARD_SCAN_ANGLE_DEG = 50.0      # Width of the forward corridor to check
+DETOUR_SCAN_ANGLE_DEG = 80.0       # Wider cone used when looking for alternate headings
+DETOUR_ANGLE_STEP_DEG = 15.0       # Angular resolution when sampling detour headings
+DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn for a detour
+BLOCKED_RETRY_WAIT_SEC = 0.4
+MAX_BLOCKED_RETRIES = 25
+
+
+def normalize_angle_deg(angle):
+    """Wrap an angle in degrees to [-180, 180]."""
+    while angle > 180.0:
+        angle -= 360.0
+    while angle < -180.0:
+        angle += 360.0
+    return angle
+
 
 class OdomOnlyNavigator:
     """
-    Minimal navigator that relies purely on STM32 odometry.
-    Accepts (x, y) goals in meters, rotates toward the goal, and drives straight.
+    Navigator that relies on STM32 odometry but uses an RPLidar for real-time
+    obstacle detection and on-the-fly detours.
     """
+
     def __init__(self):
         self.serial_conn = None
         self.odom_thread = None
@@ -39,9 +73,21 @@ class OdomOnlyNavigator:
         }
         self.response_queue = queue.Queue()
 
+        # LIDAR state
+        self.lidar = None
+        self.lidar_thread = None
+        self.lidar_running = False
+        self.scan_lock = threading.Lock()
+        self.latest_scan = []
+        self.first_scan_event = threading.Event()
+
     # --- Connection management ---
     def _connect(self):
-        print("Connecting to STM32 controller...")
+        if RPLidar is None:
+            print("RPLidar dependency missing; cannot perform obstacle avoidance.")
+            return False
+
+        print("Connecting to STM32 controller and RPLidar...")
         try:
             self.serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
             time.sleep(1.0)
@@ -49,16 +95,45 @@ class OdomOnlyNavigator:
             print(f"Error opening {SERIAL_PORT}: {exc}")
             return False
 
+        try:
+            self.lidar = RPLidar(LIDAR_PORT)
+            self.lidar.start_motor()
+            self._start_lidar_listener()
+        except RPLidarException as exc:
+            print(f"Error connecting to LIDAR on {LIDAR_PORT}: {exc}")
+            self._safe_close_serial()
+            return False
+
         self._start_odometry_listener()
         self._send_raw_command("RESET_ODOM")
+
+        # Give the scanner a moment to deliver its first frames
+        if not self.first_scan_event.wait(timeout=3.0):
+            print("Warning: no LIDAR data received yet; motion will pause until scans arrive.")
+
         print("Connected. Odometry reset to (0,0,0).")
         return True
+
+    def _safe_close_serial(self):
+        if self.serial_conn and self.serial_conn.is_open:
+            try:
+                self.serial_conn.close()
+            except Exception:
+                pass
 
     def _disconnect(self):
         print("Disconnecting...")
         self._stop_odometry_listener()
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
+        self._stop_lidar_listener()
+        if self.lidar:
+            try:
+                self.lidar.stop()
+                self.lidar.stop_motor()
+                self.lidar.disconnect()
+            except Exception:
+                pass
+            self.lidar = None
+        self._safe_close_serial()
         print("Disconnected.")
 
     # --- Odometry reading ---
@@ -90,7 +165,6 @@ class OdomOnlyNavigator:
                 with self.pose_lock:
                     self.latest_pose.update(pose)
             else:
-                # Show MCU responses (OK, TARGET_REACHED, etc.)
                 if line:
                     print(f"[STM32] {line}")
                     self.response_queue.put(line.strip())
@@ -111,6 +185,42 @@ class OdomOnlyNavigator:
     def _get_pose(self):
         with self.pose_lock:
             return dict(self.latest_pose)
+
+    # --- LIDAR reading ---
+    def _start_lidar_listener(self):
+        if self.lidar_running or not self.lidar:
+            return
+        self.lidar_running = True
+        self.lidar_thread = threading.Thread(target=self._lidar_reader_loop, daemon=True)
+        self.lidar_thread.start()
+
+    def _stop_lidar_listener(self):
+        self.lidar_running = False
+        if self.lidar_thread:
+            self.lidar_thread.join(timeout=2.0)
+            self.lidar_thread = None
+
+    def _lidar_reader_loop(self):
+        while self.lidar_running and self.lidar:
+            try:
+                for scan in self.lidar.iter_scans(scan_type='express'):
+                    if not self.lidar_running:
+                        break
+                    with self.scan_lock:
+                        self.latest_scan = scan
+                    if not self.first_scan_event.is_set():
+                        self.first_scan_event.set()
+            except RPLidarException as exc:
+                print(f"LIDAR read error: {exc}")
+                time.sleep(0.5)
+            except Exception as exc:
+                print(f"Unexpected LIDAR error: {exc}")
+                time.sleep(0.5)
+        self.lidar_running = False
+
+    def _get_scan_snapshot(self):
+        with self.scan_lock:
+            return list(self.latest_scan)
 
     # --- Command helpers ---
     def _send_raw_command(self, text):
@@ -187,69 +297,138 @@ class OdomOnlyNavigator:
         print("Warning: move timeout with no MCU response.")
         return False
 
+    # --- Obstacle awareness helpers ---
+    def _heading_clearance(self, heading_world_deg, pose_heading_deg, fov_deg, max_range_m=None):
+        """
+        Returns the closest obstacle distance (meters) inside a wedge centered on heading_world_deg.
+        heading_world_deg and pose_heading_deg are expressed in the odom/world frame.
+        """
+        scan = self._get_scan_snapshot()
+        if not scan:
+            return 0.0  # Fail-safe: treat unknown as blocked to avoid blind driving
+
+        relative_heading = normalize_angle_deg(heading_world_deg - pose_heading_deg)
+        half_fov = fov_deg / 2.0
+        min_dist = math.inf
+
+        for _, angle_deg, distance_mm in scan:
+            if distance_mm <= 0:
+                continue
+            angle_diff = normalize_angle_deg(angle_deg - relative_heading)
+            if abs(angle_diff) > half_fov:
+                continue
+            distance_m = distance_mm / 1000.0
+            if max_range_m is not None and distance_m > max_range_m:
+                distance_m = max_range_m
+            if distance_m < min_dist:
+                min_dist = distance_m
+
+        return min_dist
+
+    def _choose_heading_with_avoidance(self, desired_heading_world, step_distance):
+        """Pick a heading that is both safe (clear corridor) and still progresses toward the goal."""
+        pose_heading_deg = math.degrees(self._get_pose()['theta'])
+        required_clearance = max(step_distance + CLEARANCE_MARGIN_M, OBSTACLE_STOP_DISTANCE_M)
+
+        forward_clear = self._heading_clearance(
+            desired_heading_world, pose_heading_deg, FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
+        )
+        if forward_clear >= required_clearance:
+            return desired_heading_world
+
+        offsets = [0.0]
+        angle = DETOUR_ANGLE_STEP_DEG
+        while angle <= DETOUR_MAX_ANGLE_DEG:
+            offsets.extend([angle, -angle])
+            angle += DETOUR_ANGLE_STEP_DEG
+
+        best_heading = None
+        best_score = -math.inf
+
+        for offset in offsets:
+            candidate_world = normalize_angle_deg(desired_heading_world + offset)
+            clearance = self._heading_clearance(
+                candidate_world, pose_heading_deg, DETOUR_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
+            )
+            progress = max(0.0, math.cos(math.radians(offset)))  # Penalize turns that face away from goal
+
+            if clearance < required_clearance or progress <= 0.0:
+                continue
+
+            score = clearance * progress
+            if score > best_score:
+                best_score = score
+                best_heading = candidate_world
+
+        return best_heading
+
+    def _rotate_to_heading(self, target_heading_world):
+        pose = self._get_pose()
+        current_heading = math.degrees(pose['theta'])
+        rotate_angle = normalize_angle_deg(target_heading_world - current_heading)
+        return self._send_rotate(rotate_angle)
+
+    def _drive_step(self, desired_heading_world, step_distance):
+        attempts = 0
+        while attempts <= MAX_BLOCKED_RETRIES:
+            if not self.first_scan_event.is_set():
+                print("Waiting for first LIDAR scan before moving...")
+                self.first_scan_event.wait(timeout=1.0)
+                attempts += 1
+                continue
+
+            chosen_heading = self._choose_heading_with_avoidance(desired_heading_world, step_distance)
+            if chosen_heading is None:
+                attempts += 1
+                print("Path blocked; waiting for an opening...")
+                time.sleep(BLOCKED_RETRY_WAIT_SEC)
+                continue
+
+            if not self._rotate_to_heading(chosen_heading):
+                return False
+            if not self._send_move(step_distance):
+                return False
+            return True
+
+        print("Path remained blocked after multiple retries.")
+        return False
+
     # --- Navigation logic ---
     def navigate_to(self, goal):
-        pose = self._get_pose()
-        dx = goal[0] - pose['x']
-        dy = goal[1] - pose['y']
-        distance = math.hypot(dx, dy)
-        if distance < DISTANCE_TOLERANCE_M:
-            print("Already at goal.")
-            return
+        if not self.first_scan_event.is_set():
+            print("Waiting for initial LIDAR data...")
+            self.first_scan_event.wait(timeout=3.0)
 
-        if AXIS_ALIGNED_MOVES:
-            self._navigate_axis_aligned(goal)
-        else:
-            self._navigate_direct(dx, dy)
-
-    def _navigate_direct(self, dx, dy):
-        pose = self._get_pose()
-        target_heading = math.degrees(math.atan2(dy, dx))
-        current_heading = math.degrees(pose['theta'])
-        rotate_angle = target_heading - current_heading
-        rotate_angle = ((rotate_angle + 180) % 360) - 180
-        distance = math.hypot(dx, dy)
-
-        if not self._send_rotate(rotate_angle):
-            print("Rotation failed; aborting.")
-            return
-        if not self._send_move(distance):
-            print("Move failed; aborting.")
-            return
-        final_pose = self._get_pose()
-        print(f"Goal reached. Pose≈({final_pose['x']:.2f}, {final_pose['y']:.2f}, {math.degrees(final_pose['theta']):.1f}°)")
-
-    def _navigate_axis_aligned(self, goal):
-        pose = self._get_pose()
-        # Move in X first
-        remaining_x = goal[0] - pose['x']
-        if abs(remaining_x) >= DISTANCE_TOLERANCE_M:
-            target_heading = 0.0 if remaining_x >= 0 else 180.0
-            current_heading = math.degrees(pose['theta'])
-            rotate_angle = target_heading - current_heading
-            rotate_angle = ((rotate_angle + 180) % 360) - 180
-            if not self._send_rotate(rotate_angle):
-                print("Rotation failed; aborting.")
-                return
-            if not self._send_move(abs(remaining_x)):
-                print("Move failed; aborting.")
-                return
+        while True:
             pose = self._get_pose()
-        # Move in Y second
-        remaining_y = goal[1] - pose['y']
-        if abs(remaining_y) >= DISTANCE_TOLERANCE_M:
-            target_heading = 90.0 if remaining_y >= 0 else -90.0
-            current_heading = math.degrees(pose['theta'])
-            rotate_angle = target_heading - current_heading
-            rotate_angle = ((rotate_angle + 180) % 360) - 180
-            if not self._send_rotate(rotate_angle):
-                print("Rotation failed; aborting.")
+            dx = goal[0] - pose['x']
+            dy = goal[1] - pose['y']
+            distance = math.hypot(dx, dy)
+            if distance < DISTANCE_TOLERANCE_M:
+                print("Goal reached.")
+                final_pose = self._get_pose()
+                print(
+                    f"Pose=({final_pose['x']:.2f}, {final_pose['y']:.2f}, "
+                    f"{math.degrees(final_pose['theta']):.1f} deg)"
+                )
                 return
-            if not self._send_move(abs(remaining_y)):
-                print("Move failed; aborting.")
+
+            if AXIS_ALIGNED_MOVES and abs(dx) >= DISTANCE_TOLERANCE_M:
+                desired_heading = 0.0 if dx >= 0 else 180.0
+                step_distance = min(MOVE_STEP_M, abs(dx))
+            elif AXIS_ALIGNED_MOVES:
+                desired_heading = 90.0 if dy >= 0 else -90.0
+                step_distance = min(MOVE_STEP_M, abs(dy))
+            else:
+                desired_heading = math.degrees(math.atan2(dy, dx))
+                step_distance = min(MOVE_STEP_M, distance)
+
+            if step_distance < DISTANCE_TOLERANCE_M:
+                continue
+
+            if not self._drive_step(desired_heading, step_distance):
+                print("Navigation aborted due to repeated blockages or command errors.")
                 return
-        final_pose = self._get_pose()
-        print(f"Goal reached. Pose≈({final_pose['x']:.2f}, {final_pose['y']:.2f}, {math.degrees(final_pose['theta']):.1f}°)")
 
     # --- CLI loop ---
     def run(self):

@@ -7,3 +7,6 @@
 [submodule "fe"]
 	path = fe
 	url = https://github.com/SeGo-vn/sego-fe.git
+[submodule "robot"]
+	path = robot
+	url = https://github.com/SeGo-vn/sego-robot-stm32-blue-pill.git
