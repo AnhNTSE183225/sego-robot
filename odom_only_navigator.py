@@ -1,8 +1,11 @@
+import json
 import math
+import os
 import queue
 import serial
 import threading
 import time
+from typing import Optional
 
 try:
     from rplidar import RPLidar, RPLidarException
@@ -13,6 +16,15 @@ except ImportError:
     class RPLidarException(Exception):
         pass
 
+try:
+    from confluent_kafka import Consumer, Producer, KafkaException
+except ImportError:
+    Consumer = None
+    Producer = None
+    KafkaException = Exception
+
+from odom_kafka_bridge import KafkaBridge
+
 
 # Serial configuration
 SERIAL_PORT = '/dev/ttyAMA0'
@@ -20,6 +32,14 @@ BAUD_RATE = 115200
 
 # LIDAR configuration
 LIDAR_PORT = '/dev/ttyUSB0'
+
+# Kafka configuration (shared topics)
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_TOPIC_COMMAND = os.environ.get("KAFKA_TOPIC_COMMAND", "robot.cmd")
+KAFKA_TOPIC_TELEMETRY = os.environ.get("KAFKA_TOPIC_TELEMETRY", "robot.telemetry")
+KAFKA_TOPIC_MAP = os.environ.get("KAFKA_TOPIC_MAP", "robot.map")
+KAFKA_TOPIC_EVENTS = os.environ.get("KAFKA_TOPIC_EVENTS", "robot.events")
+ROBOT_ID = os.environ.get("ROBOT_ID")
 
 # Motion tolerances
 DISTANCE_TOLERANCE_M = 0.02
@@ -80,6 +100,12 @@ class OdomOnlyNavigator:
         self.scan_lock = threading.Lock()
         self.latest_scan = []
         self.first_scan_event = threading.Event()
+
+        # Kafka
+        self.kafka_bridge = None
+        self.command_queue = queue.Queue()
+        self.map_definition = None
+        self.map_definition_correlation = None
 
     # --- Connection management ---
     def _connect(self):
@@ -325,7 +351,7 @@ class OdomOnlyNavigator:
 
         return min_dist
 
-    def _choose_heading_with_avoidance(self, desired_heading_world, step_distance):
+    def _choose_heading_with_avoidance(self, desired_heading_world, step_distance, allow_detour=True):
         """Pick a heading that is both safe (clear corridor) and still progresses toward the goal."""
         pose_heading_deg = math.degrees(self._get_pose()['theta'])
         required_clearance = max(step_distance + CLEARANCE_MARGIN_M, OBSTACLE_STOP_DISTANCE_M)
@@ -335,6 +361,9 @@ class OdomOnlyNavigator:
         )
         if forward_clear >= required_clearance:
             return desired_heading_world
+
+        if not allow_detour:
+            return None
 
         offsets = [0.0]
         angle = DETOUR_ANGLE_STEP_DEG
@@ -368,7 +397,7 @@ class OdomOnlyNavigator:
         rotate_angle = normalize_angle_deg(target_heading_world - current_heading)
         return self._send_rotate(rotate_angle)
 
-    def _drive_step(self, desired_heading_world, step_distance):
+    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True):
         attempts = 0
         while attempts <= MAX_BLOCKED_RETRIES:
             if not self.first_scan_event.is_set():
@@ -377,8 +406,11 @@ class OdomOnlyNavigator:
                 attempts += 1
                 continue
 
-            chosen_heading = self._choose_heading_with_avoidance(desired_heading_world, step_distance)
+            chosen_heading = self._choose_heading_with_avoidance(desired_heading_world, step_distance, allow_detour)
             if chosen_heading is None:
+                if not allow_detour:
+                    print("Path blocked during verification; aborting.")
+                    return False
                 attempts += 1
                 print("Path blocked; waiting for an opening...")
                 time.sleep(BLOCKED_RETRY_WAIT_SEC)
@@ -394,7 +426,7 @@ class OdomOnlyNavigator:
         return False
 
     # --- Navigation logic ---
-    def navigate_to(self, goal):
+    def navigate_to(self, goal, allow_detour=True):
         if not self.first_scan_event.is_set():
             print("Waiting for initial LIDAR data...")
             self.first_scan_event.wait(timeout=3.0)
@@ -426,7 +458,7 @@ class OdomOnlyNavigator:
             if step_distance < DISTANCE_TOLERANCE_M:
                 continue
 
-            if not self._drive_step(desired_heading, step_distance):
+            if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour):
                 print("Navigation aborted due to repeated blockages or command errors.")
                 return
 
@@ -434,23 +466,200 @@ class OdomOnlyNavigator:
     def run(self):
         if not self._connect():
             return
+
+        # Start Kafka bridge if configured
+        if ROBOT_ID and Producer and Consumer:
+            topics = {
+                "command": KAFKA_TOPIC_COMMAND,
+                "telemetry": KAFKA_TOPIC_TELEMETRY,
+                "map": KAFKA_TOPIC_MAP,
+                "events": KAFKA_TOPIC_EVENTS,
+            }
+            self.kafka_bridge = KafkaBridge(
+                robot_id=ROBOT_ID,
+                bootstrap=KAFKA_BOOTSTRAP_SERVERS,
+                topics=topics,
+                on_command=self._handle_kafka_command,
+                on_map_def=self._handle_kafka_map_def,
+                logger=lambda msg: print(f"[Kafka] {msg}")
+            )
+            self.kafka_bridge.start()
+        else:
+            if not ROBOT_ID:
+                print("ROBOT_ID not set; Kafka bridge disabled.")
+
         try:
-            while True:
-                try:
-                    entry = input("Enter goal 'x,y' in meters (or 'q' to quit): ").strip()
-                except EOFError:
-                    break
-                if entry.lower() in ('q', 'quit', 'exit'):
-                    break
-                try:
-                    x_str, y_str = entry.split(',')
-                    goal = (float(x_str), float(y_str))
-                except ValueError:
-                    print("Invalid format. Use x,y (e.g., 0.5,-0.2).")
-                    continue
-                self.navigate_to(goal)
+            if self.kafka_bridge:
+                # Kafka-driven loop
+                while True:
+                    try:
+                        cmd = self.command_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    self._execute_command(cmd)
+            else:
+                # CLI fallback
+                while True:
+                    try:
+                        entry = input("Enter goal 'x,y' in meters (or 'q' to quit): ").strip()
+                    except EOFError:
+                        break
+                    if entry.lower() in ('q', 'quit', 'exit'):
+                        break
+                    try:
+                        x_str, y_str = entry.split(',')
+                        goal = (float(x_str), float(y_str))
+                    except ValueError:
+                        print("Invalid format. Use x,y (e.g., 0.5,-0.2).")
+                        continue
+                    self.navigate_to(goal)
         finally:
+            if self.kafka_bridge:
+                self.kafka_bridge.stop()
             self._disconnect()
+
+    # --- Kafka command handlers ---
+    def _handle_kafka_command(self, envelope):
+        self.command_queue.put(envelope)
+
+    def _handle_kafka_map_def(self, envelope):
+        self.map_definition = envelope.get("payload")
+        self.map_definition_correlation = envelope.get("correlationId")
+        print(f"Map definition received: mapId={self.map_definition.get('mapId') if self.map_definition else 'unknown'}")
+
+    def _execute_command(self, envelope):
+        payload = envelope.get("payload") or {}
+        cmd = (payload.get("command") or "").lower()
+        correlation_id = envelope.get("correlationId")
+        if cmd == "navigate_to_xy":
+            args = payload.get("args") or {}
+            x = args.get("x")
+            y = args.get("y")
+            if x is None or y is None:
+                self._send_ack(correlation_id, cmd, False, "Missing x,y")
+                return
+            try:
+                self.navigate_to((float(x), float(y)))
+                self._send_ack(correlation_id, cmd, True, None)
+                self._send_status()
+            except Exception as exc:
+                self._send_ack(correlation_id, cmd, False, str(exc))
+        elif cmd == "perimeter_validate":
+            ok, reason = self._verify_perimeter()
+            self._send_ack(correlation_id, cmd, ok, reason)
+        elif cmd == "navigate_to_poi":
+            args = payload.get("args") or {}
+            poi_id = args.get("poiId")
+            goal = self._find_poi(poi_id)
+            if goal is None:
+                self._send_ack(correlation_id, cmd, False, f"POI {poi_id} not found")
+                return
+            try:
+                self.navigate_to(goal)
+                self._send_ack(correlation_id, cmd, True, None)
+                self._send_status()
+            except Exception as exc:
+                self._send_ack(correlation_id, cmd, False, str(exc))
+        elif cmd in ("dock",):
+            dock = self._find_poi_by_category("dock")
+            if dock is None:
+                self._send_ack(correlation_id, cmd, False, "Dock POI not found")
+                return
+            try:
+                self.navigate_to(dock)
+                self._send_ack(correlation_id, cmd, True, None)
+                self._send_status()
+            except Exception as exc:
+                self._send_ack(correlation_id, cmd, False, str(exc))
+        elif cmd in ("stop", "pause"):
+            # Basic stop: send zero move; could be enhanced with motor stop command if available
+            self._send_raw_command("STOP")
+            self._send_ack(correlation_id, cmd, True, "Stopped")
+        elif cmd == "resume":
+            self._send_ack(correlation_id, cmd, True, "No-op resume")
+        elif cmd == "ping":
+            self._send_ack(correlation_id, cmd, True, "pong")
+        else:
+            self._send_ack(correlation_id, cmd, False, "Unsupported command")
+
+    def _send_ack(self, correlation_id, command, ok, note=None):
+        if self.kafka_bridge:
+            self.kafka_bridge.send_ack(correlation_id, command, ok, note)
+
+    def _send_status(self):
+        if not self.kafka_bridge:
+            return
+        pose = self._get_pose()
+        payload = {
+            "pose": {"x": pose['x'], "y": pose['y'], "thetaDeg": math.degrees(pose['theta'])},
+            "state": "IDLE",
+        }
+        self.kafka_bridge.send_status(payload)
+
+    # --- Perimeter verification (no detours) ---
+    def _verify_perimeter(self):
+        if not self.map_definition:
+            print("No map loaded; cannot verify perimeter.")
+            if self.kafka_bridge:
+                self.kafka_bridge.send_map_verdict(self.map_definition_correlation, None, "INVALID", reason="NO_MAP")
+            return False, "No map"
+        boundary = (self.map_definition.get("boundary") or {}).get("points") or []
+        map_id = self.map_definition.get("mapId")
+        if len(boundary) < 2:
+            print("Map boundary invalid; cannot verify perimeter.")
+            if self.kafka_bridge:
+                self.kafka_bridge.send_map_verdict(self.map_definition_correlation, map_id, "INVALID", reason="INVALID_BOUNDARY")
+            return False, "Invalid boundary"
+
+        print("Starting perimeter verification...")
+        points = [(float(p["x"]), float(p["y"])) for p in boundary]
+        # Ensure closed loop
+        if points[0] != points[-1]:
+            points.append(points[0])
+
+        for idx, goal in enumerate(points[1:], start=1):
+            print(f"Verifying segment {idx}/{len(points)-1} -> {goal}")
+            success = self._navigate_segment(goal)
+            if not success:
+                print("Perimeter blocked; marking INVALID.")
+                if self.kafka_bridge:
+                    self.kafka_bridge.send_map_verdict(
+                        self.map_definition_correlation, map_id, "INVALID", reason="BLOCKED_PATH",
+                        details={"blockedAt": {"x": goal[0], "y": goal[1]}}
+                    )
+                return False, "Blocked path"
+
+        print("Perimeter verification complete: VALID.")
+        if self.kafka_bridge:
+            self.kafka_bridge.send_map_verdict(self.map_definition_correlation, map_id, "VALID", reason="CLEAR", details={})
+        return True, None
+
+    def _find_poi(self, poi_id):
+        if not self.map_definition:
+            return None
+        pois = self.map_definition.get("pointsOfInterest") or []
+        for poi in pois:
+            if poi.get("id") == poi_id:
+                return float(poi.get("x", 0)), float(poi.get("y", 0))
+        return None
+
+    def _find_poi_by_category(self, category):
+        if not self.map_definition:
+            return None
+        pois = self.map_definition.get("pointsOfInterest") or []
+        for poi in pois:
+            if str(poi.get("category", "")).lower() == category.lower():
+                return float(poi.get("x", 0)), float(poi.get("y", 0))
+        return None
+
+    def _navigate_segment(self, goal):
+        """Navigate to a goal without detours; fail if path blocked."""
+        try:
+            self.navigate_to(goal, allow_detour=False)
+            return True
+        except Exception as exc:
+            print(f"Segment navigation failed: {exc}")
+            return False
 
 
 if __name__ == '__main__':

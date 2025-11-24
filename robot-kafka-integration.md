@@ -2,6 +2,19 @@
 
 Shared-topic Kafka wiring and robot/backend behaviors for map definition, verification, and operation. All notes resolved; message shapes are minimal (no schemaVersion fields).
 
+### Progress Status (2025-11-24)
+- **Topic provisioning (dev/local/prod env files):** Implemented. `robot.cmd`, `robot.telemetry`, `robot.map`, `robot.events` are created in docker-compose.env-{dev,local,prod}. Base compose relies on overlays.
+- **Backend Kafka wiring:** Implemented in robot-automation. Producers/consumers added; config via `application.yml` and `KafkaConfig`. Pending: expose REST/service entry points to publish commands/map defs and persist map verdicts beyond logging.
+- **Robot Kafka wiring:** Implemented in `odom_only_navigator.py` + `odom_kafka_bridge.py`. Supports CMD, MAP_DEF, ACK/STATUS/HEARTBEAT, MAP_VERDICT; perimeter_validate and navigate_to_xy handled.
+- **Shared envelope/msgTypes:** Implemented as described (no schemaVersion).
+- **Perimeter verification behavior:** Implemented on robot: single lap, no detours; invalid if blocked; sends MAP_VERDICT.
+- **Command set:** navigate_to_xy, perimeter_validate implemented; others (navigate_to_poi/dock/stop/pause/resume/ping) not yet wired on robot/back end.
+- **Restricted areas:** Hard no-go concept noted; not yet enforced in planner code.
+- **Return-to-origin as POI:** Not yet implemented on robot.
+- **Odometry-only localization:** Current robot code uses odom + lidar avoidance; drift not mitigated.
+- **Kafka bootstrap envs:** Robot-automation now reads KAFKA_BOOTSTRAP_SERVERS; ensure correct value via compose overlay (kafka-local:9093).
+- **Health of services:** ai-receptionist noisy but runs; qdrant healthcheck fixed in env-local; robot-automation previously crashed on JsonDeserializer config—fixed by removing conflicting property/JSON settings in code.
+
 ### Topic Model (shared)
 - `robot.cmd` (backend → robots), key = `robotId`.
 - `robot.telemetry` (robots → backend), key = `robotId`.
