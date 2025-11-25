@@ -1,4 +1,5 @@
 import json
+import logging
 import threading
 import time
 
@@ -10,16 +11,19 @@ except ImportError:
     KafkaException = Exception
 
 
+DEFAULT_LOGGER = logging.getLogger("odom.kafka").info
+
+
 class KafkaBridge:
     """Lightweight Kafka helper: consume commands/map defs; publish telemetry/acks/map verdicts."""
 
-    def __init__(self, robot_id, bootstrap, topics, on_command, on_map_def, logger=print):
+    def __init__(self, robot_id, bootstrap, topics, on_command, on_map_def, logger=None):
         self.robot_id = robot_id
         self.bootstrap = bootstrap
         self.topics = topics
         self.on_command = on_command
         self.on_map_def = on_map_def
-        self.log = logger
+        self.log = logger or DEFAULT_LOGGER
 
         self.producer = None
         self.consumer = None
@@ -44,9 +48,13 @@ class KafkaBridge:
             "acks": "all",
         }
         try:
+            self.log(f"Kafka consumer config: group.id=robot-{self.robot_id}, bootstrap={self.bootstrap}")
             self.consumer = Consumer(consumer_conf)
             self.consumer.subscribe([self.topics["command"], self.topics["map"]])
             self.producer = Producer(producer_conf)
+            self.log(
+                f"Kafka producer config: client.id=robot-{self.robot_id}, bootstrap={self.bootstrap}, acks=all"
+            )
         except Exception as exc:
             self.log(f"Failed to start Kafka bridge: {exc}")
             return False
@@ -87,6 +95,7 @@ class KafkaBridge:
             "seq": seq or int(time.time() * 1000),
             "payload": payload or {},
         }
+        self.log(f"Kafka send {msg_type} to {topic} cid={envelope['correlationId']} seq={envelope['seq']}")
         try:
             self.producer.produce(topic, key=self.robot_id, value=json.dumps(envelope))
             self.producer.poll(0)
@@ -138,8 +147,10 @@ class KafkaBridge:
                 continue
             msg_type = (data.get("msgType") or "").upper()
             if msg_type == "CMD":
+                self.log(f"Kafka CMD received cid={data.get('correlationId')}")
                 self.on_command(data)
             elif msg_type == "MAP_DEF":
+                self.log(f"Kafka MAP_DEF received mapId={(data.get('payload') or {}).get('mapId')}")
                 self.on_map_def(data)
 
     def _heartbeat_loop(self):

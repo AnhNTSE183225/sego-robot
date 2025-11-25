@@ -1,16 +1,49 @@
 import json
+import logging
+import logging.handlers
 import math
 import os
 import queue
 import serial
+import sys
 import threading
 import time
 from typing import Optional
 
+LOG_FILE = os.environ.get("ROBOT_LOG_FILE", "robot.log")
+LOG_LEVEL = os.environ.get("ROBOT_LOG_LEVEL", "DEBUG").upper()
+
+
+def configure_logging():
+    """Configure console + rotating file logging for deep debugging."""
+    level = getattr(logging, LOG_LEVEL, logging.DEBUG)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    root = logging.getLogger()
+    if root.handlers:
+        root.handlers.clear()
+    root.setLevel(level)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(level)
+    console.setFormatter(formatter)
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
+    )
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+
+    root.addHandler(console)
+    root.addHandler(file_handler)
+
+
 try:
     from rplidar import RPLidar, RPLidarException
 except ImportError:
-    print("Error: RPLidar library not found. Install with 'pip install rplidar-roboticia'.")
+    logging.getLogger("odom.navigator").error(
+        "RPLidar library not found. Install with 'pip install rplidar-roboticia'."
+    )
     RPLidar = None
 
     class RPLidarException(Exception):
@@ -81,6 +114,7 @@ class OdomOnlyNavigator:
     """
 
     def __init__(self):
+        self.logger = logging.getLogger("odom.navigator")
         self.serial_conn = None
         self.odom_thread = None
         self.odom_running = False
@@ -112,15 +146,15 @@ class OdomOnlyNavigator:
     # --- Connection management ---
     def _connect(self):
         if RPLidar is None:
-            print("RPLidar dependency missing; cannot perform obstacle avoidance.")
+            self.logger.error("RPLidar dependency missing; cannot perform obstacle avoidance.")
             return False
 
-        print("Connecting to STM32 controller and RPLidar...")
+        self.logger.info("Connecting to STM32 controller and RPLidar...")
         try:
             self.serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
             time.sleep(1.0)
         except serial.SerialException as exc:
-            print(f"Error opening {SERIAL_PORT}: {exc}")
+            self.logger.error(f"Error opening {SERIAL_PORT}: {exc}")
             return False
 
         try:
@@ -128,7 +162,7 @@ class OdomOnlyNavigator:
             self.lidar.start_motor()
             self._start_lidar_listener()
         except RPLidarException as exc:
-            print(f"Error connecting to LIDAR on {LIDAR_PORT}: {exc}")
+            self.logger.error(f"Error connecting to LIDAR on {LIDAR_PORT}: {exc}")
             self._safe_close_serial()
             return False
 
@@ -137,9 +171,9 @@ class OdomOnlyNavigator:
 
         # Give the scanner a moment to deliver its first frames
         if not self.first_scan_event.wait(timeout=3.0):
-            print("Warning: no LIDAR data received yet; motion will pause until scans arrive.")
+            self.logger.warning("No LIDAR data received yet; motion will pause until scans arrive.")
 
-        print("Connected. Odometry reset to (0,0,0).")
+        self.logger.info("Connected. Odometry reset to (0,0,0).")
         return True
 
     def _safe_close_serial(self):
@@ -150,7 +184,7 @@ class OdomOnlyNavigator:
                 pass
 
     def _disconnect(self):
-        print("Disconnecting...")
+        self.logger.info("Disconnecting...")
         self._stop_odometry_listener()
         self._stop_lidar_listener()
         if self.lidar:
@@ -162,12 +196,13 @@ class OdomOnlyNavigator:
                 pass
             self.lidar = None
         self._safe_close_serial()
-        print("Disconnected.")
+        self.logger.info("Disconnected.")
 
     # --- Odometry reading ---
     def _start_odometry_listener(self):
         if self.odom_running:
             return
+        self.logger.debug("Starting odometry listener thread.")
         self.odom_running = True
         self.odom_thread = threading.Thread(target=self._odometry_reader_loop, daemon=True)
         self.odom_thread.start()
@@ -175,6 +210,7 @@ class OdomOnlyNavigator:
     def _stop_odometry_listener(self):
         self.odom_running = False
         if self.odom_thread:
+            self.logger.debug("Stopping odometry listener thread.")
             self.odom_thread.join(timeout=2.0)
             self.odom_thread = None
 
@@ -183,7 +219,7 @@ class OdomOnlyNavigator:
             try:
                 raw = self.serial_conn.readline()
             except serial.SerialException as exc:
-                print(f"Serial read error: {exc}")
+                self.logger.error(f"Serial read error: {exc}")
                 break
             if not raw:
                 continue
@@ -194,7 +230,7 @@ class OdomOnlyNavigator:
                     self.latest_pose.update(pose)
             else:
                 if line:
-                    print(f"[STM32] {line}")
+                    self.logger.info(f"[STM32] {line}")
                     self.response_queue.put(line.strip())
         self.odom_running = False
 
@@ -218,6 +254,7 @@ class OdomOnlyNavigator:
     def _start_lidar_listener(self):
         if self.lidar_running or not self.lidar:
             return
+        self.logger.debug("Starting LIDAR listener thread.")
         self.lidar_running = True
         self.lidar_thread = threading.Thread(target=self._lidar_reader_loop, daemon=True)
         self.lidar_thread.start()
@@ -225,6 +262,7 @@ class OdomOnlyNavigator:
     def _stop_lidar_listener(self):
         self.lidar_running = False
         if self.lidar_thread:
+            self.logger.debug("Stopping LIDAR listener thread.")
             self.lidar_thread.join(timeout=2.0)
             self.lidar_thread = None
 
@@ -239,10 +277,10 @@ class OdomOnlyNavigator:
                     if not self.first_scan_event.is_set():
                         self.first_scan_event.set()
             except RPLidarException as exc:
-                print(f"LIDAR read error: {exc}")
+                self.logger.warning(f"LIDAR read error: {exc}")
                 time.sleep(0.5)
             except Exception as exc:
-                print(f"Unexpected LIDAR error: {exc}")
+                self.logger.warning(f"Unexpected LIDAR error: {exc}")
                 time.sleep(0.5)
         self.lidar_running = False
 
@@ -286,7 +324,7 @@ class OdomOnlyNavigator:
         if abs(desired_angle_deg) < ANGLE_TOLERANCE_DEG:
             return True
         cmd = f"ROTATE_DEG {desired_angle_deg:.2f}"
-        print(f"ROTATE: {cmd}")
+        self.logger.info(f"ROTATE: {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
         result, line = self._wait_for_response(
@@ -298,18 +336,18 @@ class OdomOnlyNavigator:
             return True
         if result is False:
             if line and line.startswith("TIMEOUT"):
-                print("Rotation reported TIMEOUT but assuming success (motors idle).")
+                self.logger.warning("Rotation reported TIMEOUT but assuming success (motors idle).")
                 return True
-            print(f"Warning: rotation failed ({line}).")
+            self.logger.warning(f"Rotation failed ({line}).")
             return False
-        print("Warning: rotation timeout with no MCU response.")
+        self.logger.warning("Rotation timeout with no MCU response.")
         return False
 
     def _send_move(self, target_distance):
         if target_distance < DISTANCE_TOLERANCE_M:
             return True
         cmd = f"MOVE {target_distance:.3f}"
-        print(f"MOVE: {cmd}")
+        self.logger.info(f"MOVE: {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
         result, line = self._wait_for_response(
@@ -320,9 +358,9 @@ class OdomOnlyNavigator:
         if result:
             return True
         if result is False:
-            print(f"Warning: move failed ({line}).")
+            self.logger.warning(f"Move failed ({line}).")
             return False
-        print("Warning: move timeout with no MCU response.")
+        self.logger.warning("Move timeout with no MCU response.")
         return False
 
     # --- Obstacle awareness helpers ---
@@ -404,7 +442,7 @@ class OdomOnlyNavigator:
         start_point = current_pose if current_pose else (self._get_pose()['x'], self._get_pose()['y'])
         while attempts <= MAX_BLOCKED_RETRIES:
             if not self.first_scan_event.is_set():
-                print("Waiting for first LIDAR scan before moving...")
+                self.logger.info("Waiting for first LIDAR scan before moving...")
                 self.first_scan_event.wait(timeout=1.0)
                 attempts += 1
                 continue
@@ -412,10 +450,10 @@ class OdomOnlyNavigator:
             chosen_heading = self._choose_heading_with_avoidance(desired_heading_world, step_distance, allow_detour)
             if chosen_heading is None:
                 if not allow_detour:
-                    print("Path blocked during verification; aborting.")
+                    self.logger.warning("Path blocked during verification; aborting.")
                     return False
                 attempts += 1
-                print("Path blocked; waiting for an opening...")
+                self.logger.warning("Path blocked; waiting for an opening...")
                 time.sleep(BLOCKED_RETRY_WAIT_SEC)
                 continue
 
@@ -424,7 +462,7 @@ class OdomOnlyNavigator:
             end_point = (start_point[0] + dx, start_point[1] + dy)
             if allow_detour and self._segment_crosses_obstacles(start_point, end_point):
                 attempts += 1
-                print("Static obstacle blocks the segment; trying another heading...")
+                self.logger.warning("Static obstacle blocks the segment; trying another heading...")
                 time.sleep(BLOCKED_RETRY_WAIT_SEC)
                 continue
 
@@ -434,13 +472,13 @@ class OdomOnlyNavigator:
                 return False
             return True
 
-        print("Path remained blocked after multiple retries.")
+        self.logger.warning("Path remained blocked after multiple retries.")
         return False
 
     # --- Navigation logic ---
     def navigate_to(self, goal, allow_detour=True):
         if not self.first_scan_event.is_set():
-            print("Waiting for initial LIDAR data...")
+            self.logger.info("Waiting for initial LIDAR data...")
             self.first_scan_event.wait(timeout=3.0)
 
         if allow_detour and not self._goal_valid(goal):
@@ -452,11 +490,11 @@ class OdomOnlyNavigator:
             dy = goal[1] - pose['y']
             distance = math.hypot(dx, dy)
             if distance < DISTANCE_TOLERANCE_M:
-                print("Goal reached.")
+                self.logger.info("Goal reached.")
                 final_pose = self._get_pose()
-                print(
-                    f"Pose=({final_pose['x']:.2f}, {final_pose['y']:.2f}, "
-                    f"{math.degrees(final_pose['theta']):.1f} deg)"
+                self.logger.info(
+                    "Final pose x=%.2f y=%.2f heading=%.1f deg",
+                    final_pose['x'], final_pose['y'], math.degrees(final_pose['theta'])
                 )
                 return
 
@@ -474,11 +512,20 @@ class OdomOnlyNavigator:
                 continue
 
             if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour, current_pose=(pose['x'], pose['y'])):
-                print("Navigation aborted due to repeated blockages or command errors.")
+                self.logger.warning("Navigation aborted due to repeated blockages or command errors.")
                 return
 
     # --- CLI loop ---
     def run(self):
+        self.logger.info(
+            "Startup config serial_port=%s baud=%s lidar_port=%s kafka_bootstrap=%s robot_id=%s axis_aligned=%s",
+            SERIAL_PORT,
+            BAUD_RATE,
+            LIDAR_PORT,
+            KAFKA_BOOTSTRAP_SERVERS,
+            ROBOT_ID,
+            AXIS_ALIGNED_MOVES,
+        )
         if not self._connect():
             return
 
@@ -496,12 +543,12 @@ class OdomOnlyNavigator:
                 topics=topics,
                 on_command=self._handle_kafka_command,
                 on_map_def=self._handle_kafka_map_def,
-                logger=lambda msg: print(f"[Kafka] {msg}")
+                logger=lambda msg: self.logger.info("[Kafka] %s", msg)
             )
             self.kafka_bridge.start()
         else:
             if not ROBOT_ID:
-                print("ROBOT_ID not set; Kafka bridge disabled.")
+                self.logger.warning("ROBOT_ID not set; Kafka bridge disabled.")
 
         try:
             if self.kafka_bridge:
@@ -525,7 +572,7 @@ class OdomOnlyNavigator:
                         x_str, y_str = entry.split(',')
                         goal = (float(x_str), float(y_str))
                     except ValueError:
-                        print("Invalid format. Use x,y (e.g., 0.5,-0.2).")
+                        self.logger.warning("Invalid format. Use x,y (e.g., 0.5,-0.2).")
                         continue
                     self.navigate_to(goal)
         finally:
@@ -535,13 +582,23 @@ class OdomOnlyNavigator:
 
     # --- Kafka command handlers ---
     def _handle_kafka_command(self, envelope):
+        payload = envelope.get("payload") or {}
+        self.logger.info(
+            "Kafka CMD queued cid=%s command=%s args=%s",
+            envelope.get("correlationId"),
+            payload.get("command"),
+            payload.get("args"),
+        )
         self.command_queue.put(envelope)
 
     def _handle_kafka_map_def(self, envelope):
         self.map_definition = envelope.get("payload")
         self.map_definition_correlation = envelope.get("correlationId")
         self._load_static_map_data()
-        print(f"Map definition received: mapId={self.map_definition.get('mapId') if self.map_definition else 'unknown'}")
+        self.logger.info(
+            "Map definition received: mapId=%s",
+            self.map_definition.get('mapId') if self.map_definition else 'unknown'
+        )
 
     # --- Map helpers (obstacles & POIs) ---
     def _load_static_map_data(self):
@@ -556,6 +613,11 @@ class OdomOnlyNavigator:
             polygon = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in pts if p.get("x") is not None and p.get("y") is not None]
             if polygon:
                 self.obstacles.append(polygon)
+        self.logger.info(
+            "Loaded map data: obstacles=%s pois=%s",
+            len(self.obstacles),
+            len(self.points_of_interest),
+        )
 
     def _point_in_polygon(self, point, polygon):
         x, y = point
@@ -600,6 +662,7 @@ class OdomOnlyNavigator:
         payload = envelope.get("payload") or {}
         cmd = (payload.get("command") or "").lower()
         correlation_id = envelope.get("correlationId")
+        self.logger.info("Execute command=%s cid=%s payload=%s", cmd, correlation_id, payload)
         if cmd == "navigate_to_xy":
             args = payload.get("args") or {}
             x = args.get("x")
@@ -653,6 +716,13 @@ class OdomOnlyNavigator:
 
     def _send_ack(self, correlation_id, command, ok, note=None):
         if self.kafka_bridge:
+            self.logger.info(
+                "ACK command=%s cid=%s status=%s note=%s",
+                command,
+                correlation_id,
+                "OK" if ok else "FAILED",
+                note,
+            )
             self.kafka_bridge.send_ack(correlation_id, command, ok, note)
 
     def _send_status(self):
@@ -663,34 +733,41 @@ class OdomOnlyNavigator:
             "pose": {"x": pose['x'], "y": pose['y'], "thetaDeg": math.degrees(pose['theta'])},
             "state": "IDLE",
         }
+        self.logger.info(
+            "STATUS pose=(%.2f,%.2f,%.1fdeg) state=%s",
+            pose['x'],
+            pose['y'],
+            math.degrees(pose['theta']),
+            payload["state"],
+        )
         self.kafka_bridge.send_status(payload)
 
     # --- Perimeter verification (no detours) ---
     def _verify_perimeter(self):
         if not self.map_definition:
-            print("No map loaded; cannot verify perimeter.")
+            self.logger.warning("No map loaded; cannot verify perimeter.")
             if self.kafka_bridge:
                 self.kafka_bridge.send_map_verdict(self.map_definition_correlation, None, "INVALID", reason="NO_MAP")
             return False, "No map"
         boundary = (self.map_definition.get("boundary") or {}).get("points") or []
         map_id = self.map_definition.get("mapId")
         if len(boundary) < 2:
-            print("Map boundary invalid; cannot verify perimeter.")
+            self.logger.warning("Map boundary invalid; cannot verify perimeter.")
             if self.kafka_bridge:
                 self.kafka_bridge.send_map_verdict(self.map_definition_correlation, map_id, "INVALID", reason="INVALID_BOUNDARY")
             return False, "Invalid boundary"
 
-        print("Starting perimeter verification...")
+        self.logger.info("Starting perimeter verification...")
         points = [(float(p["x"]), float(p["y"])) for p in boundary]
         # Ensure closed loop
         if points[0] != points[-1]:
             points.append(points[0])
 
         for idx, goal in enumerate(points[1:], start=1):
-            print(f"Verifying segment {idx}/{len(points)-1} -> {goal}")
+            self.logger.info("Verifying segment %s/%s -> %s", idx, len(points) - 1, goal)
             success = self._navigate_segment(goal)
             if not success:
-                print("Perimeter blocked; marking INVALID.")
+                self.logger.warning("Perimeter blocked; marking INVALID.")
                 if self.kafka_bridge:
                     self.kafka_bridge.send_map_verdict(
                         self.map_definition_correlation, map_id, "INVALID", reason="BLOCKED_PATH",
@@ -698,7 +775,7 @@ class OdomOnlyNavigator:
                     )
                 return False, "Blocked path"
 
-        print("Perimeter verification complete: VALID.")
+        self.logger.info("Perimeter verification complete: VALID.")
         if self.kafka_bridge:
             self.kafka_bridge.send_map_verdict(self.map_definition_correlation, map_id, "VALID", reason="CLEAR", details={})
         return True, None
@@ -727,10 +804,11 @@ class OdomOnlyNavigator:
             self.navigate_to(goal, allow_detour=False)
             return True
         except Exception as exc:
-            print(f"Segment navigation failed: {exc}")
+            self.logger.warning(f"Segment navigation failed: {exc}")
             return False
 
 
 if __name__ == '__main__':
+    configure_logging()
     navigator = OdomOnlyNavigator()
     navigator.run()
