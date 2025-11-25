@@ -281,7 +281,8 @@ class OdomOnlyNavigator:
                 self.logger.warning(f"LIDAR read error: {exc}")
                 time.sleep(0.5)
             except Exception as exc:
-                self.logger.warning(f"Unexpected LIDAR error: {exc}")
+                # Log full traceback so we can pinpoint parser/driver issues.
+                self.logger.exception("Unexpected LIDAR error")
                 time.sleep(0.5)
         self.lidar_running = False
 
