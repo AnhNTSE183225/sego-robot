@@ -106,6 +106,8 @@ class OdomOnlyNavigator:
         self.command_queue = queue.Queue()
         self.map_definition = None
         self.map_definition_correlation = None
+        self.obstacles = []
+        self.points_of_interest = []
 
     # --- Connection management ---
     def _connect(self):
@@ -397,8 +399,9 @@ class OdomOnlyNavigator:
         rotate_angle = normalize_angle_deg(target_heading_world - current_heading)
         return self._send_rotate(rotate_angle)
 
-    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True):
+    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None):
         attempts = 0
+        start_point = current_pose if current_pose else (self._get_pose()['x'], self._get_pose()['y'])
         while attempts <= MAX_BLOCKED_RETRIES:
             if not self.first_scan_event.is_set():
                 print("Waiting for first LIDAR scan before moving...")
@@ -416,6 +419,15 @@ class OdomOnlyNavigator:
                 time.sleep(BLOCKED_RETRY_WAIT_SEC)
                 continue
 
+            dx = step_distance * math.cos(math.radians(chosen_heading))
+            dy = step_distance * math.sin(math.radians(chosen_heading))
+            end_point = (start_point[0] + dx, start_point[1] + dy)
+            if allow_detour and self._segment_crosses_obstacles(start_point, end_point):
+                attempts += 1
+                print("Static obstacle blocks the segment; trying another heading...")
+                time.sleep(BLOCKED_RETRY_WAIT_SEC)
+                continue
+
             if not self._rotate_to_heading(chosen_heading):
                 return False
             if not self._send_move(step_distance):
@@ -430,6 +442,9 @@ class OdomOnlyNavigator:
         if not self.first_scan_event.is_set():
             print("Waiting for initial LIDAR data...")
             self.first_scan_event.wait(timeout=3.0)
+
+        if allow_detour and not self._goal_valid(goal):
+            raise ValueError("Goal lies inside an obstacle")
 
         while True:
             pose = self._get_pose()
@@ -458,7 +473,7 @@ class OdomOnlyNavigator:
             if step_distance < DISTANCE_TOLERANCE_M:
                 continue
 
-            if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour):
+            if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour, current_pose=(pose['x'], pose['y'])):
                 print("Navigation aborted due to repeated blockages or command errors.")
                 return
 
@@ -525,7 +540,61 @@ class OdomOnlyNavigator:
     def _handle_kafka_map_def(self, envelope):
         self.map_definition = envelope.get("payload")
         self.map_definition_correlation = envelope.get("correlationId")
+        self._load_static_map_data()
         print(f"Map definition received: mapId={self.map_definition.get('mapId') if self.map_definition else 'unknown'}")
+
+    # --- Map helpers (obstacles & POIs) ---
+    def _load_static_map_data(self):
+        self.obstacles = []
+        self.points_of_interest = []
+        if not self.map_definition:
+            return
+        self.points_of_interest = self.map_definition.get("pointsOfInterest") or []
+        obstacles = self.map_definition.get("obstacles") or []
+        for obs in obstacles:
+            pts = obs.get("points") or []
+            polygon = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in pts if p.get("x") is not None and p.get("y") is not None]
+            if polygon:
+                self.obstacles.append(polygon)
+
+    def _point_in_polygon(self, point, polygon):
+        x, y = point
+        inside = False
+        n = len(polygon)
+        if n < 3:
+            return False
+        px1, py1 = polygon[0]
+        for i in range(n + 1):
+            px2, py2 = polygon[i % n]
+            if ((py1 > y) != (py2 > y)) and (x < (px2 - px1) * (y - py1) / ((py2 - py1) + 1e-9) + px1):
+                inside = not inside
+            px1, py1 = px2, py2
+        return inside
+
+    def _segments_intersect(self, p1, p2, q1, q2):
+        def ccw(a, b, c):
+            return (c[1]-a[1]) * (b[0]-a[0]) > (b[1]-a[1]) * (c[0]-a[0])
+        return (ccw(p1, q1, q2) != ccw(p2, q1, q2)) and (ccw(p1, p2, q1) != ccw(p1, p2, q2))
+
+    def _segment_crosses_obstacles(self, start, end):
+        for poly in self.obstacles:
+            m = len(poly)
+            if m < 2:
+                continue
+            for i in range(m):
+                a = poly[i]
+                b = poly[(i + 1) % m]
+                if self._segments_intersect(start, end, a, b):
+                    return True
+            if self._point_in_polygon(end, poly):
+                return True
+        return False
+
+    def _goal_valid(self, goal):
+        for poly in self.obstacles:
+            if self._point_in_polygon(goal, poly):
+                return False
+        return True
 
     def _execute_command(self, envelope):
         payload = envelope.get("payload") or {}
@@ -635,18 +704,18 @@ class OdomOnlyNavigator:
         return True, None
 
     def _find_poi(self, poi_id):
-        if not self.map_definition:
+        if not self.points_of_interest:
             return None
-        pois = self.map_definition.get("pointsOfInterest") or []
+        pois = self.points_of_interest
         for poi in pois:
             if poi.get("id") == poi_id:
                 return float(poi.get("x", 0)), float(poi.get("y", 0))
         return None
 
     def _find_poi_by_category(self, category):
-        if not self.map_definition:
+        if not self.points_of_interest:
             return None
-        pois = self.map_definition.get("pointsOfInterest") or []
+        pois = self.points_of_interest
         for poi in pois:
             if str(poi.get("category", "")).lower() == category.lower():
                 return float(poi.get("x", 0)), float(poi.get("y", 0))
