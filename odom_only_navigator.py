@@ -269,7 +269,8 @@ class OdomOnlyNavigator:
     def _lidar_reader_loop(self):
         while self.lidar_running and self.lidar:
             try:
-                for scan in self.lidar.iter_scans(scan_type='express'):
+                # Standard scan mode is more widely compatible across firmware variants.
+                for scan in self.lidar.iter_scans():
                     if not self.lidar_running:
                         break
                     with self.scan_lock:
