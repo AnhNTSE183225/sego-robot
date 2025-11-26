@@ -48,6 +48,17 @@ except ImportError:
 
     class RPLidarException(Exception):
         pass
+else:
+    # Some rplidar builds return 3 values from get_health(); force a 2-tuple for compatibility.
+    _orig_get_health = RPLidar.get_health
+
+    def _get_health_two_fields(self):
+        result = _orig_get_health(self)
+        if isinstance(result, (list, tuple)) and len(result) >= 2:
+            return result[0], result[1]
+        return result, 0
+
+    RPLidar.get_health = _get_health_two_fields
 
 try:
     from confluent_kafka import Consumer, Producer, KafkaException
