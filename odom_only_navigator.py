@@ -290,6 +290,12 @@ class OdomOnlyNavigator:
                         self.first_scan_event.set()
             except RPLidarException as exc:
                 self.logger.warning(f"LIDAR read error: {exc}")
+                try:
+                    # Buffer desync errors (incorrect descriptor / data in buffer) need a flush.
+                    self.lidar.clean_input()
+                    self.logger.debug("LIDAR input buffer cleaned after error.")
+                except Exception as clean_exc:
+                    self.logger.debug(f"Failed to clean LIDAR buffer: {clean_exc}")
                 time.sleep(0.5)
             except Exception as exc:
                 # Log full traceback so we can pinpoint parser/driver issues.
