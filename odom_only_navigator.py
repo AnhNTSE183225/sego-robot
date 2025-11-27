@@ -153,6 +153,7 @@ class OdomOnlyNavigator:
         self.map_definition_correlation = None
         self.obstacles = []
         self.points_of_interest = []
+        self.map_loaded_event = threading.Event()
 
     # --- Connection management ---
     def _connect(self):
@@ -614,6 +615,7 @@ class OdomOnlyNavigator:
         self.map_definition = envelope.get("payload")
         self.map_definition_correlation = envelope.get("correlationId")
         self._load_static_map_data()
+        self.map_loaded_event.set()
         self.logger.info(
             "Map definition received: mapId=%s",
             self.map_definition.get('mapId') if self.map_definition else 'unknown'
@@ -696,6 +698,13 @@ class OdomOnlyNavigator:
             except Exception as exc:
                 self._send_ack(correlation_id, cmd, False, str(exc))
         elif cmd == "perimeter_validate":
+            args = payload.get("args") or {}
+            map_def = args.get("mapDefinition")
+            if map_def:
+                self.map_definition = map_def
+                self.map_definition_correlation = correlation_id
+                self._load_static_map_data()
+                self.map_loaded_event.set()
             ok, reason = self._verify_perimeter()
             self._send_ack(correlation_id, cmd, ok, reason)
         elif cmd == "navigate_to_poi":
@@ -763,6 +772,9 @@ class OdomOnlyNavigator:
 
     # --- Perimeter verification (no detours) ---
     def _verify_perimeter(self):
+        if not self.map_definition:
+            self.logger.info("Waiting for map definition before perimeter verification...")
+            self.map_loaded_event.wait(timeout=3.0)
         if not self.map_definition:
             self.logger.warning("No map loaded; cannot verify perimeter.")
             if self.kafka_bridge:
