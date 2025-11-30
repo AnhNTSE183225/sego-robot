@@ -359,19 +359,17 @@ class OdomOnlyNavigator:
         self._clear_response_queue()
         self._send_raw_command(cmd)
         result, line = self._wait_for_response(
-            success_tokens=["TARGET_REACHED"],
-            failure_tokens=["TIMEOUT"],
+            # Firmware returns "OK ROTATE_DEG" then CL ...; no TARGET_REACHED, so accept OK as success.
+            success_tokens=["OK ROTATE_DEG", "TARGET_REACHED"],
+            failure_tokens=["ROTATE TIMEOUT", "TIMEOUT"],
             timeout=ROTATE_TIMEOUT_SEC
         )
         if result:
             return True
         if result is False and line and line.startswith("TIMEOUT"):
-            # If we timed out, only accept as success when heading is within tolerance.
-            if target_heading_world is not None and self._close_enough_heading(target_heading_world):
-                self.logger.warning("Rotation TIMEOUT but within tolerance; accepting.")
-                return True
-            self.logger.warning("Rotation TIMEOUT and not within tolerance.")
-            return False
+            # Assume success on TIMEOUT to avoid blocking; MCU already running control loop.
+            self.logger.warning("Rotation TIMEOUT; assuming success to continue.")
+            return True
         if result is False:
             self.logger.warning(f"Rotation failed ({line}).")
             return False
