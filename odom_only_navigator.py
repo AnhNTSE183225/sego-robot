@@ -96,6 +96,9 @@ ROTATE_TIMEOUT_SEC = 15.0
 # Movement mode: True -> use axis-aligned L-shape moves (X then Y)
 AXIS_ALIGNED_MOVES = True
 
+# Heading offset (deg) to align MCU frame with map frame if needed (e.g., set to 90 to face +Y by default)
+HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
+
 # Obstacle avoidance parameters
 MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
 CLEARANCE_MARGIN_M = 0.05          # Buffer added to the intended step distance
@@ -481,6 +484,15 @@ class OdomOnlyNavigator:
             # Pure odom move: rotate then move, ignore LIDAR/obstacle sampling.
             if not self._rotate_to_heading(desired_heading_world):
                 return False
+            # Simple safety gate: if LIDAR says blocked, abort
+            if self.first_scan_event.is_set():
+                heading_clear = self._heading_clearance(
+                    desired_heading_world, math.degrees(self._get_pose()['theta']),
+                    FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
+                )
+                if heading_clear < OBSTACLE_STOP_DISTANCE_M:
+                    self.logger.warning("Obstacle detected ahead; stopping move step.")
+                    return False
             return self._send_move(step_distance)
 
         attempts = 0
@@ -792,7 +804,7 @@ class OdomOnlyNavigator:
         if not self.kafka_bridge:
             return
         pose = self._get_pose()
-        heading_deg = math.degrees(pose['theta'])
+        heading_deg = normalize_angle_deg(math.degrees(pose['theta']) + HEADING_OFFSET_DEG)
         payload = {
             # keep both thetaDeg and headingDeg/heading for FE compatibility
             "pose": {
@@ -873,13 +885,32 @@ class OdomOnlyNavigator:
         return None
 
     def _navigate_segment(self, goal):
-        """Navigate to a goal without detours; fail if path blocked."""
-        try:
-            self.navigate_to(goal, allow_detour=False)
+        """
+        Navigate to a goal without detours; single rotate + single move.
+        LIDAR only used to reject if something is directly ahead; no path reshaping.
+        """
+        # Compute vector in odom frame
+        pose = self._get_pose()
+        dx = goal[0] - pose['x']
+        dy = goal[1] - pose['y']
+        distance = math.hypot(dx, dy)
+        if distance < DISTANCE_TOLERANCE_M:
             return True
-        except Exception as exc:
-            self.logger.warning(f"Segment navigation failed: {exc}")
+
+        heading_world = math.degrees(math.atan2(dy, dx))
+
+        # Optional simple safety: if forward corridor blocked, abort (no detours)
+        if self.first_scan_event.is_set():
+            heading_clear = self._heading_clearance(
+                heading_world, math.degrees(pose['theta']), FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
+            )
+            if heading_clear < OBSTACLE_STOP_DISTANCE_M:
+                self.logger.warning("Obstacle detected ahead; stopping segment.")
+                return False
+
+        if not self._rotate_to_heading(heading_world):
             return False
+        return self._send_move(distance)
 
 
 if __name__ == '__main__':
