@@ -341,7 +341,13 @@ class OdomOnlyNavigator:
                 return False, text
         return None, None
 
-    def _send_rotate(self, desired_angle_deg):
+    def _close_enough_heading(self, desired_heading_world):
+        pose = self._get_pose()
+        current_heading = math.degrees(pose['theta'])
+        err = abs(normalize_angle_deg(desired_heading_world - current_heading))
+        return err <= ANGLE_TOLERANCE_DEG
+
+    def _send_rotate(self, desired_angle_deg, target_heading_world=None):
         """Rotate by desired_angle_deg relative to current heading."""
         if abs(desired_angle_deg) < ANGLE_TOLERANCE_DEG:
             return True
@@ -356,10 +362,14 @@ class OdomOnlyNavigator:
         )
         if result:
             return True
-        if result is False:
-            if line and line.startswith("TIMEOUT"):
-                self.logger.warning("Rotation reported TIMEOUT but assuming success (motors idle).")
+        if result is False and line and line.startswith("TIMEOUT"):
+            # If we timed out, only accept as success when heading is within tolerance.
+            if target_heading_world is not None and self._close_enough_heading(target_heading_world):
+                self.logger.warning("Rotation TIMEOUT but within tolerance; accepting.")
                 return True
+            self.logger.warning("Rotation TIMEOUT and not within tolerance.")
+            return False
+        if result is False:
             self.logger.warning(f"Rotation failed ({line}).")
             return False
         self.logger.warning("Rotation timeout with no MCU response.")
@@ -457,11 +467,23 @@ class OdomOnlyNavigator:
         pose = self._get_pose()
         current_heading = math.degrees(pose['theta'])
         rotate_angle = normalize_angle_deg(target_heading_world - current_heading)
-        return self._send_rotate(rotate_angle)
+        return self._send_rotate(rotate_angle, target_heading_world)
 
     def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None):
-        attempts = 0
+        """
+        Drive one step toward desired_heading_world.
+        - When allow_detour is False (perimeter verification), we bypass LIDAR gating to guarantee
+          the robot keeps tracing the boundary; obstacle avoidance is not applied.
+        """
         start_point = current_pose if current_pose else (self._get_pose()['x'], self._get_pose()['y'])
+
+        if not allow_detour:
+            # Pure odom move: rotate then move, ignore LIDAR/obstacle sampling.
+            if not self._rotate_to_heading(desired_heading_world):
+                return False
+            return self._send_move(step_distance)
+
+        attempts = 0
         while attempts <= MAX_BLOCKED_RETRIES:
             if not self.first_scan_event.is_set():
                 self.logger.info("Waiting for first LIDAR scan before moving...")
@@ -471,9 +493,6 @@ class OdomOnlyNavigator:
 
             chosen_heading = self._choose_heading_with_avoidance(desired_heading_world, step_distance, allow_detour)
             if chosen_heading is None:
-                if not allow_detour:
-                    self.logger.warning("Path blocked during verification; aborting.")
-                    return False
                 attempts += 1
                 self.logger.warning("Path blocked; waiting for an opening...")
                 time.sleep(BLOCKED_RETRY_WAIT_SEC)
@@ -482,7 +501,7 @@ class OdomOnlyNavigator:
             dx = step_distance * math.cos(math.radians(chosen_heading))
             dy = step_distance * math.sin(math.radians(chosen_heading))
             end_point = (start_point[0] + dx, start_point[1] + dy)
-            if allow_detour and self._segment_crosses_obstacles(start_point, end_point):
+            if self._segment_crosses_obstacles(start_point, end_point):
                 attempts += 1
                 self.logger.warning("Static obstacle blocks the segment; trying another heading...")
                 time.sleep(BLOCKED_RETRY_WAIT_SEC)
@@ -773,15 +792,23 @@ class OdomOnlyNavigator:
         if not self.kafka_bridge:
             return
         pose = self._get_pose()
+        heading_deg = math.degrees(pose['theta'])
         payload = {
-            "pose": {"x": pose['x'], "y": pose['y'], "thetaDeg": math.degrees(pose['theta'])},
+            # keep both thetaDeg and headingDeg/heading for FE compatibility
+            "pose": {
+                "x": pose['x'],
+                "y": pose['y'],
+                "thetaDeg": heading_deg,
+                "headingDeg": heading_deg,
+                "heading": heading_deg,
+            },
             "state": "IDLE",
         }
         self.logger.info(
             "STATUS pose=(%.2f,%.2f,%.1fdeg) state=%s",
             pose['x'],
             pose['y'],
-            math.degrees(pose['theta']),
+            heading_deg,
             payload["state"],
         )
         self.kafka_bridge.send_status(payload)
