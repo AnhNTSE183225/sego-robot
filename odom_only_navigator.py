@@ -154,6 +154,8 @@ class OdomOnlyNavigator:
         self.obstacles = []
         self.points_of_interest = []
         self.map_loaded_event = threading.Event()
+        self.status_thread = None
+        self.status_running = False
 
     # --- Connection management ---
     def _connect(self):
@@ -573,6 +575,9 @@ class OdomOnlyNavigator:
         try:
             if self.kafka_bridge:
                 # Kafka-driven loop
+                self.status_running = True
+                self.status_thread = threading.Thread(target=self._status_loop, daemon=True)
+                self.status_thread.start()
                 while True:
                     try:
                         cmd = self.command_queue.get(timeout=1.0)
@@ -597,8 +602,19 @@ class OdomOnlyNavigator:
                     self.navigate_to(goal)
         finally:
             if self.kafka_bridge:
+                self.status_running = False
+                if self.status_thread:
+                    self.status_thread.join(timeout=2.0)
                 self.kafka_bridge.stop()
             self._disconnect()
+
+    def _status_loop(self):
+        while self.status_running:
+            try:
+                self._send_status()
+            except Exception:
+                pass
+            time.sleep(5.0)
 
     # --- Kafka command handlers ---
     def _handle_kafka_command(self, envelope):

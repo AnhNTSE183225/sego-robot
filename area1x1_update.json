@@ -1,0 +1,15 @@
+{
+  "name": "string",
+  "areaDefinitionJson": "{\"origin\":\"bottom-left\",\"boundary\":{\"id\":\"boundary-1\",\"points\":[{\"x\":0.0,\"y\":0.0},{\"x\":1.0,\"y\":0.0},{\"x\":1.0,\"y\":1.0},{\"x\":0.0,\"y\":1.0}]},\"restricted\":[],\"obstacles\":[],\"paths\":[]}",
+  "navigationPoints": [
+    {
+      "name": "Center POI",
+      "positionX": 0.5,
+      "positionY": 0.5,
+      "headingDeg": 0.0,
+      "type": "POI"
+    }
+  ],
+  "active": true,
+  "verified": false
+}
