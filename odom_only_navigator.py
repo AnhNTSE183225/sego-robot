@@ -133,12 +133,21 @@ class OdomOnlyNavigator:
         self.response_queue = queue.Queue()
         
         # Command-based pose tracking (dead reckoning)
-        # Không dùng odometry từ STM32, tính toán từ lệnh đã gửi
+        # Dead reckoning làm chính, odom từ STM32 dùng khi interrupted
         self.pose_lock = threading.Lock()
         self.cmd_pose = {
             'x': 0.0,
             'y': 0.0,
             'heading_deg': 0.0,  # degrees, 0 = +X, 90 = +Y
+        }
+        
+        # Latest STM32 odometry (relative to last RESET_ODOM)
+        # Dùng khi bị interrupt để biết thực tế đã đi bao xa
+        self.stm32_odom_lock = threading.Lock()
+        self.stm32_odom = {
+            'x': 0.0,
+            'y': 0.0,
+            'heading_deg': 0.0,
         }
 
         # LIDAR state
@@ -186,6 +195,7 @@ class OdomOnlyNavigator:
         self._start_serial_listener()
         self._send_raw_command("RESET_ODOM")
         self._reset_pose()  # Reset internal pose tracking
+        self._reset_stm32_odom()  # Reset STM32 odom cache
 
         # Give the scanner a moment to deliver its first frames
         if not self.first_scan_event.wait(timeout=3.0):
@@ -233,7 +243,7 @@ class OdomOnlyNavigator:
             self._serial_thread = None
 
     def _serial_reader_loop(self):
-        """Đọc response từ STM32, bỏ qua odometry data."""
+        """Đọc response từ STM32, parse odometry data để lưu lại."""
         while self._serial_running and self.serial_conn and self.serial_conn.is_open:
             try:
                 raw = self.serial_conn.readline()
@@ -245,14 +255,40 @@ class OdomOnlyNavigator:
             line = raw.decode('utf-8', errors='ignore').strip()
             if not line:
                 continue
-            # Bỏ qua dòng odometry (bắt đầu bằng số, có dấu phẩy)
+            # Parse odometry lines (bắt đầu bằng số hoặc dấu trừ, có dấu phẩy)
+            # Format từ STM32: x,y,theta,vx,vy,omega,m1,m2,m3
+            # Lưu ý: theta từ STM32 là RADIANS, cần convert sang degrees
             if line[0].isdigit() or line[0] == '-':
                 parts = line.split(',')
                 if len(parts) >= 3:
-                    continue  # Skip odometry lines
+                    try:
+                        x = float(parts[0])
+                        y = float(parts[1])
+                        theta_rad = float(parts[2])
+                        # Convert radians to degrees
+                        heading_deg = math.degrees(theta_rad)
+                        with self.stm32_odom_lock:
+                            self.stm32_odom['x'] = x
+                            self.stm32_odom['y'] = y
+                            self.stm32_odom['heading_deg'] = heading_deg
+                    except ValueError:
+                        pass
+                    continue  # Don't put odom lines in response queue
             self.logger.info(f"[STM32] {line}")
             self.response_queue.put(line.strip())
         self._serial_running = False
+    
+    def _get_stm32_odom(self):
+        """Lấy odometry mới nhất từ STM32 (relative to last RESET_ODOM)."""
+        with self.stm32_odom_lock:
+            return dict(self.stm32_odom)
+    
+    def _reset_stm32_odom(self):
+        """Reset cached STM32 odometry về 0."""
+        with self.stm32_odom_lock:
+            self.stm32_odom['x'] = 0.0
+            self.stm32_odom['y'] = 0.0
+            self.stm32_odom['heading_deg'] = 0.0
 
     def _get_pose(self):
         """Trả về pose tính từ lệnh đã gửi."""
@@ -374,58 +410,203 @@ class OdomOnlyNavigator:
         return err <= ANGLE_TOLERANCE_DEG
 
     def _send_rotate(self, desired_angle_deg, target_heading_world=None):
-        """Rotate by desired_angle_deg relative to current heading."""
+        """Rotate by desired_angle_deg relative to current heading.
+        
+        STM32 ROTATE_DEG behavior:
+        - "OK ROTATE_DEG" = command received, rotation started
+        - "TARGET_REACHED" = rotation completed successfully
+        - "TIMEOUT" = rotation timed out
+        
+        Returns:
+            True if rotation completed successfully
+            False if rotation failed/interrupted (pose updated with actual rotation)
+        """
         if abs(desired_angle_deg) < 0.1:
             return True
+        
+        # Reset STM32 odom cache trước khi ROTATE
+        self._reset_stm32_odom()
+        
         cmd = f"ROTATE_DEG {desired_angle_deg:.2f}"
         self.logger.info(f"ROTATE: {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
+        
+        # Bước 1: Chờ OK ROTATE_DEG (command acknowledged)
         result, line = self._wait_for_response(
             success_tokens=["OK ROTATE_DEG"],
-            failure_tokens=["ROTATE TIMEOUT", "TIMEOUT", "ERROR"],
+            failure_tokens=["ERR"],
+            timeout=2.0  # Short timeout for ACK
+        )
+        if not result:
+            self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
+            return False
+        
+        # Bước 2: Chờ TARGET_REACHED hoặc TIMEOUT (rotation completed)
+        # STM32 closed-loop control sẽ gửi TARGET_REACHED khi xoay xong
+        result, line = self._wait_for_response(
+            success_tokens=["TARGET_REACHED"],
+            failure_tokens=["TIMEOUT"],
             timeout=ROTATE_TIMEOUT_SEC
         )
+        
         if result:
-            # Chờ STM32 hoàn thành xoay
-            wait_time = max(1.0, abs(desired_angle_deg) / 45.0)
-            self.logger.info(f"Waiting {wait_time:.1f}s for rotation to complete...")
-            time.sleep(wait_time)
+            self.logger.info(f"Rotation completed: {line}")
             # Reset STM32 odometry sau khi xoay để MOVE tiếp theo bắt đầu từ (0,0,0)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
             self._update_pose_after_rotate(desired_angle_deg)
             return True
+        
+        # Rotation bị gián đoạn -> dùng STM32 odom để biết thực tế đã xoay bao nhiêu
+        stm32_odom = self._get_stm32_odom()
+        actual_rotation = stm32_odom['heading_deg']
+        
+        if abs(actual_rotation) > 0.5:  # Xoay được ít nhất 0.5 độ
+            self.logger.info(f"Rotation interrupted at {actual_rotation:.1f}° (commanded: {desired_angle_deg:.1f}°)")
+            self._update_pose_after_rotate(actual_rotation)
+        
+        # Reset STM32 odometry cho lệnh tiếp theo
+        self._send_raw_command("RESET_ODOM")
+        time.sleep(0.1)
+        
         if result is False:
             self.logger.warning(f"Rotation failed ({line}).")
-            return False
-        self.logger.warning("Rotation timeout with no MCU response.")
+        else:
+            self.logger.warning("Rotation timeout with no MCU response.")
         return False
+    
+    def _send_stop(self):
+        """Emergency stop - dừng robot ngay lập tức."""
+        self.logger.warning("EMERGENCY STOP!")
+        self._send_raw_command("STOP")
+        
+        # Chờ OK STOP response
+        result, line = self._wait_for_response(
+            success_tokens=["OK STOP"],
+            failure_tokens=[],
+            timeout=1.0
+        )
+        
+        # Đợi một chút rồi đọc STM32 odom để biết vị trí thực tế
+        time.sleep(0.1)
+        stm32_odom = self._get_stm32_odom()
+        self.logger.info(f"Stopped at STM32 odom: x={stm32_odom['x']:.3f}, y={stm32_odom['y']:.3f}, heading={stm32_odom['heading_deg']:.1f}°")
+        return stm32_odom
 
-    def _send_move(self, target_distance):
-        """Move forward by target_distance meters."""
+    def _send_move(self, target_distance, monitor_lidar=True):
+        """Move forward by target_distance meters.
+        
+        Args:
+            target_distance: Distance to move in meters
+            monitor_lidar: If True, monitor LIDAR during movement and STOP if obstacle detected
+        
+        Returns:
+            True if movement completed successfully
+            False if movement failed/interrupted (pose updated with actual distance traveled)
+        """
         if target_distance < DISTANCE_TOLERANCE_M:
             return True
+        
+        # Reset STM32 odom cache trước khi MOVE để đo được khoảng cách thực tế
+        self._reset_stm32_odom()
+        
+        # Flag để signal stop từ LIDAR monitor thread
+        self._move_stop_flag = False
+        self._move_stop_reason = None
+        
         cmd = f"MOVE {target_distance:.3f}"
         self.logger.info(f"MOVE: {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
+        
+        # Bước 1: Chờ OK MOVE (command acknowledged)
+        result, line = self._wait_for_response(
+            success_tokens=["OK MOVE"],
+            failure_tokens=["ERR"],
+            timeout=2.0
+        )
+        if not result:
+            self.logger.warning(f"MOVE not acknowledged: {line}")
+            return False
+        
+        # Bước 2: Monitor LIDAR trong khi chờ MOVE TARGET_REACHED
+        # Nếu phát hiện obstacle, gửi STOP ngay lập tức
+        if monitor_lidar and self.first_scan_event.is_set():
+            lidar_monitor_thread = threading.Thread(
+                target=self._lidar_move_monitor,
+                args=(target_distance,),
+                daemon=True
+            )
+            lidar_monitor_thread.start()
+        
+        # Bước 3: Chờ TARGET_REACHED hoặc TIMEOUT
         result, line = self._wait_for_response(
             success_tokens=["MOVE TARGET_REACHED"],
-            failure_tokens=["MOVE TIMEOUT"],
+            failure_tokens=["MOVE TIMEOUT", "OK STOP"],  # OK STOP = bị dừng bởi LIDAR
             timeout=MOVE_TIMEOUT_SEC
         )
-        if result:
+        
+        # Stop LIDAR monitor nếu còn chạy
+        self._move_stop_flag = True
+        
+        if result and line and "TARGET_REACHED" in line:
+            # MOVE hoàn thành thành công -> trust commanded distance
             self._update_pose_after_move(target_distance)
-            # Reset STM32 odometry sau khi di chuyển để lệnh tiếp theo bắt đầu fresh
+            # Reset STM32 odometry cho lệnh tiếp theo
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
             return True
-        if result is False:
+        
+        # Movement bị gián đoạn -> dùng STM32 odom.x để biết thực tế đã đi bao xa
+        # Chỉ đọc odom.x vì MOVE = forward motion = robot's local X axis
+        # odom.y ≈ 0 (lateral drift), không cần đọc
+        time.sleep(0.1)  # Cho STM32 cập nhật odom
+        stm32_odom = self._get_stm32_odom()
+        actual_distance = stm32_odom['x']  # Forward distance
+        if actual_distance < 0:
+            self.logger.warning(f"Negative odom.x ({actual_distance:.3f}m) - robot drifted backward?")
+            actual_distance = 0.0  # Don't update pose if robot went backward
+        
+        if actual_distance > DISTANCE_TOLERANCE_M:
+            self.logger.info(f"Movement interrupted at {actual_distance:.3f}m (commanded: {target_distance:.3f}m)")
+            self._update_pose_after_move(actual_distance)
+        else:
+            self.logger.info(f"Movement barely started (odom x={stm32_odom['x']:.3f})")
+        
+        # Reset STM32 odometry cho lệnh tiếp theo
+        self._send_raw_command("RESET_ODOM")
+        time.sleep(0.1)
+        
+        if self._move_stop_reason:
+            self.logger.warning(f"Move stopped by LIDAR: {self._move_stop_reason}")
+        elif result is False:
             self.logger.warning(f"Move failed ({line}).")
-            return False
-        self.logger.warning("Move timeout with no MCU response.")
+        else:
+            self.logger.warning("Move timeout with no MCU response.")
         return False
+    
+    def _lidar_move_monitor(self, target_distance):
+        """Background thread to monitor LIDAR during MOVE and send STOP if obstacle detected."""
+        check_interval = 0.1  # 100ms check interval
+        stop_distance = OBSTACLE_STOP_DISTANCE_M
+        
+        while not self._move_stop_flag:
+            if self.first_scan_event.is_set():
+                # Check forward direction for obstacles
+                current_heading = self._get_pose()['heading_deg']
+                clearance = self._heading_clearance(
+                    current_heading, current_heading,
+                    FORWARD_SCAN_ANGLE_DEG, target_distance
+                )
+                
+                if clearance < stop_distance:
+                    self.logger.warning(f"LIDAR: Obstacle at {clearance:.2f}m! Sending STOP...")
+                    self._move_stop_reason = f"Obstacle at {clearance:.2f}m"
+                    self._send_stop()
+                    break
+            
+            time.sleep(check_interval)
 
     # --- Obstacle awareness helpers ---
     def _heading_clearance(self, heading_world_deg, pose_heading_deg, fov_deg, max_range_m=None):
@@ -958,17 +1139,21 @@ class OdomOnlyNavigator:
 
         heading_world = math.degrees(math.atan2(dy, dx))
 
-        # Optional simple safety: if forward corridor blocked, abort (no detours)
-        if self.first_scan_event.is_set():
-            heading_clear = self._heading_clearance(
-                heading_world, pose['heading_deg'], FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
-            )
-            if heading_clear < OBSTACLE_STOP_DISTANCE_M:
-                self.logger.warning("Obstacle detected ahead; stopping segment.")
-                return False
-
+        # Rotate first to face the goal
         if not self._rotate_to_heading(heading_world):
             return False
+
+        # LIDAR check AFTER rotation - now robot faces the goal direction
+        # Check forward (0°) relative to current heading
+        if self.first_scan_event.is_set():
+            current_heading = self._get_pose()['heading_deg']
+            heading_clear = self._heading_clearance(
+                current_heading, current_heading, FORWARD_SCAN_ANGLE_DEG, distance + CLEARANCE_MARGIN_M
+            )
+            if heading_clear < OBSTACLE_STOP_DISTANCE_M:
+                self.logger.warning(f"Obstacle detected at {heading_clear:.2f}m ahead; stopping segment.")
+                return False
+
         return self._send_move(distance)
 
 
