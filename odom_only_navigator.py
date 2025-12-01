@@ -104,6 +104,7 @@ ANGLE_TOLERANCE_DEG = 2.0
 # Command timeouts
 MOVE_TIMEOUT_SEC = 25.0
 ROTATE_TIMEOUT_SEC = 15.0
+ROTATE_TIMEOUT_TOLERANCE_DEG = 5.0  # If MCU times out but we're within this error, accept rotation
 
 # Movement mode: True -> use axis-aligned L-shape moves (X then Y)
 AXIS_ALIGNED_MOVES = True
@@ -436,7 +437,7 @@ class OdomOnlyNavigator:
         if abs(desired_angle_deg) < 0.1:
             return True
         
-        # Reset STM32 odom cache trước khi ROTATE
+        # Reset STM32 odom cache before ROTATE
         self._reset_stm32_odom()
         
         cmd = f"ROTATE_DEG {desired_angle_deg:.2f}"
@@ -444,7 +445,7 @@ class OdomOnlyNavigator:
         self._clear_response_queue()
         self._send_raw_command(cmd)
         
-        # Bước 1: Chờ OK ROTATE_DEG (command acknowledged)
+        # Step 1: wait for OK ROTATE_DEG (command acknowledged)
         result, line = self._wait_for_response(
             success_tokens=["OK ROTATE_DEG"],
             failure_tokens=["ERR"],
@@ -454,8 +455,7 @@ class OdomOnlyNavigator:
             self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
             return False
         
-        # Bước 2: Chờ TARGET_REACHED hoặc TIMEOUT (rotation completed)
-        # STM32 closed-loop control sẽ gửi TARGET_REACHED khi xoay xong
+        # Step 2: wait for TARGET_REACHED or TIMEOUT
         result, line = self._wait_for_response(
             success_tokens=["TARGET_REACHED"],
             failure_tokens=["TIMEOUT"],
@@ -464,21 +464,32 @@ class OdomOnlyNavigator:
         
         if result:
             self.logger.info(f"Rotation completed: {line}")
-            # Reset STM32 odometry sau khi xoay để MOVE tiếp theo bắt đầu từ (0,0,0)
+            # Reset STM32 odometry so the next MOVE starts from (0,0,0)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
             self._update_pose_after_rotate(desired_angle_deg)
             return True
         
-        # Rotation bị gián đoạn -> dùng STM32 odom để biết thực tế đã xoay bao nhiêu
+        # Rotation was interrupted/timed out: use STM32 odom to see how far it got
         stm32_odom = self._get_stm32_odom()
         actual_rotation = stm32_odom['heading_deg']
+        rotation_err = abs(normalize_angle_deg(actual_rotation - desired_angle_deg))
+        if rotation_err <= ROTATE_TIMEOUT_TOLERANCE_DEG:
+            self.logger.warning(
+                f"Rotation timeout ignored: reached {actual_rotation:.1f}deg "
+                f"(commanded {desired_angle_deg:.1f}deg, err {rotation_err:.1f}deg <= "
+                f"{ROTATE_TIMEOUT_TOLERANCE_DEG:.1f}deg)"
+            )
+            self._update_pose_after_rotate(actual_rotation)
+            self._send_raw_command("RESET_ODOM")
+            time.sleep(0.1)
+            return True
         
-        if abs(actual_rotation) > 0.5:  # Xoay được ít nhất 0.5 độ
-            self.logger.info(f"Rotation interrupted at {actual_rotation:.1f}° (commanded: {desired_angle_deg:.1f}°)")
+        if abs(actual_rotation) > 0.5:  # At least some rotation happened
+            self.logger.info(f"Rotation interrupted at {actual_rotation:.1f}deg (commanded: {desired_angle_deg:.1f}deg)")
             self._update_pose_after_rotate(actual_rotation)
         
-        # Reset STM32 odometry cho lệnh tiếp theo
+        # Reset STM32 odometry for the next command
         self._send_raw_command("RESET_ODOM")
         time.sleep(0.1)
         
@@ -487,7 +498,7 @@ class OdomOnlyNavigator:
         else:
             self.logger.warning("Rotation timeout with no MCU response.")
         return False
-    
+
     def _send_stop(self):
         """Emergency stop - dừng robot ngay lập tức."""
         self.logger.warning("EMERGENCY STOP!")
