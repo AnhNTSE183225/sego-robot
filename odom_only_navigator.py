@@ -382,15 +382,16 @@ class OdomOnlyNavigator:
         self._clear_response_queue()
         self._send_raw_command(cmd)
         result, line = self._wait_for_response(
-            success_tokens=["OK ROTATE_DEG", "TARGET_REACHED"],
-            failure_tokens=["ROTATE TIMEOUT", "TIMEOUT"],
+            success_tokens=["OK ROTATE_DEG"],
+            failure_tokens=["ROTATE TIMEOUT", "TIMEOUT", "ERROR"],
             timeout=ROTATE_TIMEOUT_SEC
         )
         if result:
-            self._update_pose_after_rotate(desired_angle_deg)
-            return True
-        if result is False and line and line.startswith("TIMEOUT"):
-            self.logger.warning("Rotation TIMEOUT; assuming success to continue.")
+            # Chờ STM32 hoàn thành xoay trước khi gửi lệnh tiếp
+            # Ước tính ~2 giây cho 90°, tỷ lệ với góc quay
+            wait_time = max(1.0, abs(desired_angle_deg) / 45.0)
+            self.logger.info(f"Waiting {wait_time:.1f}s for rotation to complete...")
+            time.sleep(wait_time)
             self._update_pose_after_rotate(desired_angle_deg)
             return True
         if result is False:
