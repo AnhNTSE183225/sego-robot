@@ -468,6 +468,10 @@ class OdomOnlyNavigator:
         pose = self._get_pose()
         current_heading = math.degrees(pose['theta'])
         rotate_angle = normalize_angle_deg(target_heading_world - current_heading)
+        # Force quẹo phải: nếu góc quay âm (quẹo trái), cộng 360 để quẹo phải
+        # STM32 chỉ hỗ trợ quẹo phải (positive degrees)
+        if rotate_angle < 0:
+            rotate_angle += 360.0
         return self._send_rotate(rotate_angle, target_heading_world)
 
     def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None):
@@ -823,6 +827,21 @@ class OdomOnlyNavigator:
         )
         self.kafka_bridge.send_status(payload)
 
+    def _is_polygon_clockwise(self, points):
+        """
+        Detect if polygon is clockwise using shoelace formula.
+        Returns True if clockwise, False if counter-clockwise.
+        """
+        if len(points) < 3:
+            return True  # Default to clockwise for invalid polygons
+        signed_area = 0.0
+        n = len(points)
+        for i in range(n):
+            j = (i + 1) % n
+            signed_area += (points[j][0] - points[i][0]) * (points[j][1] + points[i][1])
+        # Negative area = clockwise, positive = counter-clockwise
+        return signed_area < 0.0
+
     # --- Perimeter verification (no detours) ---
     def _verify_perimeter(self):
         if not self.map_definition:
@@ -846,6 +865,18 @@ class OdomOnlyNavigator:
         # Ensure closed loop
         if points[0] != points[-1]:
             points.append(points[0])
+        
+        # Detect orientation and reverse if counter-clockwise (quẹo trái)
+        # Robot cần quẹo phải (clockwise) để phù hợp với STM32
+        is_clockwise = self._is_polygon_clockwise(points)
+        if not is_clockwise:
+            self.logger.info("Boundary is counter-clockwise; reversing to clockwise for right-turn navigation.")
+            points = list(reversed(points))
+            # Remove duplicate first point if exists, then re-add at end
+            if len(points) > 1 and points[0] == points[-1]:
+                points = points[:-1]
+            if len(points) > 1 and points[0] != points[-1]:
+                points.append(points[0])
 
         for idx, goal in enumerate(points[1:], start=1):
             self.logger.info("Verifying segment %s/%s -> %s", idx, len(points) - 1, goal)

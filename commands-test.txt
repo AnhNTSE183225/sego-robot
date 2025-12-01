@@ -1,0 +1,104 @@
+python3 - <<'PY'
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+print("PRE:", ser.readline().decode(errors='ignore').strip())
+ser.close()
+PY
+
+python3 scripts/manual_run_command.py --serial-port /dev/ttyAMA0 --command RUNP --pattern "R S F" --pwm 0.5 --duration-ms 10000
+
+python3 - <<'PY'
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+print("POST:", ser.readline().decode(errors='ignore').strip())
+ser.close()
+PY
+
+// For closed-loop testing
+
+python3 - <<'PY'
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+print("PRE:", ser.readline().decode(errors='ignore').strip())
+ser.close()
+PY
+
+python3 - <<'PY'
+import serial, time
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+ser.write(b"MOVE_DIST 5.00\r\n")
+reply = ser.readline().decode(errors='ignore').strip()
+print("STM32:", reply)
+ser.close()
+PY
+
+python3 - <<'PY'
+import serial, time
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+ser.write(b"MOVE 1.0\r\n")
+reply = ser.readline().decode(errors='ignore').strip()
+print("STM32:", reply)
+ser.close()
+PY
+
+python3 - <<'PY'
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+print("POST:", ser.readline().decode(errors='ignore').strip())
+ser.close()
+PY
+
+//Debugging
+python3 -u - <<'PY' | tee /home/theanh/ros2_ws/logs/2m_drive_test.log
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+try:
+    while True:
+        line = ser.readline().decode(errors='ignore').strip()
+        if line:
+            print(line, flush=True)
+except KeyboardInterrupt:
+    pass
+finally:
+    ser.close()
+PY
+
+python3 - <<'PY'
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+ser.write(b"ROTATE_DEG 90\r\n")
+ser.close()
+PY
+
+python3 - <<'PY'
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+ser.write(b"MOVE 1.0\r\n")
+ser.close()
+PY
+
+
+python3 - <<'PY'
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+ser.write(b"RESET_ODOM\r\n")
+ser.close()
+PY
+
+python3 - <<'PY'
+import serial, time
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+ser.write(b"RUNM 1 F 1000\r\n")  # motor 1 forward for 1000 ms
+reply = ser.readline().decode(errors='ignore').strip()
+print("MCU:", reply)
+ser.close()
+PY
+
+python3 - <<'PY'
+import serial
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
+ser.write(b"MOVE_TIME 5 0.45\r\n")
+reply = ser.readline().decode(errors='ignore').strip()
+print("STM32:", reply)
+ser.close()
+PY
