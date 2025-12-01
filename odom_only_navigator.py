@@ -130,16 +130,16 @@ class OdomOnlyNavigator:
     def __init__(self):
         self.logger = logging.getLogger("odom.navigator")
         self.serial_conn = None
-        self.odom_thread = None
-        self.odom_running = False
+        self.response_queue = queue.Queue()
+        
+        # Command-based pose tracking (dead reckoning)
+        # Không dùng odometry từ STM32, tính toán từ lệnh đã gửi
         self.pose_lock = threading.Lock()
-        self.latest_pose = {
+        self.cmd_pose = {
             'x': 0.0,
             'y': 0.0,
-            'theta': 0.0,
-            'timestamp': time.time()
+            'heading_deg': 0.0,  # degrees, 0 = +X, 90 = +Y
         }
-        self.response_queue = queue.Queue()
 
         # LIDAR state
         self.lidar = None
@@ -183,14 +183,15 @@ class OdomOnlyNavigator:
             self._safe_close_serial()
             return False
 
-        self._start_odometry_listener()
+        self._start_serial_listener()
         self._send_raw_command("RESET_ODOM")
+        self._reset_pose()  # Reset internal pose tracking
 
         # Give the scanner a moment to deliver its first frames
         if not self.first_scan_event.wait(timeout=3.0):
             self.logger.warning("No LIDAR data received yet; motion will pause until scans arrive.")
 
-        self.logger.info("Connected. Odometry reset to (0,0,0).")
+        self.logger.info("Connected. Pose reset to (0,0,0).")
         return True
 
     def _safe_close_serial(self):
@@ -202,7 +203,7 @@ class OdomOnlyNavigator:
 
     def _disconnect(self):
         self.logger.info("Disconnecting...")
-        self._stop_odometry_listener()
+        self._stop_serial_listener()
         self._stop_lidar_listener()
         if self.lidar:
             try:
@@ -215,24 +216,25 @@ class OdomOnlyNavigator:
         self._safe_close_serial()
         self.logger.info("Disconnected.")
 
-    # --- Odometry reading ---
-    def _start_odometry_listener(self):
-        if self.odom_running:
+    # --- Serial response reading (không parse odometry, chỉ đọc response) ---
+    def _start_serial_listener(self):
+        if hasattr(self, '_serial_running') and self._serial_running:
             return
-        self.logger.debug("Starting odometry listener thread.")
-        self.odom_running = True
-        self.odom_thread = threading.Thread(target=self._odometry_reader_loop, daemon=True)
-        self.odom_thread.start()
+        self.logger.debug("Starting serial listener thread.")
+        self._serial_running = True
+        self._serial_thread = threading.Thread(target=self._serial_reader_loop, daemon=True)
+        self._serial_thread.start()
 
-    def _stop_odometry_listener(self):
-        self.odom_running = False
-        if self.odom_thread:
-            self.logger.debug("Stopping odometry listener thread.")
-            self.odom_thread.join(timeout=2.0)
-            self.odom_thread = None
+    def _stop_serial_listener(self):
+        self._serial_running = False
+        if hasattr(self, '_serial_thread') and self._serial_thread:
+            self.logger.debug("Stopping serial listener thread.")
+            self._serial_thread.join(timeout=2.0)
+            self._serial_thread = None
 
-    def _odometry_reader_loop(self):
-        while self.odom_running and self.serial_conn and self.serial_conn.is_open:
+    def _serial_reader_loop(self):
+        """Đọc response từ STM32, bỏ qua odometry data."""
+        while self._serial_running and self.serial_conn and self.serial_conn.is_open:
             try:
                 raw = self.serial_conn.readline()
             except serial.SerialException as exc:
@@ -241,31 +243,52 @@ class OdomOnlyNavigator:
             if not raw:
                 continue
             line = raw.decode('utf-8', errors='ignore').strip()
-            pose = self._parse_odometry_line(line)
-            if pose:
-                with self.pose_lock:
-                    self.latest_pose.update(pose)
-            else:
-                if line:
-                    self.logger.info(f"[STM32] {line}")
-                    self.response_queue.put(line.strip())
-        self.odom_running = False
-
-    def _parse_odometry_line(self, line):
-        parts = line.split(',')
-        if len(parts) < 3:
-            return None
-        try:
-            x = float(parts[0])
-            y = float(parts[1])
-            theta = float(parts[2])
-        except ValueError:
-            return None
-        return {'x': x, 'y': y, 'theta': theta, 'timestamp': time.time()}
+            if not line:
+                continue
+            # Bỏ qua dòng odometry (bắt đầu bằng số, có dấu phẩy)
+            if line[0].isdigit() or line[0] == '-':
+                parts = line.split(',')
+                if len(parts) >= 3:
+                    continue  # Skip odometry lines
+            self.logger.info(f"[STM32] {line}")
+            self.response_queue.put(line.strip())
+        self._serial_running = False
 
     def _get_pose(self):
+        """Trả về pose tính từ lệnh đã gửi."""
         with self.pose_lock:
-            return dict(self.latest_pose)
+            return {
+                'x': self.cmd_pose['x'],
+                'y': self.cmd_pose['y'],
+                'heading_deg': self.cmd_pose['heading_deg'],
+            }
+
+    def _reset_pose(self):
+        """Reset pose về (0, 0, 0)."""
+        with self.pose_lock:
+            self.cmd_pose = {'x': 0.0, 'y': 0.0, 'heading_deg': 0.0}
+
+    def _update_pose_after_move(self, distance):
+        """Cập nhật pose sau khi MOVE thành công."""
+        with self.pose_lock:
+            heading_rad = math.radians(self.cmd_pose['heading_deg'])
+            self.cmd_pose['x'] += distance * math.cos(heading_rad)
+            self.cmd_pose['y'] += distance * math.sin(heading_rad)
+            self.logger.info(
+                "Pose updated after MOVE: (%.2f, %.2f, %.1f°)",
+                self.cmd_pose['x'], self.cmd_pose['y'], self.cmd_pose['heading_deg']
+            )
+
+    def _update_pose_after_rotate(self, angle_deg):
+        """Cập nhật pose sau khi ROTATE thành công."""
+        with self.pose_lock:
+            self.cmd_pose['heading_deg'] = normalize_angle_deg(
+                self.cmd_pose['heading_deg'] + angle_deg
+            )
+            self.logger.info(
+                "Pose updated after ROTATE: (%.2f, %.2f, %.1f°)",
+                self.cmd_pose['x'], self.cmd_pose['y'], self.cmd_pose['heading_deg']
+            )
 
     # --- LIDAR reading ---
     def _start_lidar_listener(self):
@@ -346,29 +369,29 @@ class OdomOnlyNavigator:
 
     def _close_enough_heading(self, desired_heading_world):
         pose = self._get_pose()
-        current_heading = math.degrees(pose['theta'])
+        current_heading = pose['heading_deg']
         err = abs(normalize_angle_deg(desired_heading_world - current_heading))
         return err <= ANGLE_TOLERANCE_DEG
 
     def _send_rotate(self, desired_angle_deg, target_heading_world=None):
         """Rotate by desired_angle_deg relative to current heading."""
-        if abs(desired_angle_deg) < ANGLE_TOLERANCE_DEG:
+        if abs(desired_angle_deg) < 0.1:
             return True
         cmd = f"ROTATE_DEG {desired_angle_deg:.2f}"
         self.logger.info(f"ROTATE: {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
         result, line = self._wait_for_response(
-            # Firmware returns "OK ROTATE_DEG" then CL ...; no TARGET_REACHED, so accept OK as success.
             success_tokens=["OK ROTATE_DEG", "TARGET_REACHED"],
             failure_tokens=["ROTATE TIMEOUT", "TIMEOUT"],
             timeout=ROTATE_TIMEOUT_SEC
         )
         if result:
+            self._update_pose_after_rotate(desired_angle_deg)
             return True
         if result is False and line and line.startswith("TIMEOUT"):
-            # Assume success on TIMEOUT to avoid blocking; MCU already running control loop.
             self.logger.warning("Rotation TIMEOUT; assuming success to continue.")
+            self._update_pose_after_rotate(desired_angle_deg)
             return True
         if result is False:
             self.logger.warning(f"Rotation failed ({line}).")
@@ -377,6 +400,7 @@ class OdomOnlyNavigator:
         return False
 
     def _send_move(self, target_distance):
+        """Move forward by target_distance meters."""
         if target_distance < DISTANCE_TOLERANCE_M:
             return True
         cmd = f"MOVE {target_distance:.3f}"
@@ -389,6 +413,7 @@ class OdomOnlyNavigator:
             timeout=MOVE_TIMEOUT_SEC
         )
         if result:
+            self._update_pose_after_move(target_distance)
             return True
         if result is False:
             self.logger.warning(f"Move failed ({line}).")
@@ -426,7 +451,7 @@ class OdomOnlyNavigator:
 
     def _choose_heading_with_avoidance(self, desired_heading_world, step_distance, allow_detour=True):
         """Pick a heading that is both safe (clear corridor) and still progresses toward the goal."""
-        pose_heading_deg = math.degrees(self._get_pose()['theta'])
+        pose_heading_deg = self._get_pose()['heading_deg']
         required_clearance = max(step_distance + CLEARANCE_MARGIN_M, OBSTACLE_STOP_DISTANCE_M)
 
         forward_clear = self._heading_clearance(
@@ -466,10 +491,9 @@ class OdomOnlyNavigator:
 
     def _rotate_to_heading(self, target_heading_world):
         pose = self._get_pose()
-        current_heading = math.degrees(pose['theta'])
+        current_heading = pose['heading_deg']
         rotate_angle = normalize_angle_deg(target_heading_world - current_heading)
         # Force quẹo phải: nếu góc quay âm (quẹo trái), cộng 360 để quẹo phải
-        # STM32 chỉ hỗ trợ quẹo phải (positive degrees)
         if rotate_angle < 0:
             rotate_angle += 360.0
         return self._send_rotate(rotate_angle, target_heading_world)
@@ -489,7 +513,7 @@ class OdomOnlyNavigator:
             # Simple safety gate: if LIDAR says blocked, abort
             if self.first_scan_event.is_set():
                 heading_clear = self._heading_clearance(
-                    desired_heading_world, math.degrees(self._get_pose()['theta']),
+                    desired_heading_world, self._get_pose()['heading_deg'],
                     FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
                 )
                 if heading_clear < OBSTACLE_STOP_DISTANCE_M:
@@ -549,7 +573,7 @@ class OdomOnlyNavigator:
                 final_pose = self._get_pose()
                 self.logger.info(
                     "Final pose x=%.2f y=%.2f heading=%.1f deg",
-                    final_pose['x'], final_pose['y'], math.degrees(final_pose['theta'])
+                    final_pose['x'], final_pose['y'], final_pose['heading_deg']
                 )
                 return
 
@@ -806,9 +830,8 @@ class OdomOnlyNavigator:
         if not self.kafka_bridge:
             return
         pose = self._get_pose()
-        heading_deg = normalize_angle_deg(math.degrees(pose['theta']) + HEADING_OFFSET_DEG)
+        heading_deg = normalize_angle_deg(pose['heading_deg'] + HEADING_OFFSET_DEG)
         payload = {
-            # keep both thetaDeg and headingDeg/heading for FE compatibility
             "pose": {
                 "x": pose['x'],
                 "y": pose['y'],
@@ -932,7 +955,7 @@ class OdomOnlyNavigator:
         # Optional simple safety: if forward corridor blocked, abort (no detours)
         if self.first_scan_event.is_set():
             heading_clear = self._heading_clearance(
-                heading_world, math.degrees(pose['theta']), FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
+                heading_world, pose['heading_deg'], FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
             )
             if heading_clear < OBSTACLE_STOP_DISTANCE_M:
                 self.logger.warning("Obstacle detected ahead; stopping segment.")
