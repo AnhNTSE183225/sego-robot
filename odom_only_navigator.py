@@ -586,6 +586,48 @@ class OdomOnlyNavigator:
             self.logger.warning("Move timeout with no MCU response.")
         return False
     
+    def _log_lidar_scan_debug(self, robot_heading, clearance_found, distance_needed):
+        """Log full LIDAR scan data for debugging when obstacle detected."""
+        scan = self._get_scan_snapshot()
+        if not scan:
+            self.logger.warning("LIDAR DEBUG: No scan data available!")
+            return
+        
+        self.logger.info("=" * 60)
+        self.logger.info("LIDAR DEBUG - OBSTACLE DETECTED")
+        self.logger.info(f"  Robot heading: {robot_heading:.1f}°")
+        self.logger.info(f"  Clearance found: {clearance_found:.2f}m")
+        self.logger.info(f"  Distance needed: {distance_needed:.2f}m")
+        self.logger.info(f"  Forward scan angle: ±{FORWARD_SCAN_ANGLE_DEG/2:.1f}°")
+        self.logger.info(f"  Obstacle stop distance: {OBSTACLE_STOP_DISTANCE_M:.2f}m")
+        
+        # Log points in forward cone
+        forward_points = []
+        half_fov = FORWARD_SCAN_ANGLE_DEG / 2.0
+        for quality, angle_deg, dist_mm in scan:
+            if dist_mm <= 0:
+                continue
+            dist_m = dist_mm / 1000.0
+            # LIDAR angle is relative to robot's forward direction
+            # Normalize to check if in forward cone
+            angle_diff = angle_deg  # LIDAR 0° = robot forward
+            while angle_diff > 180:
+                angle_diff -= 360
+            while angle_diff < -180:
+                angle_diff += 360
+            
+            if abs(angle_diff) <= half_fov and dist_m < distance_needed + CLEARANCE_MARGIN_M:
+                forward_points.append((angle_deg, dist_m, quality))
+        
+        self.logger.info(f"  Points in forward cone ({len(forward_points)} total):")
+        for angle, dist, quality in sorted(forward_points, key=lambda x: x[0]):
+            marker = " <-- BLOCKING" if dist < OBSTACLE_STOP_DISTANCE_M else ""
+            self.logger.info(f"    {angle:6.1f}° : {dist:.2f}m (q={quality}){marker}")
+        
+        if not forward_points:
+            self.logger.warning("  NO points in forward cone - check LIDAR alignment!")
+        self.logger.info("=" * 60)
+    
     def _lidar_move_monitor(self, target_distance):
         """Background thread to monitor LIDAR during MOVE and send STOP if obstacle detected."""
         check_interval = 0.1  # 100ms check interval
@@ -602,6 +644,7 @@ class OdomOnlyNavigator:
                 
                 if clearance < stop_distance:
                     self.logger.warning(f"LIDAR: Obstacle at {clearance:.2f}m! Sending STOP...")
+                    self._log_lidar_scan_debug(current_heading, clearance, target_distance)
                     self._move_stop_reason = f"Obstacle at {clearance:.2f}m"
                     self._send_stop()
                     break
@@ -613,27 +656,43 @@ class OdomOnlyNavigator:
         """
         Returns the closest obstacle distance (meters) inside a wedge centered on heading_world_deg.
         heading_world_deg and pose_heading_deg are expressed in the odom/world frame.
+        
+        LIDAR convention: angle_deg from LIDAR is relative to robot's forward direction
+        - LIDAR 0° = robot forward
+        - LIDAR 90° = robot left
+        - LIDAR 270° = robot right
         """
         scan = self._get_scan_snapshot()
         if not scan:
-            return 0.0  # Fail-safe: treat unknown as blocked to avoid blind driving
+            self.logger.warning("_heading_clearance: No scan data!")
+            return math.inf  # No data = assume clear (better than blocking blindly)
 
+        # When heading_world_deg == pose_heading_deg, relative_heading = 0
+        # This means we're checking robot's forward direction
         relative_heading = normalize_angle_deg(heading_world_deg - pose_heading_deg)
         half_fov = fov_deg / 2.0
         min_dist = math.inf
+        points_in_cone = 0
 
         for _, angle_deg, distance_mm in scan:
             if distance_mm <= 0:
                 continue
+            # angle_deg from LIDAR is already robot-relative (0° = forward)
+            # relative_heading is also robot-relative
             angle_diff = normalize_angle_deg(angle_deg - relative_heading)
             if abs(angle_diff) > half_fov:
                 continue
+            points_in_cone += 1
             distance_m = distance_mm / 1000.0
             if max_range_m is not None and distance_m > max_range_m:
                 distance_m = max_range_m
             if distance_m < min_dist:
                 min_dist = distance_m
 
+        # If no points in cone, path is clear (return infinity)
+        if min_dist == math.inf:
+            self.logger.debug(f"_heading_clearance: No obstacles in ±{half_fov:.0f}° cone ({points_in_cone} points)")
+        
         return min_dist
 
     def _choose_heading_with_avoidance(self, desired_heading_world, step_distance, allow_detour=True):
@@ -1138,23 +1197,36 @@ class OdomOnlyNavigator:
             return True
 
         heading_world = math.degrees(math.atan2(dy, dx))
+        self.logger.info(f"Navigate segment: from ({pose['x']:.2f}, {pose['y']:.2f}) to ({goal[0]:.2f}, {goal[1]:.2f})")
+        self.logger.info(f"  Distance: {distance:.2f}m, Target heading: {heading_world:.1f}°")
 
         # Rotate first to face the goal
+        # NOTE: Rotation should NOT be interrupted by LIDAR - robot spins in place
         if not self._rotate_to_heading(heading_world):
+            self.logger.warning("Rotation failed!")
             return False
+        
+        self.logger.info(f"Rotation complete. Current heading: {self._get_pose()['heading_deg']:.1f}°")
 
         # LIDAR check AFTER rotation - now robot faces the goal direction
         # Check forward (0°) relative to current heading
         if self.first_scan_event.is_set():
             current_heading = self._get_pose()['heading_deg']
+            self.logger.info(f"Checking LIDAR in forward direction (heading {current_heading:.1f}°, FOV ±{FORWARD_SCAN_ANGLE_DEG/2:.0f}°)")
             heading_clear = self._heading_clearance(
                 current_heading, current_heading, FORWARD_SCAN_ANGLE_DEG, distance + CLEARANCE_MARGIN_M
             )
+            self.logger.info(f"LIDAR clearance: {heading_clear:.2f}m (need {OBSTACLE_STOP_DISTANCE_M:.2f}m min)")
+            
             if heading_clear < OBSTACLE_STOP_DISTANCE_M:
-                self.logger.warning(f"Obstacle detected at {heading_clear:.2f}m ahead; stopping segment.")
+                # Log full LIDAR scan for debugging
+                self._log_lidar_scan_debug(current_heading, heading_clear, distance)
+                self.logger.warning(f"Obstacle detected at {heading_clear:.2f}m ahead (need {distance:.2f}m); stopping segment.")
                 return False
+        else:
+            self.logger.warning("No LIDAR data available - proceeding without obstacle check")
 
-        return self._send_move(distance)
+        return self._send_move(distance, monitor_lidar=True)
 
 
 if __name__ == '__main__':
