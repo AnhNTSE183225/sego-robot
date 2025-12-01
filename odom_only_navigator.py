@@ -544,13 +544,18 @@ class OdomOnlyNavigator:
         
         # Bước 2: Monitor LIDAR trong khi chờ MOVE TARGET_REACHED
         # Nếu phát hiện obstacle, gửi STOP ngay lập tức
-        if monitor_lidar and self.first_scan_event.is_set():
-            lidar_monitor_thread = threading.Thread(
-                target=self._lidar_move_monitor,
-                args=(target_distance,),
-                daemon=True
-            )
-            lidar_monitor_thread.start()
+        lidar_monitor_thread = None
+        if monitor_lidar:
+            if self.first_scan_event.is_set():
+                self.logger.info(f"Starting LIDAR monitor thread for MOVE {target_distance:.3f}m")
+                lidar_monitor_thread = threading.Thread(
+                    target=self._lidar_move_monitor,
+                    args=(target_distance,),
+                    daemon=True
+                )
+                lidar_monitor_thread.start()
+            else:
+                self.logger.warning("LIDAR monitor requested but no scan data available yet!")
         
         # Bước 3: Chờ TARGET_REACHED hoặc TIMEOUT
         result, line = self._wait_for_response(
@@ -644,6 +649,9 @@ class OdomOnlyNavigator:
         """Background thread to monitor LIDAR during MOVE and send STOP if obstacle detected."""
         check_interval = 0.1  # 100ms check interval
         stop_distance = OBSTACLE_STOP_DISTANCE_M
+        check_count = 0
+        
+        self.logger.info(f"[LIDAR Monitor] Started - target_distance={target_distance:.2f}m, stop_distance={stop_distance:.2f}m")
         
         while not self._move_stop_flag:
             if self.first_scan_event.is_set():
@@ -653,15 +661,24 @@ class OdomOnlyNavigator:
                     current_heading, current_heading,
                     FORWARD_SCAN_ANGLE_DEG, target_distance
                 )
+                check_count += 1
+                
+                # Log every 5th check (every 0.5s) for debugging
+                if check_count % 5 == 0:
+                    self.logger.debug(f"[LIDAR Monitor] Check #{check_count}: clearance={clearance:.2f}m, heading={current_heading:.1f}°")
                 
                 if clearance < stop_distance:
-                    self.logger.warning(f"LIDAR: Obstacle at {clearance:.2f}m! Sending STOP...")
+                    self.logger.warning(f"[LIDAR Monitor] OBSTACLE DETECTED at {clearance:.2f}m! (stop_distance={stop_distance:.2f}m)")
                     self._log_lidar_scan_debug(current_heading, clearance, target_distance)
                     self._move_stop_reason = f"Obstacle at {clearance:.2f}m"
                     self._send_stop()
                     break
+            else:
+                self.logger.warning("[LIDAR Monitor] No scan data available!")
             
             time.sleep(check_interval)
+        
+        self.logger.info(f"[LIDAR Monitor] Stopped after {check_count} checks")
 
     # --- Obstacle awareness helpers ---
     def _heading_clearance(self, heading_world_deg, pose_heading_deg, fov_deg, max_range_m=None):
