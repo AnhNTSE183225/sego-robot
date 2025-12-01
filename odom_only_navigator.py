@@ -838,8 +838,9 @@ class OdomOnlyNavigator:
         n = len(points)
         for i in range(n):
             j = (i + 1) % n
-            signed_area += (points[j][0] - points[i][0]) * (points[j][1] + points[i][1])
-        # Negative area = clockwise, positive = counter-clockwise
+            # Shoelace formula: sum of (x_i * y_j - x_j * y_i)
+            # Negative area = clockwise, positive = counter-clockwise
+            signed_area += points[i][0] * points[j][1] - points[j][0] * points[i][1]
         return signed_area < 0.0
 
     # --- Perimeter verification (no detours) ---
