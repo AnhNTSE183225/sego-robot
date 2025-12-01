@@ -387,11 +387,13 @@ class OdomOnlyNavigator:
             timeout=ROTATE_TIMEOUT_SEC
         )
         if result:
-            # Chờ STM32 hoàn thành xoay trước khi gửi lệnh tiếp
-            # Ước tính ~2 giây cho 90°, tỷ lệ với góc quay
+            # Chờ STM32 hoàn thành xoay
             wait_time = max(1.0, abs(desired_angle_deg) / 45.0)
             self.logger.info(f"Waiting {wait_time:.1f}s for rotation to complete...")
             time.sleep(wait_time)
+            # Reset STM32 odometry sau khi xoay để MOVE tiếp theo bắt đầu từ (0,0,0)
+            self._send_raw_command("RESET_ODOM")
+            time.sleep(0.1)
             self._update_pose_after_rotate(desired_angle_deg)
             return True
         if result is False:
@@ -415,6 +417,9 @@ class OdomOnlyNavigator:
         )
         if result:
             self._update_pose_after_move(target_distance)
+            # Reset STM32 odometry sau khi di chuyển để lệnh tiếp theo bắt đầu fresh
+            self._send_raw_command("RESET_ODOM")
+            time.sleep(0.1)
             return True
         if result is False:
             self.logger.warning(f"Move failed ({line}).")
