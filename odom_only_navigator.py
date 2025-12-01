@@ -15,27 +15,39 @@ LOG_LEVEL = os.environ.get("ROBOT_LOG_LEVEL", "DEBUG").upper()
 
 
 def configure_logging():
-    """Configure console + rotating file logging for deep debugging."""
-    level = getattr(logging, LOG_LEVEL, logging.DEBUG)
+    """Configure console + rotating file logging.
+    
+    Console: INFO level (or ROBOT_LOG_LEVEL env var)
+    File: Always DEBUG level for detailed debugging
+    """
+    console_level = getattr(logging, LOG_LEVEL, logging.INFO)
+    file_level = logging.DEBUG  # File always gets DEBUG for detailed analysis
+    
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     root = logging.getLogger()
     if root.handlers:
         root.handlers.clear()
-    root.setLevel(level)
+    root.setLevel(logging.DEBUG)  # Root accepts all, handlers filter
 
+    # Console: INFO (hoặc theo env var)
     console = logging.StreamHandler(sys.stdout)
-    console.setLevel(level)
+    console.setLevel(console_level)
     console.setFormatter(formatter)
 
+    # File: DEBUG (luôn luôn để debug chi tiết)
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
     )
-    file_handler.setLevel(level)
+    file_handler.setLevel(file_level)
     file_handler.setFormatter(formatter)
 
     root.addHandler(console)
     root.addHandler(file_handler)
+    
+    # Log startup info (shows in both console and file)
+    logger = logging.getLogger("odom.navigator")
+    logger.info(f"Logging configured: Console={logging.getLevelName(console_level)}, File={logging.getLevelName(file_level)} -> {LOG_FILE}")
 
 
 try:
