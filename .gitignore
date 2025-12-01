@@ -1,2 +1,3 @@
-robot.log
+*.log.*
+*.log
 __pycache__

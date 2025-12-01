@@ -779,9 +779,6 @@ class OdomOnlyNavigator:
         pose = self._get_pose()
         current_heading = pose['heading_deg']
         rotate_angle = normalize_angle_deg(target_heading_world - current_heading)
-        # Force quẹo phải: nếu góc quay âm (quẹo trái), cộng 360 để quẹo phải
-        if rotate_angle < 0:
-            rotate_angle += 360.0
         return self._send_rotate(rotate_angle, target_heading_world)
 
     def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None):
