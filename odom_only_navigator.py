@@ -114,10 +114,10 @@ HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
 # Obstacle avoidance parameters
 MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
 CLEARANCE_MARGIN_M = 0.10          # Buffer added to the intended step distance
-OBSTACLE_STOP_DISTANCE_M = 0.35    # Stop sooner to avoid “bumping” obstacles
+OBSTACLE_STOP_DISTANCE_M = 0.45    # Stop sooner to avoid “bumping” obstacles
 OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
 ROBOT_RADIUS_M = 0.15              # Approx robot radius (m) for corridor checks
-CORRIDOR_HALF_WIDTH_M = 0.18       # Half-width of forward corridor to catch obstacles near edges
+CORRIDOR_HALF_WIDTH_M = 0.25       # Half-width of forward corridor to catch obstacles near edges
 SIDE_WALL_MIN_M = 0.05             # Min distance to consider “along the wall”
 SIDE_WALL_MAX_M = 0.80             # Max distance to consider “along the wall”
 SIDE_CONE_DEG = 60.0               # ±30° cone for side wall detection
@@ -128,7 +128,7 @@ DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn f
 BLOCKED_RETRY_WAIT_SEC = 0.4
 MAX_BLOCKED_RETRIES = 25
 MAX_SIDE_SWITCHES = 5
-START_MIN_CLEARANCE_M = 0.50       # Minimum clearance required before starting a MOVE
+START_MIN_CLEARANCE_M = 0.60       # Minimum clearance required before starting a MOVE
 ROTATE_TIMEOUT_TOLERANCE_DEG = 7.0  # Increased tolerance for timeout acceptance
 
 STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
