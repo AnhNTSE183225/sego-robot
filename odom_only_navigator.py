@@ -115,7 +115,7 @@ HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
 # Obstacle avoidance parameters
 MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
 CLEARANCE_MARGIN_M = 0.05          # Buffer added to the intended step distance
-OBSTACLE_STOP_DISTANCE_M = 0.60    # Anything closer than this in the corridor blocks motion; raised for more stopping room
+OBSTACLE_STOP_DISTANCE_M = 0.10    # Anything closer than this in the corridor blocks motion; raised for more stopping room
 OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
 FORWARD_SCAN_ANGLE_DEG = 100.0     # Width of the forward corridor to check; widened to catch obstacles off-axis
 DETOUR_SCAN_ANGLE_DEG = 80.0       # Wider cone used when looking for alternate headings
