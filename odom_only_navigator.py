@@ -190,6 +190,10 @@ class OdomOnlyNavigator:
         self.boundary_polygon = None
         self.points_of_interest = []
         self.map_anchor_applied = False
+        # Anchor metadata (raw -> anchor). Used to convert pose back to raw frame when publishing status.
+        self.anchor_rotation_deg = None
+        self.anchor_p0_raw = None
+        self.anchor_pose_at_load = None
         self.map_loaded_event = threading.Event()
         self.status_thread = None
         self.status_running = False
@@ -1227,6 +1231,9 @@ class OdomOnlyNavigator:
         self.boundary_polygon = None
         self.points_of_interest = []
         self.map_anchor_applied = False
+        self.anchor_rotation_deg = None
+        self.anchor_p0_raw = None
+        self.anchor_pose_at_load = None
         if not self.map_definition:
             return
         pose = self._get_pose()
@@ -1266,6 +1273,13 @@ class OdomOnlyNavigator:
                 self.boundary_polygon = boundary_poly
                 boundary_anchor_set = True
                 self.map_anchor_applied = True
+                self.anchor_rotation_deg = rotation_offset_deg
+                self.anchor_p0_raw = p0
+                self.anchor_pose_at_load = {
+                    'x': pose['x'],
+                    'y': pose['y'],
+                    'heading_deg': pose['heading_deg'],
+                }
                 self.logger.info(
                     "Anchoring map: edgeAngle=%.1f°, poseHeading=%.1f°, rotOffset=%.1f°",
                     map_edge_angle_deg, pose_heading_deg, rotation_offset_deg
@@ -1311,6 +1325,36 @@ class OdomOnlyNavigator:
             len(self.obstacles),
             len(self.points_of_interest),
         )
+
+    def _pose_anchor_to_raw(self, pose_anchor):
+        """
+        Convert a pose from anchored frame back to raw map frame.
+        If no anchor metadata is available, return the pose as-is.
+        """
+        if (
+            self.anchor_rotation_deg is None
+            or self.anchor_p0_raw is None
+            or self.anchor_pose_at_load is None
+        ):
+            return {
+                'x': pose_anchor.get('x', 0.0),
+                'y': pose_anchor.get('y', 0.0),
+                'heading_deg': pose_anchor.get('heading_deg', 0.0),
+            }
+
+        rot_deg = self.anchor_rotation_deg
+        rad = math.radians(-rot_deg)  # inverse rotation
+        cos_r = math.cos(rad)
+        sin_r = math.sin(rad)
+
+        dx = pose_anchor.get('x', 0.0) - self.anchor_pose_at_load['x']
+        dy = pose_anchor.get('y', 0.0) - self.anchor_pose_at_load['y']
+
+        x_raw = cos_r * dx - sin_r * dy + self.anchor_p0_raw[0]
+        y_raw = sin_r * dx + cos_r * dy + self.anchor_p0_raw[1]
+        heading_raw = normalize_angle_deg(pose_anchor.get('heading_deg', 0.0) + rot_deg)
+
+        return {'x': x_raw, 'y': y_raw, 'heading_deg': heading_raw}
 
     def _point_in_polygon(self, point, polygon):
         x, y = point
@@ -1469,12 +1513,13 @@ class OdomOnlyNavigator:
     def _send_status(self):
         if not self.kafka_bridge:
             return
-        pose = self._get_pose()
-        heading_deg = normalize_angle_deg(pose['heading_deg'] + HEADING_OFFSET_DEG)
+        pose_anchor = self._get_pose()
+        pose_raw = self._pose_anchor_to_raw(pose_anchor)
+        heading_deg = normalize_angle_deg(pose_raw['heading_deg'] + HEADING_OFFSET_DEG)
         payload = {
             "pose": {
-                "x": pose['x'],
-                "y": pose['y'],
+                "x": pose_raw['x'],
+                "y": pose_raw['y'],
                 "thetaDeg": heading_deg,
                 "headingDeg": heading_deg,
                 "heading": heading_deg,
@@ -1483,8 +1528,8 @@ class OdomOnlyNavigator:
         }
         self.logger.info(
             "STATUS pose=(%.2f,%.2f,%.1fdeg) state=%s",
-            pose['x'],
-            pose['y'],
+            pose_raw['x'],
+            pose_raw['y'],
             heading_deg,
             payload["state"],
         )
