@@ -431,7 +431,7 @@ class OdomOnlyNavigator:
         err = abs(normalize_angle_deg(desired_heading_world - current_heading))
         return err <= ANGLE_TOLERANCE_DEG
 
-    def _send_rotate(self, desired_angle_deg, target_heading_world=None):
+    def _send_rotate(self, desired_angle_deg, target_heading_world=None, world_delta=None):
         """Rotate by desired_angle_deg relative to current heading.
         
         STM32 ROTATE_DEG behavior:
@@ -476,26 +476,24 @@ class OdomOnlyNavigator:
             # Reset STM32 odometry so the next MOVE starts from (0,0,0)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
-            self._update_pose_after_rotate(desired_angle_deg)
             return True
         
         # Rotation was interrupted/timed out: use STM32 odom to see how far it got
         stm32_odom = self._get_stm32_odom()
         actual_rotation = stm32_odom['heading_deg']
-        rotation_err = abs(normalize_angle_deg(actual_rotation - desired_angle_deg))
+        target_delta = world_delta if world_delta is not None else desired_angle_deg
+        rotation_err = abs(normalize_angle_deg(actual_rotation - target_delta))
         if rotation_err <= ROTATE_TIMEOUT_TOLERANCE_DEG:
             self.logger.warning(
-                "Rotation TIMEOUT but odom within tolerance (actual=%.1f°, cmd=%.1f°, err=%.1f° <= %.1f°); accepting.",
-                actual_rotation, desired_angle_deg, rotation_err, ROTATE_TIMEOUT_TOLERANCE_DEG
+                "Rotation TIMEOUT but odom within tolerance (actual=%.1f°, target_delta=%.1f°, err=%.1f° <= %.1f°); accepting.",
+                actual_rotation, target_delta, rotation_err, ROTATE_TIMEOUT_TOLERANCE_DEG
             )
-            self._update_pose_after_rotate(actual_rotation)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
             return True
         
         if abs(actual_rotation) > 0.5:  # At least some rotation happened
             self.logger.info(f"Rotation interrupted at {actual_rotation:.1f}deg (commanded: {desired_angle_deg:.1f}deg)")
-            self._update_pose_after_rotate(actual_rotation)
         
         # Reset STM32 odometry for the next command
         self._send_raw_command("RESET_ODOM")
@@ -868,15 +866,19 @@ class OdomOnlyNavigator:
     def _rotate_to_heading(self, target_heading_world):
         pose = self._get_pose()
         current_heading = pose['heading_deg']
-        # Convention: positive angle = rotate right (clockwise) as expected by STM32 firmware.
-        # The heading math (target - current) yields a right turn when negative, so invert sign here.
-        rotate_angle = -normalize_angle_deg(target_heading_world - current_heading)
+        # World delta (CCW positive)
+        world_delta = normalize_angle_deg(target_heading_world - current_heading)
+        # MCU expects clockwise positive, so invert sign
+        command_delta = -world_delta
+
         self.logger.info(
-            "Rotate_to_heading: current=%.1f°, target=%.1f°, command delta=%.1f°",
-            current_heading, target_heading_world, rotate_angle
+            "Rotate_to_heading: current=%.1f°, target=%.1f°, world_delta=%.1f°, command_delta=%.1f°",
+            current_heading, target_heading_world, world_delta, command_delta
         )
-        ok = self._send_rotate(rotate_angle, target_heading_world)
+        ok = self._send_rotate(command_delta, target_heading_world, world_delta=world_delta)
         if ok:
+            # On success, apply world delta
+            self._update_pose_after_rotate(world_delta)
             return True
         # If rotation reported failure, check if we're already close enough
         pose_after = self._get_pose()
