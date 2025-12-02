@@ -114,15 +114,15 @@ HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
 # Obstacle avoidance parameters
 MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
 CLEARANCE_MARGIN_M = 0.10          # Buffer added to the intended step distance
-OBSTACLE_STOP_DISTANCE_M = 0.45    # Stop sooner to avoid “bumping” obstacles
+OBSTACLE_STOP_DISTANCE_M = 0.45    # Stop sooner to avoid "bumping" obstacles
 OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
 ROBOT_RADIUS_M = 0.15              # Approx robot radius (m) for corridor checks
 CORRIDOR_HALF_WIDTH_M = 0.25       # Half-width of forward corridor to catch obstacles near edges
-SIDE_WALL_MIN_M = 0.05             # Min distance to consider “along the wall”
-SIDE_WALL_MAX_M = 0.80             # Max distance to consider “along the wall”
+SIDE_WALL_MIN_M = 0.05             # Min distance to consider "along the wall"
+SIDE_WALL_MAX_M = 0.80             # Max distance to consider "along the wall"
 SIDE_CONE_DEG = 60.0               # ±30° cone for side wall detection
-FORWARD_SCAN_ANGLE_DEG = 140.0     # Width of the forward corridor to check; widened to catch obstacles off-axis
-DETOUR_SCAN_ANGLE_DEG = 80.0       # Wider cone used when looking for alternate headings
+FORWARD_SCAN_ANGLE_DEG = 180.0     # Wider forward corridor to catch off-axis obstacles
+DETOUR_SCAN_ANGLE_DEG = 120.0      # Wider cone used when looking for alternate headings
 DETOUR_ANGLE_STEP_DEG = 15.0       # Angular resolution when sampling detour headings
 DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn for a detour
 BLOCKED_RETRY_WAIT_SEC = 0.4
@@ -667,7 +667,7 @@ class OdomOnlyNavigator:
     
     def _lidar_move_monitor(self, target_distance):
         """Background thread to monitor LIDAR during MOVE and send STOP if obstacle detected."""
-        check_interval = 0.1  # 100ms check interval
+        check_interval = 0.05  # 50ms check interval for faster reaction
         stop_distance = OBSTACLE_STOP_DISTANCE_M
         check_count = 0
         min_clearance_seen = math.inf
@@ -712,55 +712,64 @@ class OdomOnlyNavigator:
     # --- Obstacle awareness helpers ---
     def _heading_clearance(self, heading_world_deg, pose_heading_deg, fov_deg, max_range_m=None):
         """
-        Returns the closest forward distance (meters) to an obstacle inside a corridor centered on heading_world_deg.
-        heading_world_deg and pose_heading_deg are expressed in the odom/world frame.
+        Returns the closest forward distance (meters) from the robot hull to an obstacle
+        inside a corridor centered on heading_world_deg.
         
-        Corridor is defined by:
+        Corridor definition:
         - Angular FOV: ±fov_deg/2 around heading_world_deg
         - Lateral half-width: CORRIDOR_HALF_WIDTH_M
         - Only points in front of the robot (forward > 0)
-        - If max_range_m is provided, points beyond it are ignored
+        - If max_range_m is provided, points beyond it are ignored (after hull offset)
         """
         scan = self._get_scan_snapshot()
         if not scan:
             self.logger.warning("_heading_clearance: No scan data!")
             return math.inf  # No data = assume clear (better than blocking blindly)
 
-        # When heading_world_deg == pose_heading_deg, relative_heading = 0
-        # This means we're checking robot's forward direction
         relative_heading = normalize_angle_deg(heading_world_deg - pose_heading_deg)
         half_fov = fov_deg / 2.0
         min_forward = math.inf
-        points_in_corridor = 0
 
         for _, angle_deg, distance_mm in scan:
             if distance_mm <= 0:
                 continue
+
+            distance_m = distance_mm / 1000.0
+
+            # Skip very far points early if max_range_m provided (allowing for robot radius)
+            if max_range_m is not None and distance_m > max_range_m + ROBOT_RADIUS_M:
+                continue
+
             angle_diff = normalize_angle_deg(angle_deg - relative_heading)
             if abs(angle_diff) > half_fov:
                 continue
-            distance_m = distance_mm / 1000.0
             ang_rad = math.radians(angle_diff)
             forward = distance_m * math.cos(ang_rad)
             lateral = distance_m * math.sin(ang_rad)
 
             if forward <= 0:
                 continue
-            if max_range_m is not None and forward > max_range_m:
+            if max_range_m is not None and forward > max_range_m + ROBOT_RADIUS_M:
                 continue
             if abs(lateral) > CORRIDOR_HALF_WIDTH_M:
                 continue
 
-            points_in_corridor += 1
-            if forward < min_forward:
-                min_forward = forward
+            # Account for robot hull: subtract projected radius in the travel direction
+            if abs(lateral) < ROBOT_RADIUS_M:
+                hull_offset = math.sqrt(max(ROBOT_RADIUS_M ** 2 - lateral ** 2, 0.0))
+            else:
+                hull_offset = 0.0
+
+            clearance_along_path = forward - hull_offset
+            if clearance_along_path < min_forward:
+                min_forward = clearance_along_path
 
         if min_forward == math.inf:
             self.logger.debug(
                 "_heading_clearance: No obstacles in corridor (FOV=±%.0f°, width=%.2fm)",
                 half_fov, CORRIDOR_HALF_WIDTH_M * 2,
             )
-        
+
         return min_forward
 
     def _choose_heading_with_avoidance(self, desired_heading_world, step_distance, allow_detour=True):
