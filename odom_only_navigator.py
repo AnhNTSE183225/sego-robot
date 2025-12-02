@@ -18,7 +18,7 @@ def configure_logging():
     """Configure console + rotating file logging.
     
     Console: INFO level (or ROBOT_LOG_LEVEL env var)
-    File: INFO level to keep files less noisy
+    File: INFO level to keep logs from being too noisy
     """
     console_level = getattr(logging, LOG_LEVEL, logging.INFO)
     file_level = logging.INFO  # File logs at INFO to reduce noise
@@ -104,7 +104,6 @@ ANGLE_TOLERANCE_DEG = 2.0
 # Command timeouts
 MOVE_TIMEOUT_SEC = 25.0
 ROTATE_TIMEOUT_SEC = 15.0
-ROTATE_TIMEOUT_TOLERANCE_DEG = 5.0  # If MCU times out but we're within this error, accept rotation
 
 # Movement mode: True -> use axis-aligned L-shape moves (X then Y)
 AXIS_ALIGNED_MOVES = True
@@ -127,6 +126,7 @@ DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn f
 BLOCKED_RETRY_WAIT_SEC = 0.4
 MAX_BLOCKED_RETRIES = 25
 MAX_SIDE_SWITCHES = 5
+ROTATE_TIMEOUT_TOLERANCE_DEG = 7.0  # Increased tolerance for timeout acceptance
 
 STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
 STATE_OBSTACLE_FOLLOW = "OBSTACLE_FOLLOW"
@@ -485,9 +485,8 @@ class OdomOnlyNavigator:
         rotation_err = abs(normalize_angle_deg(actual_rotation - desired_angle_deg))
         if rotation_err <= ROTATE_TIMEOUT_TOLERANCE_DEG:
             self.logger.warning(
-                f"Rotation timeout ignored: reached {actual_rotation:.1f}deg "
-                f"(commanded {desired_angle_deg:.1f}deg, err {rotation_err:.1f}deg <= "
-                f"{ROTATE_TIMEOUT_TOLERANCE_DEG:.1f}deg)"
+                "Rotation TIMEOUT but odom within tolerance (actual=%.1f°, cmd=%.1f°, err=%.1f° <= %.1f°); accepting.",
+                actual_rotation, desired_angle_deg, rotation_err, ROTATE_TIMEOUT_TOLERANCE_DEG
             )
             self._update_pose_after_rotate(actual_rotation)
             self._send_raw_command("RESET_ODOM")
@@ -872,7 +871,23 @@ class OdomOnlyNavigator:
         # Convention: positive angle = rotate right (clockwise) as expected by STM32 firmware.
         # The heading math (target - current) yields a right turn when negative, so invert sign here.
         rotate_angle = -normalize_angle_deg(target_heading_world - current_heading)
-        return self._send_rotate(rotate_angle, target_heading_world)
+        self.logger.info(
+            "Rotate_to_heading: current=%.1f°, target=%.1f°, command delta=%.1f°",
+            current_heading, target_heading_world, rotate_angle
+        )
+        ok = self._send_rotate(rotate_angle, target_heading_world)
+        if ok:
+            return True
+        # If rotation reported failure, check if we're already close enough
+        pose_after = self._get_pose()
+        err = abs(normalize_angle_deg(target_heading_world - pose_after['heading_deg']))
+        if err <= ANGLE_TOLERANCE_DEG:
+            self.logger.info(
+                "Rotation reported failure but heading within tolerance (err=%.1f° <= %.1f°); accepting.",
+                err, ANGLE_TOLERANCE_DEG
+            )
+            return True
+        return False
 
     def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None):
         """
@@ -1182,7 +1197,6 @@ class OdomOnlyNavigator:
         if not self.map_definition:
             return
         pose = self._get_pose()
-        dx = dy = 0.0
         boundary_anchor_set = False
 
         raw_pois = self.map_definition.get("pointsOfInterest") or []
@@ -1190,19 +1204,42 @@ class OdomOnlyNavigator:
         boundary_pts = (self.map_definition.get("boundary") or {}).get("points") or []
 
         # Anchor boundary to current pose
-        if len(boundary_pts) >= 1:
-            boundary_poly = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in boundary_pts if p.get("x") is not None and p.get("y") is not None]
-            if boundary_poly:
-                bx0, by0 = boundary_poly[0]
-                dx = pose['x'] - bx0
-                dy = pose['y'] - by0
-                boundary_poly = [(x + dx, y + dy) for (x, y) in boundary_poly]
+        if len(boundary_pts) >= 2:
+            raw_boundary = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in boundary_pts if p.get("x") is not None and p.get("y") is not None]
+            if len(raw_boundary) >= 2:
+                p0 = raw_boundary[0]
+                p1 = raw_boundary[1]
+                vx = p1[0] - p0[0]
+                vy = p1[1] - p0[1]
+                map_edge_angle_deg = normalize_angle_deg(math.degrees(math.atan2(vy, vx)))
+                pose_heading_deg = pose['heading_deg']
+                rotation_offset_deg = normalize_angle_deg(pose_heading_deg - map_edge_angle_deg)
+                rot = math.radians(rotation_offset_deg)
+                cos_r = math.cos(rot)
+                sin_r = math.sin(rot)
+
+                def _rotate_translate_point(pt):
+                    rx = pt[0] - p0[0]
+                    ry = pt[1] - p0[1]
+                    x_rot = rx * cos_r - ry * sin_r
+                    y_rot = rx * sin_r + ry * cos_r
+                    x_world = x_rot + p0[0]
+                    y_world = y_rot + p0[1]
+                    x_world += pose['x'] - p0[0]
+                    y_world += pose['y'] - p0[1]
+                    return (x_world, y_world)
+
+                boundary_poly = [_rotate_translate_point(pt) for pt in raw_boundary]
                 self.boundary_polygon = boundary_poly
                 boundary_anchor_set = True
                 self.map_anchor_applied = True
                 self.logger.info(
-                    "Anchored boundary to current pose: anchor=(%.2f, %.2f) dx=%.2f dy=%.2f",
-                    pose['x'], pose['y'], dx, dy
+                    "Anchoring map: edgeAngle=%.1f°, poseHeading=%.1f°, rotOffset=%.1f°",
+                    map_edge_angle_deg, pose_heading_deg, rotation_offset_deg
+                )
+                self.logger.info(
+                    "Boundary anchored: firstVertexWorld=(%.2f, %.2f), vertices=%d",
+                    boundary_poly[0][0], boundary_poly[0][1], len(boundary_poly)
                 )
 
         # Anchor obstacles using same offset if boundary exists
@@ -1212,7 +1249,7 @@ class OdomOnlyNavigator:
             if not polygon:
                 continue
             if boundary_anchor_set:
-                polygon = [(x + dx, y + dy) for (x, y) in polygon]
+                polygon = [_rotate_translate_point(pt) for pt in polygon]
             self.obstacles.append(polygon)
 
         # Anchor POIs using same offset if boundary exists
@@ -1221,8 +1258,7 @@ class OdomOnlyNavigator:
             x = float(poi.get("x", 0.0))
             y = float(poi.get("y", 0.0))
             if boundary_anchor_set:
-                x += dx
-                y += dy
+                x, y = _rotate_translate_point((x, y))
             new_poi = dict(poi)
             new_poi["x"] = x
             new_poi["y"] = y
@@ -1447,7 +1483,6 @@ class OdomOnlyNavigator:
             if self.kafka_bridge:
                 self.kafka_bridge.send_map_verdict(self.map_definition_correlation, None, "INVALID", reason="NO_MAP")
             return False, "No map"
-        boundary = (self.map_definition.get("boundary") or {}).get("points") or []
         map_id = self.map_definition.get("mapId")
         if self.boundary_polygon is None or len(self.boundary_polygon) < 2:
             self.logger.warning("Map boundary invalid; cannot verify perimeter.")
@@ -1485,7 +1520,7 @@ class OdomOnlyNavigator:
 
         for idx, goal in enumerate(points[1:], start=1):
             self.logger.info("Verifying segment %s/%s -> %s", idx, len(points) - 1, goal)
-            success = self._navigate_segment(goal)
+            success = self._navigate_segment(goal, snap_heading=False)
             if not success:
                 self.logger.warning("Perimeter blocked; marking INVALID.")
                 if self.kafka_bridge:
@@ -1518,7 +1553,7 @@ class OdomOnlyNavigator:
                 return float(poi.get("x", 0)), float(poi.get("y", 0))
         return None
 
-    def _navigate_segment(self, goal):
+    def _navigate_segment(self, goal, snap_heading=True):
         """
         Navigate to a goal without detours; single rotate + single move.
         LIDAR only used to reject if something is directly ahead; no path reshaping.
@@ -1533,10 +1568,14 @@ class OdomOnlyNavigator:
 
         # Axis-aligned simplification: snap desired heading to nearest 90°
         heading_world_raw = math.degrees(math.atan2(dy, dx))
-        heading_world = round(heading_world_raw / 90.0) * 90.0
-        heading_world = normalize_angle_deg(heading_world)
+        if snap_heading:
+            heading_world = round(heading_world_raw / 90.0) * 90.0
+            heading_world = normalize_angle_deg(heading_world)
+        else:
+            heading_world = normalize_angle_deg(heading_world_raw)
+        heading_label = "snapped" if snap_heading else "raw"
         self.logger.info(f"Navigate segment: from ({pose['x']:.2f}, {pose['y']:.2f}) to ({goal[0]:.2f}, {goal[1]:.2f})")
-        self.logger.info(f"  Distance: {distance:.2f}m, Target heading (snapped): {heading_world:.1f}° "
+        self.logger.info(f"  Distance: {distance:.2f}m, Target heading ({heading_label}): {heading_world:.1f}° "
                          f"(raw {heading_world_raw:.1f}°)")
 
         # Rotate first to face the goal
