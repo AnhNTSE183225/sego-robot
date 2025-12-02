@@ -481,12 +481,12 @@ class OdomOnlyNavigator:
         # Rotation was interrupted/timed out: use STM32 odom to see how far it got
         stm32_odom = self._get_stm32_odom()
         actual_rotation = stm32_odom['heading_deg']
-        target_delta = world_delta if world_delta is not None else desired_angle_deg
-        rotation_err = abs(normalize_angle_deg(actual_rotation - target_delta))
-        if rotation_err <= ROTATE_TIMEOUT_TOLERANCE_DEG:
+        target_delta_mcu = desired_angle_deg  # MCU frame (same sign as command)
+        rotation_err_mcu = abs(actual_rotation - target_delta_mcu)
+        if rotation_err_mcu <= ROTATE_TIMEOUT_TOLERANCE_DEG:
             self.logger.warning(
-                "Rotation TIMEOUT but odom within tolerance (actual=%.1f°, target_delta=%.1f°, err=%.1f° <= %.1f°); accepting.",
-                actual_rotation, target_delta, rotation_err, ROTATE_TIMEOUT_TOLERANCE_DEG
+                "Rotation TIMEOUT but odom within tolerance in MCU frame (actual=%.1f°, target=%.1f°, err=%.1f° <= %.1f°); accepting.",
+                actual_rotation, target_delta_mcu, rotation_err_mcu, ROTATE_TIMEOUT_TOLERANCE_DEG
             )
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
