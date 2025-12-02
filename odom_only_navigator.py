@@ -1492,6 +1492,9 @@ class OdomOnlyNavigator:
                 self.kafka_bridge.send_map_verdict(self.map_definition_correlation, map_id, "INVALID", reason="INVALID_BOUNDARY")
             return False, "Invalid boundary"
 
+        start_pose = self._get_pose()
+        start_heading = start_pose['heading_deg']
+
         self.logger.info(
             "Starting perimeter verification from pose=(%.2f, %.2f), anchored boundary size=%d",
             self._get_pose()['x'],
@@ -1531,6 +1534,16 @@ class OdomOnlyNavigator:
                         details={"blockedAt": {"x": goal[0], "y": goal[1]}}
                     )
                 return False, "Blocked path"
+
+        # Rotate back to initial heading so robot ends where it started
+        self.logger.info(
+            "Perimeter complete at pose=(%.2f, %.2f, %.1f°); rotating back to start heading %.1f°",
+            self._get_pose()['x'],
+            self._get_pose()['y'],
+            self._get_pose()['heading_deg'],
+            start_heading,
+        )
+        self._rotate_to_heading(start_heading)
 
         self.logger.info("Perimeter verification complete: VALID.")
         if self.kafka_bridge:
