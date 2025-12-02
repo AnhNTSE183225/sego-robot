@@ -117,12 +117,19 @@ MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactivene
 CLEARANCE_MARGIN_M = 0.05          # Buffer added to the intended step distance
 OBSTACLE_STOP_DISTANCE_M = 0.20    # Anything closer than this in the corridor blocks motion; raised for more stopping room
 OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
+SIDE_WALL_MIN_M = 0.05             # Min distance to consider “along the wall”
+SIDE_WALL_MAX_M = 0.80             # Max distance to consider “along the wall”
+SIDE_CONE_DEG = 60.0               # ±30° cone for side wall detection
 FORWARD_SCAN_ANGLE_DEG = 100.0     # Width of the forward corridor to check; widened to catch obstacles off-axis
 DETOUR_SCAN_ANGLE_DEG = 80.0       # Wider cone used when looking for alternate headings
 DETOUR_ANGLE_STEP_DEG = 15.0       # Angular resolution when sampling detour headings
 DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn for a detour
 BLOCKED_RETRY_WAIT_SEC = 0.4
 MAX_BLOCKED_RETRIES = 25
+MAX_SIDE_SWITCHES = 5
+
+STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
+STATE_OBSTACLE_FOLLOW = "OBSTACLE_FOLLOW"
 
 
 def normalize_angle_deg(angle):
@@ -177,6 +184,7 @@ class OdomOnlyNavigator:
         self.map_definition = None
         self.map_definition_correlation = None
         self.obstacles = []
+        self.boundary_polygon = None
         self.points_of_interest = []
         self.map_loaded_event = threading.Event()
         self.status_thread = None
@@ -775,6 +783,88 @@ class OdomOnlyNavigator:
 
         return best_heading
 
+    def _front_clear(self, step_distance, heading_world=None):
+        pose = self._get_pose()
+        heading = pose['heading_deg'] if heading_world is None else heading_world
+        clearance = self._heading_clearance(
+            heading, pose['heading_deg'], FORWARD_SCAN_ANGLE_DEG, step_distance + CLEARANCE_MARGIN_M
+        )
+        required = max(step_distance, OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M)
+        return clearance >= required
+
+    def _side_has_obstacle(self, side):
+        """
+        side: "RIGHT" or "LEFT"
+        Returns True if LIDAR sees obstacle in side cone within [SIDE_WALL_MIN_M, SIDE_WALL_MAX_M].
+        """
+        scan = self._get_scan_snapshot()
+        if not scan:
+            return False
+        target_rel = -90.0 if side == "RIGHT" else 90.0
+        half_fov = SIDE_CONE_DEG / 2.0
+        for _, angle_deg, dist_mm in scan:
+            if dist_mm <= 0:
+                continue
+            distance_m = dist_mm / 1000.0
+            if distance_m < SIDE_WALL_MIN_M or distance_m > SIDE_WALL_MAX_M:
+                continue
+            angle_diff = normalize_angle_deg(angle_deg - target_rel)
+            if abs(angle_diff) <= half_fov:
+                return True
+        return False
+
+    def _path_to_goal_clear(self, pose, segment_goal, base_heading):
+        """
+        Returns True if path from pose -> segment_goal does NOT intersect known obstacles
+        and LIDAR forward clearance in that direction is acceptable.
+        """
+        start = (pose['x'], pose['y'])
+        if self._segment_crosses_obstacles(start, segment_goal):
+            self.logger.info(
+                "Path-to-goal blocked by obstacle: %s -> %s",
+                start, segment_goal
+            )
+            return False
+        if self._segment_leaves_boundary(start, segment_goal):
+            self.logger.info(
+                "Path-to-goal would leave boundary: %s -> %s",
+                start, segment_goal
+            )
+            return False
+        clearance = self._heading_clearance(
+            base_heading,
+            pose['heading_deg'],
+            FORWARD_SCAN_ANGLE_DEG,
+            OBSTACLE_LOOKAHEAD_M
+        )
+        ok = clearance >= (OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M)
+        self.logger.info(
+            "Path-to-goal clearance heading=%.1f° from %s -> %s: %.2fm (required >= %.2fm) => %s",
+            base_heading, start, segment_goal,
+            clearance,
+            OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M,
+            "CLEAR" if ok else "BLOCKED"
+        )
+        return ok
+
+    def _detour_heading(self, base_heading, side):
+        return normalize_angle_deg(base_heading - 90.0 if side == "RIGHT" else base_heading + 90.0)
+
+    def _detour_side_available(self, pose, base_heading, side):
+        """
+        Rough check if a short step in detour direction would immediately cross a known obstacle.
+        """
+        heading = self._detour_heading(base_heading, side)
+        test_step = 0.15
+        dx = test_step * math.cos(math.radians(heading))
+        dy = test_step * math.sin(math.radians(heading))
+        end_point = (pose['x'] + dx, pose['y'] + dy)
+        if self._segment_crosses_obstacles((pose['x'], pose['y']), end_point):
+            return False
+        if self._segment_leaves_boundary((pose['x'], pose['y']), end_point):
+            return False
+        return True
+
     def _rotate_to_heading(self, target_heading_world):
         pose = self._get_pose()
         current_heading = pose['heading_deg']
@@ -846,38 +936,141 @@ class OdomOnlyNavigator:
             self.first_scan_event.wait(timeout=3.0)
 
         if allow_detour and not self._goal_valid(goal):
+            self.logger.warning("navigate_to(%s) rejected: goal invalid wrt map.", goal)
             raise ValueError("Goal lies inside an obstacle")
 
-        while True:
-            pose = self._get_pose()
-            dx = goal[0] - pose['x']
-            dy = goal[1] - pose['y']
-            distance = math.hypot(dx, dy)
-            if distance < DISTANCE_TOLERANCE_M:
-                self.logger.info("Goal reached.")
-                final_pose = self._get_pose()
-                self.logger.info(
-                    "Final pose x=%.2f y=%.2f heading=%.1f deg",
-                    final_pose['x'], final_pose['y'], final_pose['heading_deg']
-                )
-                return
-
-            if AXIS_ALIGNED_MOVES and abs(dx) >= DISTANCE_TOLERANCE_M:
-                desired_heading = 0.0 if dx >= 0 else 180.0
-                step_distance = min(MOVE_STEP_M, abs(dx))
-            elif AXIS_ALIGNED_MOVES:
-                desired_heading = 90.0 if dy >= 0 else -90.0
-                step_distance = min(MOVE_STEP_M, abs(dy))
-            else:
+        # Non-axis-aligned fallback: preserve previous behavior
+        if not AXIS_ALIGNED_MOVES:
+            while True:
+                pose = self._get_pose()
+                dx = goal[0] - pose['x']
+                dy = goal[1] - pose['y']
+                distance = math.hypot(dx, dy)
+                if distance < DISTANCE_TOLERANCE_M:
+                    self.logger.info("Goal reached.")
+                    return
                 desired_heading = math.degrees(math.atan2(dy, dx))
                 step_distance = min(MOVE_STEP_M, distance)
+                if step_distance < DISTANCE_TOLERANCE_M:
+                    continue
+                if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour, current_pose=(pose['x'], pose['y'])):
+                    self.logger.warning("Navigation aborted due to repeated blockages or command errors.")
+                    return
+            return
 
-            if step_distance < DISTANCE_TOLERANCE_M:
+        # Axis-aligned L-shape: two segments (X then Y)
+        pose = self._get_pose()
+        segments = [
+            (goal[0], pose['y']),  # X segment
+            (goal[0], goal[1]),    # Y segment
+        ]
+
+        for segment_goal in segments:
+            state = STATE_GOAL_FOLLOW
+            detour_side = "RIGHT"
+            side_switches = 0
+
+            # If detour is disabled, perform simple rotate+move with LIDAR gate
+            if not allow_detour:
+                while True:
+                    pose = self._get_pose()
+                    dx = segment_goal[0] - pose['x']
+                    dy = segment_goal[1] - pose['y']
+                    distance = math.hypot(dx, dy)
+                    if distance < DISTANCE_TOLERANCE_M:
+                        break
+                    if abs(dx) >= DISTANCE_TOLERANCE_M:
+                        base_heading = 0.0 if dx >= 0 else 180.0
+                    else:
+                        base_heading = 90.0 if dy >= 0 else -90.0
+                    if not self._close_enough_heading(base_heading):
+                        self._rotate_to_heading(base_heading)
+                    if self.first_scan_event.is_set() and not self._front_clear(distance, heading_world=base_heading):
+                        self.logger.warning("Path blocked and detour disabled; aborting segment.")
+                        return
+                    if not self._send_move(distance):
+                        self.logger.warning("Move failed and detour disabled; aborting segment.")
+                        return
                 continue
 
-            if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour, current_pose=(pose['x'], pose['y'])):
-                self.logger.warning("Navigation aborted due to repeated blockages or command errors.")
-                return
+            while True:
+                pose = self._get_pose()
+                dx = segment_goal[0] - pose['x']
+                dy = segment_goal[1] - pose['y']
+                distance = math.hypot(dx, dy)
+                if distance < DISTANCE_TOLERANCE_M:
+                    break  # Segment complete
+
+                # Determine axis and base heading for this segment
+                if abs(dx) >= DISTANCE_TOLERANCE_M:
+                    base_heading = 0.0 if dx >= 0 else 180.0
+                else:
+                    base_heading = 90.0 if dy >= 0 else -90.0
+
+                if state == STATE_GOAL_FOLLOW:
+                    if not self._close_enough_heading(base_heading):
+                        self._rotate_to_heading(base_heading)
+
+                    step = min(MOVE_STEP_M, distance)
+                    if step < DISTANCE_TOLERANCE_M:
+                        continue
+
+                    if self._front_clear(step):
+                        if not self._send_move(step):
+                            # Treat failed move as obstacle encounter
+                            state = STATE_OBSTACLE_FOLLOW
+                            detour_side = "RIGHT"
+                            side_switches = 0
+                        continue
+
+                    # Blocked ahead: choose detour side
+                    preferred = "RIGHT"
+                    if not self._detour_side_available(pose, base_heading, preferred):
+                        preferred = "LEFT"
+                    detour_side = preferred
+                    detour_heading = self._detour_heading(base_heading, detour_side)
+                    self._rotate_to_heading(detour_heading)
+                    state = STATE_OBSTACLE_FOLLOW
+                    side_switches = 0
+                    continue
+
+                if state == STATE_OBSTACLE_FOLLOW:
+                    # Can we return to base path?
+                    if self._path_to_goal_clear(pose, segment_goal, base_heading):
+                        self._rotate_to_heading(base_heading)
+                        state = STATE_GOAL_FOLLOW
+                        detour_side = "RIGHT"
+                        side_switches = 0
+                        continue
+
+                    detour_heading = self._detour_heading(base_heading, detour_side)
+                    # Side contact check (for debugging wall-follow quality)
+                    if not self._side_has_obstacle(detour_side):
+                        self.logger.debug(f"Side {detour_side} appears clear while following obstacle.")
+                    if not self._close_enough_heading(detour_heading):
+                        self._rotate_to_heading(detour_heading)
+
+                    step = min(MOVE_STEP_M, distance)
+                    if step < DISTANCE_TOLERANCE_M:
+                        continue
+
+                    if self._front_clear(step, heading_world=detour_heading):
+                        if not self._send_move(step):
+                            # treat as blockage even though front_clear said clear
+                            pass
+                        continue
+
+                    # Need to switch side
+                    detour_side = "LEFT" if detour_side == "RIGHT" else "RIGHT"
+                    side_switches += 1
+                    detour_heading = self._detour_heading(base_heading, detour_side)
+                    self._rotate_to_heading(detour_heading)
+                    if side_switches > MAX_SIDE_SWITCHES:
+                        self.logger.warning("Too many detour side switches; aborting segment.")
+                        return
+
+        self.logger.info("Goal reached.")
+
 
     # --- CLI loop ---
     def run(self):
@@ -982,6 +1175,7 @@ class OdomOnlyNavigator:
     # --- Map helpers (obstacles & POIs) ---
     def _load_static_map_data(self):
         self.obstacles = []
+        self.boundary_polygon = None
         self.points_of_interest = []
         if not self.map_definition:
             return
@@ -992,6 +1186,20 @@ class OdomOnlyNavigator:
             polygon = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in pts if p.get("x") is not None and p.get("y") is not None]
             if polygon:
                 self.obstacles.append(polygon)
+        boundary_pts = (self.map_definition.get("boundary") or {}).get("points") or []
+        if len(boundary_pts) >= 3:
+            boundary_poly = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in boundary_pts if p.get("x") is not None and p.get("y") is not None]
+            if boundary_poly:
+                self.boundary_polygon = boundary_poly
+        if self.boundary_polygon:
+            self.logger.info(
+                "Boundary loaded: %d vertices, first=%s, last=%s",
+                len(self.boundary_polygon),
+                self.boundary_polygon[0],
+                self.boundary_polygon[-1]
+            )
+        else:
+            self.logger.info("Boundary not present in map definition.")
         self.logger.info(
             "Loaded map data: obstacles=%s pois=%s",
             len(self.obstacles),
@@ -1018,7 +1226,7 @@ class OdomOnlyNavigator:
         return (ccw(p1, q1, q2) != ccw(p2, q1, q2)) and (ccw(p1, p2, q1) != ccw(p1, p2, q2))
 
     def _segment_crosses_obstacles(self, start, end):
-        for poly in self.obstacles:
+        for poly_idx, poly in enumerate(self.obstacles):
             m = len(poly)
             if m < 2:
                 continue
@@ -1026,16 +1234,57 @@ class OdomOnlyNavigator:
                 a = poly[i]
                 b = poly[(i + 1) % m]
                 if self._segments_intersect(start, end, a, b):
+                    self.logger.info(
+                        "Segment %s -> %s intersects obstacle[%d] edge %s -> %s",
+                        start, end, poly_idx, a, b
+                    )
                     return True
             if self._point_in_polygon(end, poly):
+                self.logger.info(
+                    "Segment %s -> %s ends INSIDE obstacle[%d].",
+                    start, end, poly_idx
+                )
                 return True
+        self.logger.debug("Segment %s -> %s does NOT cross any obstacle.", start, end)
         return False
 
     def _goal_valid(self, goal):
-        for poly in self.obstacles:
+        if self.boundary_polygon and not self._point_in_polygon(goal, self.boundary_polygon):
+            self.logger.warning(
+                "Goal %s is OUTSIDE boundary polygon; rejecting.",
+                goal,
+            )
+            return False
+        for poly_idx, poly in enumerate(self.obstacles):
             if self._point_in_polygon(goal, poly):
+                self.logger.warning(
+                    "Goal %s lies INSIDE obstacle index=%d; rejecting.",
+                    goal, poly_idx
+                )
                 return False
+        self.logger.debug("Goal %s is valid w.r.t. boundary + obstacles.", goal)
         return True
+
+    def _segment_leaves_boundary(self, start, end):
+        """
+        Returns True if moving from start to end would leave the boundary polygon.
+        Assumes start should be inside; if boundary is absent, returns False.
+        """
+        if not self.boundary_polygon:
+            return False
+        inside_start = self._point_in_polygon(start, self.boundary_polygon)
+        inside_end = self._point_in_polygon(end, self.boundary_polygon)
+        if inside_start and not inside_end:
+            self.logger.info(
+                "Segment %s -> %s leaves boundary: start inside, end outside.",
+                start, end
+            )
+            return True
+        self.logger.debug(
+            "Segment %s -> %s stays within boundary (start_inside=%s, end_inside=%s).",
+            start, end, inside_start, inside_end
+        )
+        return False
 
     def _execute_command(self, envelope):
         payload = envelope.get("payload") or {}
@@ -1178,6 +1427,11 @@ class OdomOnlyNavigator:
         # Detect orientation and reverse if counter-clockwise (quẹo trái)
         # Robot cần quẹo phải (clockwise) để phù hợp với STM32
         is_clockwise = self._is_polygon_clockwise(points)
+        self.logger.info(
+            "Perimeter boundary orientation: %s (vertices=%d)",
+            "CLOCKWISE" if is_clockwise else "COUNTERCLOCKWISE",
+            len(points)
+        )
         if not is_clockwise:
             self.logger.info("Boundary is counter-clockwise; reversing to clockwise for right-turn navigation.")
             points = list(reversed(points))
@@ -1235,9 +1489,13 @@ class OdomOnlyNavigator:
         if distance < DISTANCE_TOLERANCE_M:
             return True
 
-        heading_world = math.degrees(math.atan2(dy, dx))
+        # Axis-aligned simplification: snap desired heading to nearest 90°
+        heading_world_raw = math.degrees(math.atan2(dy, dx))
+        heading_world = round(heading_world_raw / 90.0) * 90.0
+        heading_world = normalize_angle_deg(heading_world)
         self.logger.info(f"Navigate segment: from ({pose['x']:.2f}, {pose['y']:.2f}) to ({goal[0]:.2f}, {goal[1]:.2f})")
-        self.logger.info(f"  Distance: {distance:.2f}m, Target heading: {heading_world:.1f}°")
+        self.logger.info(f"  Distance: {distance:.2f}m, Target heading (snapped): {heading_world:.1f}° "
+                         f"(raw {heading_world_raw:.1f}°)")
 
         # Rotate first to face the goal
         # NOTE: Rotation should NOT be interrupted by LIDAR - robot spins in place
