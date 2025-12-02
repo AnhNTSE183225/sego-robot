@@ -668,6 +668,7 @@ class OdomOnlyNavigator:
         check_interval = 0.1  # 100ms check interval
         stop_distance = OBSTACLE_STOP_DISTANCE_M
         check_count = 0
+        min_clearance_seen = math.inf
         
         self.logger.info(f"[LIDAR Monitor] Started - target_distance={target_distance:.2f}m, stop_distance={stop_distance:.2f}m")
         
@@ -680,10 +681,15 @@ class OdomOnlyNavigator:
                     FORWARD_SCAN_ANGLE_DEG, target_distance
                 )
                 check_count += 1
+                if clearance < min_clearance_seen:
+                    min_clearance_seen = clearance
                 
-                # Log every 5th check (every 0.5s) for debugging
+                # Log every 5th check (every 0.5s) at INFO for visibility
                 if check_count % 5 == 0:
-                    self.logger.debug(f"[LIDAR Monitor] Check #{check_count}: clearance={clearance:.2f}m, heading={current_heading:.1f}°")
+                    self.logger.info(
+                        "[LIDAR Monitor] Check #%d: clearance=%.2fm, min_seen=%.2fm, heading=%.1f°",
+                        check_count, clearance, min_clearance_seen, current_heading
+                    )
                 
                 if clearance < stop_distance:
                     self.logger.warning(f"[LIDAR Monitor] OBSTACLE DETECTED at {clearance:.2f}m! (stop_distance={stop_distance:.2f}m)")
@@ -696,7 +702,10 @@ class OdomOnlyNavigator:
             
             time.sleep(check_interval)
         
-        self.logger.info(f"[LIDAR Monitor] Stopped after {check_count} checks")
+        self.logger.info(
+            "[LIDAR Monitor] Stopped after %d checks (min_clearance_seen=%.2fm)",
+            check_count, min_clearance_seen
+        )
 
     # --- Obstacle awareness helpers ---
     def _heading_clearance(self, heading_world_deg, pose_heading_deg, fov_deg, max_range_m=None):
