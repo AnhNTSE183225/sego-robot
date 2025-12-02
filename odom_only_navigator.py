@@ -113,8 +113,8 @@ HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
 
 # Obstacle avoidance parameters
 MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
-CLEARANCE_MARGIN_M = 0.05          # Buffer added to the intended step distance
-OBSTACLE_STOP_DISTANCE_M = 0.20    # Anything closer than this in the corridor blocks motion; raised for more stopping room
+CLEARANCE_MARGIN_M = 0.10          # Buffer added to the intended step distance
+OBSTACLE_STOP_DISTANCE_M = 0.35    # Stop sooner to avoid “bumping” obstacles
 OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
 SIDE_WALL_MIN_M = 0.05             # Min distance to consider “along the wall”
 SIDE_WALL_MAX_M = 0.80             # Max distance to consider “along the wall”
@@ -126,6 +126,7 @@ DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn f
 BLOCKED_RETRY_WAIT_SEC = 0.4
 MAX_BLOCKED_RETRIES = 25
 MAX_SIDE_SWITCHES = 5
+START_MIN_CLEARANCE_M = 0.50       # Minimum clearance required before starting a MOVE
 ROTATE_TIMEOUT_TOLERANCE_DEG = 7.0  # Increased tolerance for timeout acceptance
 
 STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
@@ -1609,9 +1610,10 @@ class OdomOnlyNavigator:
             heading_clear = self._heading_clearance(
                 current_heading, current_heading, FORWARD_SCAN_ANGLE_DEG, distance + CLEARANCE_MARGIN_M
             )
-            self.logger.info(f"LIDAR clearance: {heading_clear:.2f}m (need {OBSTACLE_STOP_DISTANCE_M:.2f}m min)")
+            required_start_clearance = max(OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M, START_MIN_CLEARANCE_M)
+            self.logger.info(f"LIDAR clearance: {heading_clear:.2f}m (need {required_start_clearance:.2f}m min)")
             
-            if heading_clear < OBSTACLE_STOP_DISTANCE_M:
+            if heading_clear < required_start_clearance:
                 # Log full LIDAR scan for debugging
                 self._log_lidar_scan_debug(current_heading, heading_clear, distance)
                 self.logger.warning(f"Obstacle detected at {heading_clear:.2f}m ahead (need {distance:.2f}m); stopping segment.")
