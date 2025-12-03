@@ -133,6 +133,7 @@ MAX_BLOCKED_RETRIES = 25
 MAX_SIDE_SWITCHES = 5
 START_MIN_CLEARANCE_M = 0.35       # Minimum clearance required before starting a MOVE
 ROTATE_TIMEOUT_TOLERANCE_DEG = 7.0  # Increased tolerance for timeout acceptance
+MIN_VALID_LIDAR_DIST_M = 0.20      # Ignore hits closer than this (likely robot body/noise)
 
 STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
 STATE_OBSTACLE_FOLLOW = "OBSTACLE_FOLLOW"
@@ -665,6 +666,11 @@ class OdomOnlyNavigator:
             if dist_mm <= 0:
                 continue
             dist_m = dist_mm / 1000.0
+
+            # Ignore very close hits so debug focuses on external obstacles
+            if dist_m < MIN_VALID_LIDAR_DIST_M:
+                continue
+
             robot_angle = lidar_angle_to_robot(raw_angle_deg)
             angle_diff = robot_angle
             
@@ -754,7 +760,7 @@ class OdomOnlyNavigator:
             distance_m = distance_mm / 1000.0
 
             # Ignore hits that are extremely close to the robot (self/mount/edge of platform)
-            if distance_m < 0.22:  # SELF_FILTER_RADIUS_M ~ robot radius + small buffer
+            if distance_m < MIN_VALID_LIDAR_DIST_M:
                 continue
 
             # Skip very far points early if max_range_m provided (allowing for robot radius)
@@ -857,6 +863,8 @@ class OdomOnlyNavigator:
             if dist_mm <= 0:
                 continue
             distance_m = dist_mm / 1000.0
+            if distance_m < MIN_VALID_LIDAR_DIST_M:
+                continue
             if distance_m < SIDE_WALL_MIN_M or distance_m > SIDE_WALL_MAX_M:
                 continue
             robot_angle = lidar_angle_to_robot(raw_angle_deg)
