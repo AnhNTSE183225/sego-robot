@@ -1097,6 +1097,7 @@ class OdomOnlyNavigator:
                 if state == STATE_OBSTACLE_FOLLOW:
                     # Can we return to base path?
                     if self._path_to_goal_clear(pose, segment_goal, base_heading):
+                        self.logger.info("Path to segment goal appears clear; returning to GOAL_FOLLOW.")
                         self._rotate_to_heading(base_heading)
                         state = STATE_GOAL_FOLLOW
                         detour_side = "RIGHT"
@@ -1104,30 +1105,31 @@ class OdomOnlyNavigator:
                         continue
 
                     detour_heading = self._detour_heading(base_heading, detour_side)
-                    # Side contact check (for debugging wall-follow quality)
-                    if not self._side_has_obstacle(detour_side):
-                        self.logger.debug(f"Side {detour_side} appears clear while following obstacle.")
-                    if not self._close_enough_heading(detour_heading):
-                        self._rotate_to_heading(detour_heading)
-
                     step = min(MOVE_STEP_M, distance)
                     if step < DISTANCE_TOLERANCE_M:
                         continue
 
-                    if self._front_clear(step, heading_world=detour_heading):
-                        if not self._send_move(step):
-                            # treat as blockage even though front_clear said clear
-                            pass
+                    moved = self._drive_step(
+                        detour_heading,
+                        step,
+                        allow_detour=True,
+                        current_pose=(pose['x'], pose['y']),
+                    )
+                    if moved:
+                        # Made progress along detour; continue following obstacle
                         continue
 
-                    # Need to switch side
+                    # Detour heading blocked: switch side and retry
+                    self.logger.info(
+                        "Detour side %s blocked when following obstacle; switching side.",
+                        detour_side,
+                    )
                     detour_side = "LEFT" if detour_side == "RIGHT" else "RIGHT"
                     side_switches += 1
-                    detour_heading = self._detour_heading(base_heading, detour_side)
-                    self._rotate_to_heading(detour_heading)
                     if side_switches > MAX_SIDE_SWITCHES:
                         self.logger.warning("Too many detour side switches; aborting segment.")
                         raise RuntimeError("Segment blocked after obstacle-follow retries")
+                    continue
 
         self.logger.info("Goal reached.")
 
