@@ -736,6 +736,23 @@ class OdomOnlyNavigator:
         )
 
     # --- Obstacle awareness helpers ---
+    def _step_static_clear(self, pose, heading_world_deg, step_distance):
+        """
+        Check if a single step along heading_world_deg for step_distance
+        would cross static obstacles or leave the boundary.
+        """
+        sx, sy = pose['x'], pose['y']
+        rad = math.radians(heading_world_deg)
+        ex = sx + step_distance * math.cos(rad)
+        ey = sy + step_distance * math.sin(rad)
+        start = (sx, sy)
+        end = (ex, ey)
+        if self._segment_leaves_boundary(start, end):
+            return False
+        if self._segment_crosses_obstacles(start, end):
+            return False
+        return True
+
     def _heading_clearance(self, heading_world_deg, pose_heading_deg, fov_deg, max_range_m=None):
         """
         Returns the closest forward distance (meters) from the robot hull to an obstacle
@@ -803,14 +820,20 @@ class OdomOnlyNavigator:
 
         return min_forward
 
-    def _choose_heading_with_avoidance(self, desired_heading_world, step_distance, allow_detour=True):
-        """Pick a heading that is both safe (clear corridor) and still progresses toward the goal."""
-        pose_heading_deg = self._get_pose()['heading_deg']
+    def _choose_heading_with_avoidance(self, desired_heading_world, step_distance, allow_detour=True, pose=None):
+        """Pick a heading that is both safe (static map + LIDAR) and still progresses toward the goal."""
+        pose = pose or self._get_pose()
+        pose_heading_deg = pose['heading_deg']
         required_clearance = max(step_distance + CLEARANCE_MARGIN_M, OBSTACLE_STOP_DISTANCE_M)
 
-        forward_clear = self._heading_clearance(
-            desired_heading_world, pose_heading_deg, FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
-        )
+        # First try straight-to-goal heading if static allows it
+        if self._step_static_clear(pose, desired_heading_world, step_distance):
+            forward_clear = self._heading_clearance(
+                desired_heading_world, pose_heading_deg, FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
+            )
+        else:
+            forward_clear = 0.0  # treat as blocked by static map
+
         if forward_clear >= required_clearance:
             return desired_heading_world
 
@@ -828,6 +851,11 @@ class OdomOnlyNavigator:
 
         for offset in offsets:
             candidate_world = normalize_angle_deg(desired_heading_world + offset)
+
+            # Static check for this step; skip headings that would cut obstacles/boundary
+            if not self._step_static_clear(pose, candidate_world, step_distance):
+                continue
+
             clearance = self._heading_clearance(
                 candidate_world, pose_heading_deg, DETOUR_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
             )
@@ -978,11 +1006,12 @@ class OdomOnlyNavigator:
                     FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
                 )
                 if heading_clear < OBSTACLE_STOP_DISTANCE_M:
-                    self.logger.warning("Obstacle detected ahead; stopping move step.")
-                    return False
-            return self._send_move(step_distance)
+            self.logger.warning("Obstacle detected ahead; stopping move step.")
+            return False
+        return self._send_move(step_distance)
 
         attempts = 0
+        pose = pose if 'pose' in locals() else self._get_pose()
         while attempts <= MAX_BLOCKED_RETRIES:
             if not self.first_scan_event.is_set():
                 self.logger.info("Waiting for first LIDAR scan before moving...")
@@ -990,7 +1019,12 @@ class OdomOnlyNavigator:
                 attempts += 1
                 continue
 
-            chosen_heading = self._choose_heading_with_avoidance(desired_heading_world, step_distance, allow_detour)
+            chosen_heading = self._choose_heading_with_avoidance(
+                desired_heading_world,
+                step_distance,
+                allow_detour=True,
+                pose=pose,
+            )
             if chosen_heading is None:
                 attempts += 1
                 self.logger.warning("Path blocked; waiting for an opening...")
