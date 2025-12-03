@@ -116,8 +116,8 @@ HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
 
 # Obstacle avoidance parameters
 MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
-CLEARANCE_MARGIN_M = 0.10          # Buffer added to the intended step distance
-OBSTACLE_STOP_DISTANCE_M = 0.20    # Stop distance (reduced sensitivity)
+CLEARANCE_MARGIN_M = 0.05          # Buffer added to the intended step distance
+OBSTACLE_STOP_DISTANCE_M = 0.30    # Stop distance tuned for small map demo
 OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
 ROBOT_RADIUS_M = 0.15              # Approx robot radius (m) for corridor checks
 CORRIDOR_HALF_WIDTH_M = 0.25       # Half-width of forward corridor to catch obstacles near edges
@@ -752,6 +752,10 @@ class OdomOnlyNavigator:
                 continue
 
             distance_m = distance_mm / 1000.0
+
+            # Ignore hits that are extremely close to the robot (self/mount/edge of platform)
+            if distance_m < 0.22:  # SELF_FILTER_RADIUS_M ~ robot radius + small buffer
+                continue
 
             # Skip very far points early if max_range_m provided (allowing for robot radius)
             if max_range_m is not None and distance_m > max_range_m + ROBOT_RADIUS_M:
