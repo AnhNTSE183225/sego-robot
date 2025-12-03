@@ -131,7 +131,7 @@ DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn f
 BLOCKED_RETRY_WAIT_SEC = 0.4
 MAX_BLOCKED_RETRIES = 25
 MAX_SIDE_SWITCHES = 5
-START_MIN_CLEARANCE_M = 0.35       # Minimum clearance required before starting a MOVE
+START_MIN_CLEARANCE_M = 0.30       # Minimum clearance required before starting a MOVE
 ROTATE_TIMEOUT_TOLERANCE_DEG = 7.0  # Increased tolerance for timeout acceptance
 MIN_VALID_LIDAR_DIST_M = 0.20      # Ignore hits closer than this (likely robot body/noise)
 
@@ -846,7 +846,8 @@ class OdomOnlyNavigator:
         clearance = self._heading_clearance(
             heading, pose['heading_deg'], FORWARD_SCAN_ANGLE_DEG, step_distance + CLEARANCE_MARGIN_M
         )
-        required = max(step_distance, OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M)
+        # Require clearance at least for the planned step, but not stricter than stop distance
+        required = min(step_distance, OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M)
         return clearance >= required
 
     def _side_has_obstacle(self, side):
