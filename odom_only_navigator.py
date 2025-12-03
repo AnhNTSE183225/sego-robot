@@ -688,8 +688,10 @@ class OdomOnlyNavigator:
                 # Check forward direction for obstacles
                 current_heading = self._get_pose()['heading_deg']
                 clearance = self._heading_clearance(
-                    current_heading, current_heading,
-                    FORWARD_SCAN_ANGLE_DEG, target_distance
+                    current_heading,
+                    current_heading,
+                    FORWARD_SCAN_ANGLE_DEG,
+                    OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M
                 )
                 check_count += 1
                 if clearance < min_clearance_seen:
@@ -1125,7 +1127,7 @@ class OdomOnlyNavigator:
                     self._rotate_to_heading(detour_heading)
                     if side_switches > MAX_SIDE_SWITCHES:
                         self.logger.warning("Too many detour side switches; aborting segment.")
-                        return
+                        raise RuntimeError("Segment blocked after obstacle-follow retries")
 
         self.logger.info("Goal reached.")
 
