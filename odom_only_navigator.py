@@ -597,6 +597,8 @@ class OdomOnlyNavigator:
             # Reset STM32 odometry cho lệnh tiếp theo
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
+            # Publish latest pose so UI sees translation promptly
+            self._send_status()
             return True
         
         # Movement bị gián đoạn -> dùng STM32 odom.x để biết thực tế đã đi bao xa
@@ -625,6 +627,8 @@ class OdomOnlyNavigator:
             self.logger.warning(f"Move failed ({line}).")
         else:
             self.logger.warning("Move timeout with no MCU response.")
+        # Publish pose even on interruption so UI reflects actual stop point
+        self._send_status()
         return False
     
     def _log_lidar_scan_debug(self, robot_heading, clearance_found, distance_needed):
@@ -1352,7 +1356,8 @@ class OdomOnlyNavigator:
 
         x_raw = cos_r * dx - sin_r * dy + self.anchor_p0_raw[0]
         y_raw = sin_r * dx + cos_r * dy + self.anchor_p0_raw[1]
-        heading_raw = normalize_angle_deg(pose_anchor.get('heading_deg', 0.0) + rot_deg)
+        # Heading in raw frame = heading_anchor - rotOffset
+        heading_raw = normalize_angle_deg(pose_anchor.get('heading_deg', 0.0) - rot_deg)
 
         return {'x': x_raw, 'y': y_raw, 'heading_deg': heading_raw}
 
