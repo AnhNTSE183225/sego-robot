@@ -186,6 +186,7 @@ class OdomOnlyNavigator:
         self.command_queue = queue.Queue()
         self.map_definition = None
         self.map_definition_correlation = None
+        self.current_map_id = None
         self.obstacles = []
         self.boundary_polygon = None
         self.points_of_interest = []
@@ -1222,25 +1223,41 @@ class OdomOnlyNavigator:
     def _handle_kafka_map_def(self, envelope):
         self.map_definition = envelope.get("payload")
         self.map_definition_correlation = envelope.get("correlationId")
-        self._load_static_map_data()
+        incoming_map_id = self.map_definition.get('mapId') if self.map_definition else None
+        if self.map_anchor_applied and self.current_map_id == incoming_map_id:
+            # Already anchored this mapId; keep existing anchor to avoid "teleporting" pose
+            self.logger.info(
+                "Map definition received again for mapId=%s; keeping existing anchor.",
+                incoming_map_id
+            )
+        else:
+            self.current_map_id = incoming_map_id
+            # Force re-anchor on first receipt or map change
+            self._load_static_map_data(force_reanchor=True)
+            self.logger.info(
+                "Map definition received: mapId=%s",
+                incoming_map_id if incoming_map_id else 'unknown'
+            )
         self.map_loaded_event.set()
-        self.logger.info(
-            "Map definition received: mapId=%s",
-            self.map_definition.get('mapId') if self.map_definition else 'unknown'
-        )
 
     # --- Map helpers (obstacles & POIs) ---
-    def _load_static_map_data(self):
+    def _load_static_map_data(self, force_reanchor=False):
         self.obstacles = []
         self.boundary_polygon = None
         self.points_of_interest = []
-        self.map_anchor_applied = False
-        self.anchor_rotation_deg = None
-        self.anchor_p0_raw = None
-        self.anchor_pose_at_load = None
+        # Only reset anchor metadata when explicitly re-anchoring
+        if force_reanchor or self.anchor_pose_at_load is None:
+            self.map_anchor_applied = False
+            self.anchor_rotation_deg = None
+            self.anchor_p0_raw = None
+            self.anchor_pose_at_load = None
         if not self.map_definition:
             return
-        pose = self._get_pose()
+        # Decide which pose to use for anchoring
+        if force_reanchor or self.anchor_pose_at_load is None:
+            pose_for_anchor = self._get_pose()
+        else:
+            pose_for_anchor = self.anchor_pose_at_load
         boundary_anchor_set = False
 
         raw_pois = self.map_definition.get("pointsOfInterest") or []
@@ -1256,7 +1273,7 @@ class OdomOnlyNavigator:
                 vx = p1[0] - p0[0]
                 vy = p1[1] - p0[1]
                 map_edge_angle_deg = normalize_angle_deg(math.degrees(math.atan2(vy, vx)))
-                pose_heading_deg = pose['heading_deg']
+                pose_heading_deg = pose_for_anchor['heading_deg']
                 rotation_offset_deg = normalize_angle_deg(pose_heading_deg - map_edge_angle_deg)
                 rot = math.radians(rotation_offset_deg)
                 cos_r = math.cos(rot)
@@ -1269,21 +1286,23 @@ class OdomOnlyNavigator:
                     y_rot = rx * sin_r + ry * cos_r
                     x_world = x_rot + p0[0]
                     y_world = y_rot + p0[1]
-                    x_world += pose['x'] - p0[0]
-                    y_world += pose['y'] - p0[1]
+                    x_world += pose_for_anchor['x'] - p0[0]
+                    y_world += pose_for_anchor['y'] - p0[1]
                     return (x_world, y_world)
 
                 boundary_poly = [_rotate_translate_point(pt) for pt in raw_boundary]
                 self.boundary_polygon = boundary_poly
                 boundary_anchor_set = True
                 self.map_anchor_applied = True
-                self.anchor_rotation_deg = rotation_offset_deg
-                self.anchor_p0_raw = p0
-                self.anchor_pose_at_load = {
-                    'x': pose['x'],
-                    'y': pose['y'],
-                    'heading_deg': pose['heading_deg'],
-                }
+                # Only overwrite anchor metadata when (re)anchoring
+                if force_reanchor or self.anchor_pose_at_load is None:
+                    self.anchor_rotation_deg = rotation_offset_deg
+                    self.anchor_p0_raw = p0
+                    self.anchor_pose_at_load = {
+                        'x': pose_for_anchor['x'],
+                        'y': pose_for_anchor['y'],
+                        'heading_deg': pose_for_anchor['heading_deg'],
+                    }
                 self.logger.info(
                     "Anchoring map: edgeAngle=%.1f°, poseHeading=%.1f°, rotOffset=%.1f°",
                     map_edge_angle_deg, pose_heading_deg, rotation_offset_deg
@@ -1465,7 +1484,8 @@ class OdomOnlyNavigator:
             if map_def:
                 self.map_definition = map_def
                 self.map_definition_correlation = correlation_id
-                self._load_static_map_data()
+                # Allow re-anchor when perimeter validation explicitly sends a map
+                self._load_static_map_data(force_reanchor=True)
                 self.map_loaded_event.set()
             ok, reason = self._verify_perimeter()
             self._send_ack(correlation_id, cmd, ok, reason)
@@ -1520,7 +1540,8 @@ class OdomOnlyNavigator:
             return
         pose_anchor = self._get_pose()
         pose_raw = self._pose_anchor_to_raw(pose_anchor)
-        heading_deg = normalize_angle_deg(pose_raw['heading_deg'] + HEADING_OFFSET_DEG)
+        # Publish heading in raw map frame; do not add hardware offset here
+        heading_deg = normalize_angle_deg(pose_raw['heading_deg'])
         payload = {
             "pose": {
                 "x": pose_raw['x'],
@@ -1532,7 +1553,10 @@ class OdomOnlyNavigator:
             "state": "IDLE",
         }
         self.logger.info(
-            "STATUS pose=(%.2f,%.2f,%.1fdeg) state=%s",
+            "STATUS anchor=(%.2f,%.2f,%.1fdeg) raw=(%.2f,%.2f,%.1fdeg) state=%s",
+            pose_anchor['x'],
+            pose_anchor['y'],
+            pose_anchor['heading_deg'],
             pose_raw['x'],
             pose_raw['y'],
             heading_deg,
