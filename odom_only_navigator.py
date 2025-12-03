@@ -803,14 +803,48 @@ class OdomOnlyNavigator:
 
         return min_forward
 
-    def _choose_heading_with_avoidance(self, desired_heading_world, step_distance, allow_detour=True):
-        """Pick a heading that is both safe (clear corridor) and still progresses toward the goal."""
-        pose_heading_deg = self._get_pose()['heading_deg']
+    def _step_static_clear(self, pose, heading_world_deg, step_distance):
+        """
+        Check whether a forward step of step_distance along heading_world_deg stays within boundary
+        and does not cut through any static obstacle.
+        """
+        sx, sy = pose['x'], pose['y']
+        rad = math.radians(heading_world_deg)
+        ex = sx + step_distance * math.cos(rad)
+        ey = sy + step_distance * math.sin(rad)
+        start = (sx, sy)
+        end = (ex, ey)
+
+        if self._segment_leaves_boundary(start, end):
+            return False
+        if self._segment_crosses_obstacles(start, end):
+            return False
+        return True
+
+    def _choose_heading_with_avoidance(
+        self,
+        desired_heading_world,
+        step_distance,
+        allow_detour=True,
+        pose=None,
+    ):
+        """Pick a heading that is safe against both static map and LIDAR while progressing toward the goal."""
+        if pose is None:
+            pose = self._get_pose()
+
+        pose_heading_deg = pose['heading_deg']
         required_clearance = max(step_distance + CLEARANCE_MARGIN_M, OBSTACLE_STOP_DISTANCE_M)
 
-        forward_clear = self._heading_clearance(
-            desired_heading_world, pose_heading_deg, FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
-        )
+        if self._step_static_clear(pose, desired_heading_world, step_distance):
+            forward_clear = self._heading_clearance(
+                desired_heading_world,
+                pose_heading_deg,
+                FORWARD_SCAN_ANGLE_DEG,
+                OBSTACLE_LOOKAHEAD_M,
+            )
+        else:
+            forward_clear = 0.0
+
         if forward_clear >= required_clearance:
             return desired_heading_world
 
@@ -828,12 +862,21 @@ class OdomOnlyNavigator:
 
         for offset in offsets:
             candidate_world = normalize_angle_deg(desired_heading_world + offset)
-            clearance = self._heading_clearance(
-                candidate_world, pose_heading_deg, DETOUR_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
-            )
-            progress = max(0.0, math.cos(math.radians(offset)))  # Penalize turns that face away from goal
 
-            if clearance < required_clearance or progress <= 0.0:
+            if not self._step_static_clear(pose, candidate_world, step_distance):
+                continue
+
+            clearance = self._heading_clearance(
+                candidate_world,
+                pose_heading_deg,
+                DETOUR_SCAN_ANGLE_DEG,
+                OBSTACLE_LOOKAHEAD_M,
+            )
+            if clearance < required_clearance:
+                continue
+
+            progress = max(0.0, math.cos(math.radians(offset)))  # Penalize turns that face away from goal
+            if progress <= 0.0:
                 continue
 
             score = clearance * progress
@@ -957,25 +1000,33 @@ class OdomOnlyNavigator:
             return True
         return False
 
-    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None, check_static=False):
+    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None, check_static=True):
         """
         Drive one step toward desired_heading_world.
-        - When allow_detour is False (perimeter verification), we bypass LIDAR gating to guarantee
-          the robot keeps tracing the boundary; obstacle avoidance is not applied.
-        - check_static is kept for compatibility but defaults to False so local motion
-          relies on LIDAR; static obstacles should be handled by the global planner.
+        - When allow_detour is False (perimeter verification), we rotate/move in the requested
+          direction without exploring detours, but still gate by LIDAR/static safety.
+        - check_static is kept for compatibility; static checks are always applied.
         """
-        start_point = current_pose if current_pose else (self._get_pose()['x'], self._get_pose()['y'])
+        if current_pose:
+            pose = {'x': current_pose[0], 'y': current_pose[1], 'heading_deg': self._get_pose()['heading_deg']}
+        else:
+            pose = self._get_pose()
 
         if not allow_detour:
-            # Pure odom move: rotate then move, ignore LIDAR/obstacle sampling.
+            # Rotate then move in-place without exploring alternate headings.
+            if not self._step_static_clear(pose, desired_heading_world, step_distance):
+                self.logger.warning("Static map blocks requested step; aborting move.")
+                return False
             if not self._rotate_to_heading(desired_heading_world):
                 return False
             # Simple safety gate: if LIDAR says blocked, abort
             if self.first_scan_event.is_set():
+                pose['heading_deg'] = self._get_pose()['heading_deg']
                 heading_clear = self._heading_clearance(
-                    desired_heading_world, self._get_pose()['heading_deg'],
-                    FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
+                    desired_heading_world,
+                    pose['heading_deg'],
+                    FORWARD_SCAN_ANGLE_DEG,
+                    step_distance + CLEARANCE_MARGIN_M,
                 )
                 if heading_clear < OBSTACLE_STOP_DISTANCE_M:
                     self.logger.warning("Obstacle detected ahead; stopping move step.")
@@ -990,7 +1041,13 @@ class OdomOnlyNavigator:
                 attempts += 1
                 continue
 
-            chosen_heading = self._choose_heading_with_avoidance(desired_heading_world, step_distance, allow_detour)
+            pose['heading_deg'] = self._get_pose()['heading_deg']
+            chosen_heading = self._choose_heading_with_avoidance(
+                desired_heading_world,
+                step_distance,
+                allow_detour=True,
+                pose=pose,
+            )
             if chosen_heading is None:
                 attempts += 1
                 self.logger.warning("Path blocked; waiting for an opening...")
@@ -1036,7 +1093,7 @@ class OdomOnlyNavigator:
                 if not self._navigate_direct(
                     wp,
                     allow_detour=allow_detour,
-                    check_static=False if len(waypoints) > 1 else False,
+                    check_static=True,
                 ):
                     return
             self.logger.info("Goal reached.")
