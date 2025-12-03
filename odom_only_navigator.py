@@ -135,8 +135,8 @@ START_MIN_CLEARANCE_M = 0.25       # Minimum clearance required before starting 
 ROTATE_TIMEOUT_TOLERANCE_DEG = 15.0  # Accept larger odom error on rotation timeout to avoid false blockage
 MIN_VALID_LIDAR_DIST_M = 0.20      # Ignore hits closer than this (likely robot body/noise)
 # Path planning
-ASTAR_GRID_STEP_M = 0.10           # Grid resolution for simple A* planner
-ASTAR_MAX_NODES = 8000             # Safety cap to avoid runaway planning
+ASTAR_GRID_STEP_M = 0.05           # Finer grid for A* planner to find narrow corridors
+ASTAR_MAX_NODES = 20000            # Safety cap to avoid runaway planning
 
 STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
 STATE_OBSTACLE_FOLLOW = "OBSTACLE_FOLLOW"
@@ -957,12 +957,13 @@ class OdomOnlyNavigator:
             return True
         return False
 
-    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None, check_static=True):
+    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None, check_static=False):
         """
         Drive one step toward desired_heading_world.
         - When allow_detour is False (perimeter verification), we bypass LIDAR gating to guarantee
           the robot keeps tracing the boundary; obstacle avoidance is not applied.
-        - check_static=False can be used when following a pre-planned path that already considered static obstacles.
+        - check_static is kept for compatibility but defaults to False so local motion
+          relies on LIDAR; static obstacles should be handled by the global planner.
         """
         start_point = current_pose if current_pose else (self._get_pose()['x'], self._get_pose()['y'])
 
@@ -996,15 +997,6 @@ class OdomOnlyNavigator:
                 time.sleep(BLOCKED_RETRY_WAIT_SEC)
                 continue
 
-            dx = step_distance * math.cos(math.radians(chosen_heading))
-            dy = step_distance * math.sin(math.radians(chosen_heading))
-            end_point = (start_point[0] + dx, start_point[1] + dy)
-            if check_static and self._segment_crosses_obstacles(start_point, end_point):
-                attempts += 1
-                self.logger.warning("Static obstacle blocks the segment; trying another heading...")
-                time.sleep(BLOCKED_RETRY_WAIT_SEC)
-                continue
-
             if not self._rotate_to_heading(chosen_heading):
                 return False
             if not self._send_move(step_distance):
@@ -1035,7 +1027,7 @@ class OdomOnlyNavigator:
                 if waypoints:
                     self.logger.info("Planner produced %d waypoint(s).", len(waypoints))
                 else:
-                    self.logger.info("Planner failed; falling back to direct navigation.")
+                    self.logger.info("Planner failed; falling back to direct navigation with LIDAR-only avoidance.")
                     waypoints = [goal]
             else:
                 waypoints = [goal]
@@ -1044,7 +1036,7 @@ class OdomOnlyNavigator:
                 if not self._navigate_direct(
                     wp,
                     allow_detour=allow_detour,
-                    check_static=False if len(waypoints) > 1 else True,
+                    check_static=False if len(waypoints) > 1 else False,
                 ):
                     return
             self.logger.info("Goal reached.")
@@ -1534,6 +1526,7 @@ class OdomOnlyNavigator:
             return [goal]
 
         if not self.boundary_polygon:
+            self.logger.info("Planner abort: no boundary polygon.")
             return None
 
         xs = [p[0] for p in self.boundary_polygon]
@@ -1560,12 +1553,18 @@ class OdomOnlyNavigator:
                 y += ASTAR_GRID_STEP_M
                 count_nodes += 1
                 if count_nodes > ASTAR_MAX_NODES:
+                    self.logger.warning("Planner abort: exceeded node cap while sampling free space.")
                     break
             if count_nodes > ASTAR_MAX_NODES:
                 break
             x += ASTAR_GRID_STEP_M
 
         if start_g not in free or goal_g not in free:
+            self.logger.info(
+                "Planner abort: start/goal not in free space (start_free=%s, goal_free=%s)",
+                start_g in free,
+                goal_g in free,
+            )
             return None
 
         import heapq
@@ -1610,6 +1609,7 @@ class OdomOnlyNavigator:
                     f = tentative + heuristic(nb, goal_g)
                     heapq.heappush(open_set, (f, nb))
 
+        self.logger.info("Planner failed to find path after visiting %d nodes (cap=%d).", visited, ASTAR_MAX_NODES)
         return None
 
     def _goal_valid(self, goal):
