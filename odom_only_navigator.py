@@ -35,7 +35,7 @@ def configure_logging():
     console.setLevel(console_level)
     console.setFormatter(formatter)
 
-    # File: DEBUG (luôn luôn để debug chi tiết)
+    # File: INFO (luôn luôn để debug chi tiết)
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
     )
@@ -1782,13 +1782,16 @@ class OdomOnlyNavigator:
             heading_clear = self._heading_clearance(
                 current_heading, current_heading, FORWARD_SCAN_ANGLE_DEG, distance + CLEARANCE_MARGIN_M
             )
-            required_start_clearance = max(OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M, START_MIN_CLEARANCE_M)
+            # Require clearance at least for the distance we plan to move, but not stricter than stop distance
+            required_start_clearance = min(distance, OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M)
             self.logger.info(f"LIDAR clearance: {heading_clear:.2f}m (need {required_start_clearance:.2f}m min)")
             
             if heading_clear < required_start_clearance:
                 # Log full LIDAR scan for debugging
                 self._log_lidar_scan_debug(current_heading, heading_clear, distance)
-                self.logger.warning(f"Obstacle detected at {heading_clear:.2f}m ahead (need {distance:.2f}m); stopping segment.")
+                self.logger.warning(
+                    f"Obstacle detected at {heading_clear:.2f}m ahead (need {required_start_clearance:.2f}m); stopping segment."
+                )
                 return False
         else:
             self.logger.warning("No LIDAR data available - proceeding without obstacle check")
