@@ -88,6 +88,9 @@ BAUD_RATE = 115200
 
 # LIDAR configuration
 LIDAR_PORT = '/dev/ttyUSB0'
+# LIDAR angle mapping: robot forward (0°) corresponds to raw angle with offset + sign flip.
+# From measurements: obstacle in front ~120.6°, obstacle left ~27.5° => offset ≈119°, robot_angle = -raw + offset
+LIDAR_FRONT_OFFSET_DEG = 119.0
 
 # Kafka configuration (shared topics)
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -142,6 +145,14 @@ def normalize_angle_deg(angle):
     while angle < -180.0:
         angle += 360.0
     return angle
+
+
+def lidar_angle_to_robot(angle_deg: float) -> float:
+    """
+    Convert raw LIDAR angle (per RPLidar frame) into robot-forward frame.
+    After conversion: 0deg = robot forward, +90deg = robot left, -90deg = robot right.
+    """
+    return normalize_angle_deg(-angle_deg + LIDAR_FRONT_OFFSET_DEG)
 
 
 class OdomOnlyNavigator:
@@ -647,28 +658,23 @@ class OdomOnlyNavigator:
         self.logger.info(f"  Forward scan angle: ±{FORWARD_SCAN_ANGLE_DEG/2:.1f}°")
         self.logger.info(f"  Obstacle stop distance: {OBSTACLE_STOP_DISTANCE_M:.2f}m")
         
-        # Log points in forward cone
+        # Log points in forward cone (robot frame)
         forward_points = []
         half_fov = FORWARD_SCAN_ANGLE_DEG / 2.0
-        for quality, angle_deg, dist_mm in scan:
+        for quality, raw_angle_deg, dist_mm in scan:
             if dist_mm <= 0:
                 continue
             dist_m = dist_mm / 1000.0
-            # LIDAR angle is relative to robot's forward direction
-            # Normalize to check if in forward cone
-            angle_diff = angle_deg  # LIDAR 0° = robot forward
-            while angle_diff > 180:
-                angle_diff -= 360
-            while angle_diff < -180:
-                angle_diff += 360
+            robot_angle = lidar_angle_to_robot(raw_angle_deg)
+            angle_diff = robot_angle
             
             if abs(angle_diff) <= half_fov and dist_m < distance_needed + CLEARANCE_MARGIN_M:
-                forward_points.append((angle_deg, dist_m, quality))
+                forward_points.append((robot_angle, raw_angle_deg, dist_m, quality))
         
         self.logger.info(f"  Points in forward cone ({len(forward_points)} total):")
-        for angle, dist, quality in sorted(forward_points, key=lambda x: x[0]):
+        for robot_a, raw_a, dist, quality in sorted(forward_points, key=lambda x: x[0]):
             marker = " <-- BLOCKING" if dist < OBSTACLE_STOP_DISTANCE_M else ""
-            self.logger.info(f"    {angle:6.1f}° : {dist:.2f}m (q={quality}){marker}")
+            self.logger.info(f"    robot={robot_a:6.1f}° raw={raw_a:6.1f}° : {dist:.2f}m (q={quality}){marker}")
         
         if not forward_points:
             self.logger.warning("  NO points in forward cone - check LIDAR alignment!")
@@ -741,7 +747,7 @@ class OdomOnlyNavigator:
         half_fov = fov_deg / 2.0
         min_forward = math.inf
 
-        for _, angle_deg, distance_mm in scan:
+        for _, raw_angle_deg, distance_mm in scan:
             if distance_mm <= 0:
                 continue
 
@@ -751,7 +757,8 @@ class OdomOnlyNavigator:
             if max_range_m is not None and distance_m > max_range_m + ROBOT_RADIUS_M:
                 continue
 
-            angle_diff = normalize_angle_deg(angle_deg - relative_heading)
+            robot_angle = lidar_angle_to_robot(raw_angle_deg)
+            angle_diff = normalize_angle_deg(robot_angle - relative_heading)
             if abs(angle_diff) > half_fov:
                 continue
             ang_rad = math.radians(angle_diff)
@@ -842,13 +849,14 @@ class OdomOnlyNavigator:
             return False
         target_rel = -90.0 if side == "RIGHT" else 90.0
         half_fov = SIDE_CONE_DEG / 2.0
-        for _, angle_deg, dist_mm in scan:
+        for _, raw_angle_deg, dist_mm in scan:
             if dist_mm <= 0:
                 continue
             distance_m = dist_mm / 1000.0
             if distance_m < SIDE_WALL_MIN_M or distance_m > SIDE_WALL_MAX_M:
                 continue
-            angle_diff = normalize_angle_deg(angle_deg - target_rel)
+            robot_angle = lidar_angle_to_robot(raw_angle_deg)
+            angle_diff = normalize_angle_deg(robot_angle - target_rel)
             if abs(angle_diff) <= half_fov:
                 return True
         return False
@@ -1384,7 +1392,7 @@ class OdomOnlyNavigator:
 
         return {'x': x_raw, 'y': y_raw, 'heading_deg': heading_raw}
 
-    def _point_in_polygon(self, point, polygon):
+    def _point_in_polygon(self, point, polygon, epsilon=1e-6):
         x, y = point
         inside = False
         n = len(polygon)
@@ -1393,6 +1401,18 @@ class OdomOnlyNavigator:
         px1, py1 = polygon[0]
         for i in range(n + 1):
             px2, py2 = polygon[i % n]
+            # Check if point lies on edge (inclusive with epsilon)
+            dx = px2 - px1
+            dy = py2 - py1
+            if abs(dx) < epsilon and abs(dy) < epsilon:
+                px1, py1 = px2, py2
+                continue
+            t = ((x - px1) * dx + (y - py1) * dy) / ((dx * dx) + (dy * dy) + 1e-12)
+            t_clamped = max(0.0, min(1.0, t))
+            proj_x = px1 + t_clamped * dx
+            proj_y = py1 + t_clamped * dy
+            if math.hypot(proj_x - x, proj_y - y) <= epsilon:
+                return True
             if ((py1 > y) != (py2 > y)) and (x < (px2 - px1) * (y - py1) / ((py2 - py1) + 1e-9) + px1):
                 inside = not inside
             px1, py1 = px2, py2
