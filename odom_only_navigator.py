@@ -108,8 +108,8 @@ ANGLE_TOLERANCE_DEG = 2.0
 MOVE_TIMEOUT_SEC = 25.0
 ROTATE_TIMEOUT_SEC = 15.0
 
-# Movement mode: True -> use axis-aligned L-shape moves (X then Y)
-AXIS_ALIGNED_MOVES = True
+# Movement mode: False -> use direct heading (no forced L-shape)
+AXIS_ALIGNED_MOVES = False
 
 # Heading offset (deg) to align MCU frame with map frame if needed (e.g., set to 90 to face +Y by default)
 HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
