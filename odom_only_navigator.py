@@ -132,7 +132,7 @@ BLOCKED_RETRY_WAIT_SEC = 0.4
 MAX_BLOCKED_RETRIES = 25
 MAX_SIDE_SWITCHES = 5
 START_MIN_CLEARANCE_M = 0.25       # Minimum clearance required before starting a MOVE
-ROTATE_TIMEOUT_TOLERANCE_DEG = 7.0  # Increased tolerance for timeout acceptance
+ROTATE_TIMEOUT_TOLERANCE_DEG = 15.0  # Accept larger odom error on rotation timeout to avoid false blockage
 MIN_VALID_LIDAR_DIST_M = 0.20      # Ignore hits closer than this (likely robot body/noise)
 
 STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
