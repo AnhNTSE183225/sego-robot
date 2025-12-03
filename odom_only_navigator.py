@@ -134,6 +134,9 @@ MAX_SIDE_SWITCHES = 5
 START_MIN_CLEARANCE_M = 0.25       # Minimum clearance required before starting a MOVE
 ROTATE_TIMEOUT_TOLERANCE_DEG = 15.0  # Accept larger odom error on rotation timeout to avoid false blockage
 MIN_VALID_LIDAR_DIST_M = 0.20      # Ignore hits closer than this (likely robot body/noise)
+# Path planning
+ASTAR_GRID_STEP_M = 0.10           # Grid resolution for simple A* planner
+ASTAR_MAX_NODES = 8000             # Safety cap to avoid runaway planning
 
 STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
 STATE_OBSTACLE_FOLLOW = "OBSTACLE_FOLLOW"
@@ -1022,21 +1025,24 @@ class OdomOnlyNavigator:
 
         # Non-axis-aligned fallback: preserve previous behavior
         if not AXIS_ALIGNED_MOVES:
-            while True:
+            # Simple A* path plan using static obstacles if detour is allowed
+            waypoints = None
+            if allow_detour:
                 pose = self._get_pose()
-                dx = goal[0] - pose['x']
-                dy = goal[1] - pose['y']
-                distance = math.hypot(dx, dy)
-                if distance < DISTANCE_TOLERANCE_M:
-                    self.logger.info("Goal reached.")
+                start = (pose['x'], pose['y'])
+                waypoints = self._plan_path_astar(start, goal)
+                if waypoints:
+                    self.logger.info("Planner produced %d waypoint(s).", len(waypoints))
+                else:
+                    self.logger.info("Planner failed; falling back to direct navigation.")
+                    waypoints = [goal]
+            else:
+                waypoints = [goal]
+
+            for wp in waypoints:
+                if not self._navigate_direct(wp, allow_detour=allow_detour):
                     return
-                desired_heading = math.degrees(math.atan2(dy, dx))
-                step_distance = min(MOVE_STEP_M, distance)
-                if step_distance < DISTANCE_TOLERANCE_M:
-                    continue
-                if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour, current_pose=(pose['x'], pose['y'])):
-                    self.logger.warning("Navigation aborted due to repeated blockages or command errors.")
-                    return
+            self.logger.info("Goal reached.")
             return
 
         # Axis-aligned L-shape: two segments (X then Y)
@@ -1490,6 +1496,117 @@ class OdomOnlyNavigator:
         self.logger.debug("Segment %s -> %s does NOT cross any obstacle.", start, end)
         return False
 
+    def _in_boundary(self, point):
+        if not self.boundary_polygon:
+            return True
+        return self._point_in_polygon(point, self.boundary_polygon)
+
+    def _point_free(self, point):
+        """Return True if point is inside boundary and not inside any obstacle."""
+        if not self._in_boundary(point):
+            return False
+        for poly in self.obstacles:
+            if self._point_in_polygon(point, poly):
+                return False
+        return True
+
+    def _direct_path_clear(self, start, goal):
+        """Check if straight line from start->goal is free of static obstacles and within boundary."""
+        if not self._in_boundary(goal):
+            return False
+        if self._segment_crosses_obstacles(start, goal):
+            return False
+        if self._segment_leaves_boundary(start, goal):
+            return False
+        return True
+
+    def _plan_path_astar(self, start, goal):
+        """
+        Very simple grid-based A* planner on anchored frame.
+        Returns list of waypoints (including goal) or None if no path.
+        """
+        if self._direct_path_clear(start, goal):
+            return [goal]
+
+        if not self.boundary_polygon:
+            return None
+
+        xs = [p[0] for p in self.boundary_polygon]
+        ys = [p[1] for p in self.boundary_polygon]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        margin = ASTAR_GRID_STEP_M
+
+        def to_grid(val, offset):
+            return round((val - offset) / ASTAR_GRID_STEP_M)
+
+        start_g = (to_grid(start[0], min_x), to_grid(start[1], min_y))
+        goal_g = (to_grid(goal[0], min_x), to_grid(goal[1], min_y))
+
+        # Precompute free cells
+        free = set()
+        x = min_x + ASTAR_GRID_STEP_M * 0.5
+        count_nodes = 0
+        while x <= max_x + margin:
+            y = min_y + ASTAR_GRID_STEP_M * 0.5
+            while y <= max_y + margin:
+                if self._point_free((x, y)):
+                    free.add((to_grid(x, min_x), to_grid(y, min_y)))
+                y += ASTAR_GRID_STEP_M
+                count_nodes += 1
+                if count_nodes > ASTAR_MAX_NODES:
+                    break
+            if count_nodes > ASTAR_MAX_NODES:
+                break
+            x += ASTAR_GRID_STEP_M
+
+        if start_g not in free or goal_g not in free:
+            return None
+
+        import heapq
+        open_set = []
+        heapq.heappush(open_set, (0, start_g))
+        came = {}
+        g_score = {start_g: 0}
+
+        def heuristic(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        moves = [(1,0), (-1,0), (0,1), (0,-1)]
+
+        visited = 0
+        while open_set and visited < ASTAR_MAX_NODES:
+            _, current = heapq.heappop(open_set)
+            visited += 1
+            if current == goal_g:
+                # Reconstruct
+                path_cells = [current]
+                while current in came:
+                    current = came[current]
+                    path_cells.append(current)
+                path_cells.reverse()
+                waypoints = []
+                for cx, cy in path_cells[1:]:
+                    wx = min_x + cx * ASTAR_GRID_STEP_M
+                    wy = min_y + cy * ASTAR_GRID_STEP_M
+                    waypoints.append((wx, wy))
+                # ensure final goal
+                waypoints[-1] = goal
+                return waypoints
+
+            for dx, dy in moves:
+                nb = (current[0] + dx, current[1] + dy)
+                if nb not in free:
+                    continue
+                tentative = g_score[current] + 1
+                if tentative < g_score.get(nb, math.inf):
+                    came[nb] = current
+                    g_score[nb] = tentative
+                    f = tentative + heuristic(nb, goal_g)
+                    heapq.heappush(open_set, (f, nb))
+
+        return None
+
     def _goal_valid(self, goal):
         if self.boundary_polygon and not self._point_in_polygon(goal, self.boundary_polygon):
             self.logger.warning(
@@ -1797,6 +1914,26 @@ class OdomOnlyNavigator:
             self.logger.warning("No LIDAR data available - proceeding without obstacle check")
 
         return self._send_move(distance, monitor_lidar=True)
+
+    def _navigate_direct(self, goal, allow_detour=True):
+        """
+        Navigate toward goal using incremental steps (non-axis-aligned), with optional detour avoidance.
+        """
+        while True:
+            pose = self._get_pose()
+            dx = goal[0] - pose['x']
+            dy = goal[1] - pose['y']
+            distance = math.hypot(dx, dy)
+            if distance < DISTANCE_TOLERANCE_M:
+                return True
+            desired_heading = math.degrees(math.atan2(dy, dx))
+            step_distance = min(MOVE_STEP_M, distance)
+            if step_distance < DISTANCE_TOLERANCE_M:
+                continue
+            if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour, current_pose=(pose['x'], pose['y'])):
+                self.logger.warning("Navigation aborted due to repeated blockages or command errors.")
+                return False
+        return True
 
 
 if __name__ == '__main__':
