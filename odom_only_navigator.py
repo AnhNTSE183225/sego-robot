@@ -957,11 +957,12 @@ class OdomOnlyNavigator:
             return True
         return False
 
-    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None):
+    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None, check_static=True):
         """
         Drive one step toward desired_heading_world.
         - When allow_detour is False (perimeter verification), we bypass LIDAR gating to guarantee
           the robot keeps tracing the boundary; obstacle avoidance is not applied.
+        - check_static=False can be used when following a pre-planned path that already considered static obstacles.
         """
         start_point = current_pose if current_pose else (self._get_pose()['x'], self._get_pose()['y'])
 
@@ -998,7 +999,7 @@ class OdomOnlyNavigator:
             dx = step_distance * math.cos(math.radians(chosen_heading))
             dy = step_distance * math.sin(math.radians(chosen_heading))
             end_point = (start_point[0] + dx, start_point[1] + dy)
-            if self._segment_crosses_obstacles(start_point, end_point):
+            if check_static and self._segment_crosses_obstacles(start_point, end_point):
                 attempts += 1
                 self.logger.warning("Static obstacle blocks the segment; trying another heading...")
                 time.sleep(BLOCKED_RETRY_WAIT_SEC)
@@ -1040,7 +1041,11 @@ class OdomOnlyNavigator:
                 waypoints = [goal]
 
             for wp in waypoints:
-                if not self._navigate_direct(wp, allow_detour=allow_detour):
+                if not self._navigate_direct(
+                    wp,
+                    allow_detour=allow_detour,
+                    check_static=False if len(waypoints) > 1 else True,
+                ):
                     return
             self.logger.info("Goal reached.")
             return
@@ -1915,7 +1920,7 @@ class OdomOnlyNavigator:
 
         return self._send_move(distance, monitor_lidar=True)
 
-    def _navigate_direct(self, goal, allow_detour=True):
+    def _navigate_direct(self, goal, allow_detour=True, check_static=True):
         """
         Navigate toward goal using incremental steps (non-axis-aligned), with optional detour avoidance.
         """
@@ -1930,7 +1935,13 @@ class OdomOnlyNavigator:
             step_distance = min(MOVE_STEP_M, distance)
             if step_distance < DISTANCE_TOLERANCE_M:
                 continue
-            if not self._drive_step(desired_heading, step_distance, allow_detour=allow_detour, current_pose=(pose['x'], pose['y'])):
+            if not self._drive_step(
+                desired_heading,
+                step_distance,
+                allow_detour=allow_detour,
+                current_pose=(pose['x'], pose['y']),
+                check_static=check_static,
+            ):
                 self.logger.warning("Navigation aborted due to repeated blockages or command errors.")
                 return False
         return True
