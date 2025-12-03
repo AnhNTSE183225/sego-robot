@@ -1034,6 +1034,17 @@ class OdomOnlyNavigator:
         ]
 
         for segment_goal in segments:
+            # Fix axis and heading for this segment once at start
+            segment_start = self._get_pose()
+            seg_dx = segment_goal[0] - segment_start['x']
+            seg_dy = segment_goal[1] - segment_start['y']
+            if abs(seg_dx) >= abs(seg_dy):
+                segment_axis = "X"
+                segment_base_heading = 0.0 if seg_dx >= 0 else 180.0
+            else:
+                segment_axis = "Y"
+                segment_base_heading = 90.0 if seg_dy >= 0 else -90.0
+
             state = STATE_GOAL_FOLLOW
             detour_side = "RIGHT"
             side_switches = 0
@@ -1066,14 +1077,27 @@ class OdomOnlyNavigator:
                 dx = segment_goal[0] - pose['x']
                 dy = segment_goal[1] - pose['y']
                 distance = math.hypot(dx, dy)
+
+                # Debug the segment state machine
+                self.logger.info(
+                    "[SEGMENT DEBUG] axis=%s base_heading=%.1f° state=%s detour=%s "
+                    "pose=(%.2f, %.2f, %.1f°) dx=%.2f dy=%.2f dist=%.2f",
+                    segment_axis,
+                    segment_base_heading,
+                    state,
+                    detour_side,
+                    pose['x'],
+                    pose['y'],
+                    pose['heading_deg'],
+                    dx,
+                    dy,
+                    distance
+                )
+
                 if distance < DISTANCE_TOLERANCE_M:
                     break  # Segment complete
 
-                # Determine axis and base heading for this segment
-                if abs(dx) >= DISTANCE_TOLERANCE_M:
-                    base_heading = 0.0 if dx >= 0 else 180.0
-                else:
-                    base_heading = 90.0 if dy >= 0 else -90.0
+                base_heading = segment_base_heading
 
                 if state == STATE_GOAL_FOLLOW:
                     if not self._close_enough_heading(base_heading):
@@ -1097,6 +1121,10 @@ class OdomOnlyNavigator:
                         preferred = "LEFT"
                     detour_side = preferred
                     detour_heading = self._detour_heading(base_heading, detour_side)
+                    self.logger.info(
+                        "[DETOUR] Blocked ahead → detour_side=%s, detour_heading=%.1f°",
+                        detour_side, detour_heading
+                    )
                     self._rotate_to_heading(detour_heading)
                     state = STATE_OBSTACLE_FOLLOW
                     side_switches = 0
@@ -1105,7 +1133,10 @@ class OdomOnlyNavigator:
                 if state == STATE_OBSTACLE_FOLLOW:
                     # Can we return to base path?
                     if self._path_to_goal_clear(pose, segment_goal, base_heading):
-                        self.logger.info("Path to segment goal appears clear; returning to GOAL_FOLLOW.")
+                        self.logger.info(
+                            "[RETURN_TO_PATH] Path clear → switching to GOAL_FOLLOW heading %.1f°",
+                            base_heading
+                        )
                         self._rotate_to_heading(base_heading)
                         state = STATE_GOAL_FOLLOW
                         detour_side = "RIGHT"
