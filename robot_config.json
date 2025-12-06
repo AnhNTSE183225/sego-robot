@@ -1,0 +1,99 @@
+{
+    "_comment": "Robot configuration file - all settings in one place",
+    
+    "robot": {
+        "id": "3162d037-b3c1-49a0-ac24-da9f5a569213"
+    },
+    
+    "serial": {
+        "port": "/dev/ttyAMA0",
+        "baud_rate": 115200
+    },
+    
+    "lidar": {
+        "port": "/dev/ttyUSB0",
+        "front_offset_deg": 119.0
+    },
+    
+    "kafka": {
+        "bootstrap_servers": "192.168.1.14:9092",
+        "topic_command": "robot.cmd",
+        "topic_telemetry": "robot.telemetry",
+        "topic_map": "robot.map",
+        "topic_events": "robot.events"
+    },
+    
+    "logging": {
+        "file": "robot.log",
+        "level": "INFO"
+    },
+    
+    "motion": {
+        "distance_tolerance_m": 0.02,
+        "angle_tolerance_deg": 2.0,
+        "move_timeout_sec": 25.0,
+        "rotate_timeout_sec": 15.0,
+        "axis_aligned_moves": false,
+        "heading_offset_deg": 0.0
+    },
+    
+    "obstacle_avoidance": {
+        "move_step_m": 0.25,
+        "clearance_margin_m": 0.05,
+        "obstacle_stop_distance_m": 0.25,
+        "obstacle_lookahead_m": 1.2,
+        "robot_radius_m": 0.15,
+        "corridor_half_width_m": 0.20,
+        "side_wall_min_m": 0.05,
+        "side_wall_max_m": 0.80,
+        "side_cone_deg": 60.0,
+        "forward_scan_angle_deg": 140.0,
+        "detour_scan_angle_deg": 120.0,
+        "detour_angle_step_deg": 15.0,
+        "detour_max_angle_deg": 90.0,
+        "blocked_retry_wait_sec": 0.4,
+        "max_blocked_retries": 25,
+        "max_side_switches": 5,
+        "start_min_clearance_m": 0.25,
+        "rotate_timeout_tolerance_deg": 15.0,
+        "min_valid_lidar_dist_m": 0.20
+    },
+    
+    "path_planning": {
+        "astar_grid_step_m": 0.05,
+        "astar_max_nodes": 20000
+    },
+    
+    "stm32_params": {
+        "_comment": "These are sent to STM32 via SET_PARAM on startup",
+        
+        "odom_scale": 0.902521,
+        
+        "linear_k": 1.0,
+        "angular_k": 0.55,
+        "max_speed": 0.8,
+        "min_duty_linear": 0.45,
+        "min_duty_rotate": 0.48,
+        "min_duty_brake": 0.18,
+        
+        "move_kp": -0.0040,
+        "move_ki": -0.00015,
+        "move_kd": -0.0008,
+        "move_min_pwm": 0.46,
+        "move_max_pwm": 0.70,
+        "move_smoothing": 0.25,
+        "move_skew": 0.015,
+        "move_base_pwm": 0.58,
+        "move_timeout": 20000,
+        
+        "rotate_tol_dist": 0.02,
+        "rotate_tol_angle": 0.02,
+        "rotate_timeout": 10000,
+        
+        "move_dist_tol_dist": 0.01,
+        "move_dist_tol_angle": 0.05,
+        "move_dist_timeout": 10000,
+        
+        "angular_rate_tol": 0.05
+    }
+}

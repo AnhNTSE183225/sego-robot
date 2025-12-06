@@ -2,16 +2,34 @@ import json
 import logging
 import logging.handlers
 import math
-import os
 import queue
 import serial
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
-LOG_FILE = os.environ.get("ROBOT_LOG_FILE", "robot.log")
-LOG_LEVEL = os.environ.get("ROBOT_LOG_LEVEL", "DEBUG").upper()
+
+def load_robot_config():
+    """Load configuration from robot_config.json. Raises error if file missing."""
+    config_path = Path(__file__).parent / "robot_config.json"
+    
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Configuration file not found: {config_path}\n"
+            "Please create robot_config.json with required settings."
+        )
+    
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+
+# Load config once at module level
+ROBOT_CONFIG = load_robot_config()
+
+LOG_FILE = ROBOT_CONFIG.get('logging', {}).get('file', 'robot.log')
+LOG_LEVEL = ROBOT_CONFIG.get('logging', {}).get('level', 'INFO').upper()
 
 
 def configure_logging():
@@ -82,25 +100,20 @@ except ImportError:
 from odom_kafka_bridge import KafkaBridge
 
 
-# Serial configuration
-SERIAL_PORT = '/dev/ttyAMA0'
-BAUD_RATE = 115200
+# Serial configuration (from config file)
+SERIAL_PORT = ROBOT_CONFIG.get('serial', {}).get('port', '/dev/ttyAMA0')
+BAUD_RATE = ROBOT_CONFIG.get('serial', {}).get('baud_rate', 115200)
 
 # STM32 configurable parameters (sent on startup via SET_PARAM)
 # These can be tuned without reflashing the STM32
-STM32_PARAMS = {
-    # Odometry calibration
+STM32_PARAMS = ROBOT_CONFIG.get('stm32_params', {
     'odom_scale': 0.902521,
-    
-    # Closed-loop position control
     'linear_k': 1.0,
     'angular_k': 0.55,
     'max_speed': 0.8,
     'min_duty_linear': 0.45,
     'min_duty_rotate': 0.48,
     'min_duty_brake': 0.18,
-    
-    # MOVE PID control
     'move_kp': -0.0040,
     'move_ki': -0.00015,
     'move_kd': -0.0008,
@@ -110,72 +123,63 @@ STM32_PARAMS = {
     'move_skew': 0.015,
     'move_base_pwm': 0.58,
     'move_timeout': 20000,
-    
-    # ROTATE tolerances
     'rotate_tol_dist': 0.02,
     'rotate_tol_angle': 0.02,
     'rotate_timeout': 10000,
-    
-    # MOVE_DIST tolerances
     'move_dist_tol_dist': 0.01,
     'move_dist_tol_angle': 0.05,
     'move_dist_timeout': 10000,
-    
-    # Angular rate tolerance
     'angular_rate_tol': 0.05,
-}
+})
 
-# LIDAR configuration
-LIDAR_PORT = '/dev/ttyUSB0'
-# LIDAR angle mapping: robot forward (0°) corresponds to raw angle with offset + sign flip.
-# From measurements: obstacle in front ~120.6°, obstacle left ~27.5° => offset ≈119°, robot_angle = -raw + offset
-LIDAR_FRONT_OFFSET_DEG = 119.0
+# LIDAR configuration (from config file)
+LIDAR_PORT = ROBOT_CONFIG.get('lidar', {}).get('port', '/dev/ttyUSB0')
+LIDAR_FRONT_OFFSET_DEG = ROBOT_CONFIG.get('lidar', {}).get('front_offset_deg', 119.0)
 
-# Kafka configuration (shared topics)
-KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TOPIC_COMMAND = os.environ.get("KAFKA_TOPIC_COMMAND", "robot.cmd")
-KAFKA_TOPIC_TELEMETRY = os.environ.get("KAFKA_TOPIC_TELEMETRY", "robot.telemetry")
-KAFKA_TOPIC_MAP = os.environ.get("KAFKA_TOPIC_MAP", "robot.map")
-KAFKA_TOPIC_EVENTS = os.environ.get("KAFKA_TOPIC_EVENTS", "robot.events")
-ROBOT_ID = os.environ.get("ROBOT_ID")
+# Kafka configuration (from config file)
+_kafka_cfg = ROBOT_CONFIG.get('kafka', {})
+KAFKA_BOOTSTRAP_SERVERS = _kafka_cfg.get('bootstrap_servers', 'localhost:9092')
+KAFKA_TOPIC_COMMAND = _kafka_cfg.get('topic_command', 'robot.cmd')
+KAFKA_TOPIC_TELEMETRY = _kafka_cfg.get('topic_telemetry', 'robot.telemetry')
+KAFKA_TOPIC_MAP = _kafka_cfg.get('topic_map', 'robot.map')
+KAFKA_TOPIC_EVENTS = _kafka_cfg.get('topic_events', 'robot.events')
+ROBOT_ID = ROBOT_CONFIG.get('robot', {}).get('id')
 
-# Motion tolerances
-DISTANCE_TOLERANCE_M = 0.02
-ANGLE_TOLERANCE_DEG = 2.0
+# Motion tolerances (from config file)
+_motion_cfg = ROBOT_CONFIG.get('motion', {})
+DISTANCE_TOLERANCE_M = _motion_cfg.get('distance_tolerance_m', 0.02)
+ANGLE_TOLERANCE_DEG = _motion_cfg.get('angle_tolerance_deg', 2.0)
+MOVE_TIMEOUT_SEC = _motion_cfg.get('move_timeout_sec', 25.0)
+ROTATE_TIMEOUT_SEC = _motion_cfg.get('rotate_timeout_sec', 15.0)
+AXIS_ALIGNED_MOVES = _motion_cfg.get('axis_aligned_moves', False)
+HEADING_OFFSET_DEG = _motion_cfg.get('heading_offset_deg', 0.0)
 
-# Command timeouts
-MOVE_TIMEOUT_SEC = 25.0
-ROTATE_TIMEOUT_SEC = 15.0
+# Obstacle avoidance parameters (from config file)
+_obstacle_cfg = ROBOT_CONFIG.get('obstacle_avoidance', {})
+MOVE_STEP_M = _obstacle_cfg.get('move_step_m', 0.25)
+CLEARANCE_MARGIN_M = _obstacle_cfg.get('clearance_margin_m', 0.05)
+OBSTACLE_STOP_DISTANCE_M = _obstacle_cfg.get('obstacle_stop_distance_m', 0.25)
+OBSTACLE_LOOKAHEAD_M = _obstacle_cfg.get('obstacle_lookahead_m', 1.2)
+ROBOT_RADIUS_M = _obstacle_cfg.get('robot_radius_m', 0.15)
+CORRIDOR_HALF_WIDTH_M = _obstacle_cfg.get('corridor_half_width_m', 0.20)
+SIDE_WALL_MIN_M = _obstacle_cfg.get('side_wall_min_m', 0.05)
+SIDE_WALL_MAX_M = _obstacle_cfg.get('side_wall_max_m', 0.80)
+SIDE_CONE_DEG = _obstacle_cfg.get('side_cone_deg', 60.0)
+FORWARD_SCAN_ANGLE_DEG = _obstacle_cfg.get('forward_scan_angle_deg', 140.0)
+DETOUR_SCAN_ANGLE_DEG = _obstacle_cfg.get('detour_scan_angle_deg', 120.0)
+DETOUR_ANGLE_STEP_DEG = _obstacle_cfg.get('detour_angle_step_deg', 15.0)
+DETOUR_MAX_ANGLE_DEG = _obstacle_cfg.get('detour_max_angle_deg', 90.0)
+BLOCKED_RETRY_WAIT_SEC = _obstacle_cfg.get('blocked_retry_wait_sec', 0.4)
+MAX_BLOCKED_RETRIES = _obstacle_cfg.get('max_blocked_retries', 25)
+MAX_SIDE_SWITCHES = _obstacle_cfg.get('max_side_switches', 5)
+START_MIN_CLEARANCE_M = _obstacle_cfg.get('start_min_clearance_m', 0.25)
+ROTATE_TIMEOUT_TOLERANCE_DEG = _obstacle_cfg.get('rotate_timeout_tolerance_deg', 15.0)
+MIN_VALID_LIDAR_DIST_M = _obstacle_cfg.get('min_valid_lidar_dist_m', 0.20)
 
-# Movement mode: False -> use direct heading (no forced L-shape)
-AXIS_ALIGNED_MOVES = False
-
-# Heading offset (deg) to align MCU frame with map frame if needed (e.g., set to 90 to face +Y by default)
-HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
-
-# Obstacle avoidance parameters
-MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
-CLEARANCE_MARGIN_M = 0.05          # Buffer added to the intended step distance
-OBSTACLE_STOP_DISTANCE_M = 0.25    # Stop distance tuned for small map demo
-OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
-ROBOT_RADIUS_M = 0.15              # Approx robot radius (m) for corridor checks
-CORRIDOR_HALF_WIDTH_M = 0.20       # Half-width of forward corridor to catch obstacles near edges
-SIDE_WALL_MIN_M = 0.05             # Min distance to consider "along the wall"
-SIDE_WALL_MAX_M = 0.80             # Max distance to consider "along the wall"
-SIDE_CONE_DEG = 60.0               # ±30° cone for side wall detection
-FORWARD_SCAN_ANGLE_DEG = 140.0     # Forward corridor; narrower to avoid side walls on small maps
-DETOUR_SCAN_ANGLE_DEG = 120.0      # Wider cone used when looking for alternate headings
-DETOUR_ANGLE_STEP_DEG = 15.0       # Angular resolution when sampling detour headings
-DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn for a detour
-BLOCKED_RETRY_WAIT_SEC = 0.4
-MAX_BLOCKED_RETRIES = 25
-MAX_SIDE_SWITCHES = 5
-START_MIN_CLEARANCE_M = 0.25       # Minimum clearance required before starting a MOVE
-ROTATE_TIMEOUT_TOLERANCE_DEG = 15.0  # Accept larger odom error on rotation timeout to avoid false blockage
-MIN_VALID_LIDAR_DIST_M = 0.20      # Ignore hits closer than this (likely robot body/noise)
-# Path planning
-ASTAR_GRID_STEP_M = 0.05           # Finer grid for A* planner to find narrow corridors
-ASTAR_MAX_NODES = 20000            # Safety cap to avoid runaway planning
+# Path planning (from config file)
+_path_cfg = ROBOT_CONFIG.get('path_planning', {})
+ASTAR_GRID_STEP_M = _path_cfg.get('astar_grid_step_m', 0.05)
+ASTAR_MAX_NODES = _path_cfg.get('astar_max_nodes', 20000)
 
 STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
 STATE_OBSTACLE_FOLLOW = "OBSTACLE_FOLLOW"
@@ -472,6 +476,10 @@ class OdomOnlyNavigator:
         """Send all configurable parameters to STM32 on startup."""
         self.logger.info("Configuring STM32 parameters...")
         for param_name, param_value in STM32_PARAMS.items():
+            # Skip comment keys (start with '_')
+            if param_name.startswith('_'):
+                continue
+            
             # Format value appropriately (int for timeout values, float for others)
             if 'timeout' in param_name:
                 value_str = str(int(param_value))
@@ -1318,6 +1326,7 @@ class OdomOnlyNavigator:
 
     # --- CLI loop ---
     def run(self):
+        self.logger.info("Config loaded from: robot_config.json")
         self.logger.info(
             "Startup config serial_port=%s baud=%s lidar_port=%s kafka_bootstrap=%s robot_id=%s axis_aligned=%s",
             SERIAL_PORT,

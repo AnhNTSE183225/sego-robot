@@ -93,10 +93,27 @@ Python sends all params via `STM32_PARAMS` dict in `odom_only_navigator.py` at s
 ## Software Stack
 - **STM32 Firmware**: C (HAL library), STM32CubeIDE project at `robot/`
 - **Navigator**: Python 3 (`odom_only_navigator.py`)
+- **Test Scripts**: `test_run.py`, `test_rotate.py` - standalone testers for debugging
+- **Config**: `robot_config.json` - all settings in one file (replaces env vars)
 - **Dependencies**: rplidar-roboticia, confluent-kafka, pyserial
 - **Kafka Topics**: robot.cmd, robot.telemetry, robot.map, robot.events
 
+## Configuration File (`robot_config.json`)
+All settings are centralized in `robot_config.json`:
+- `robot.id` - Robot UUID for Kafka
+- `serial.*` - Serial port settings
+- `lidar.*` - LIDAR port and offset
+- `kafka.*` - Kafka bootstrap and topic names
+- `logging.*` - Log file and level
+- `motion.*` - Tolerances, timeouts, axis-aligned mode
+- `obstacle_avoidance.*` - LIDAR-based avoidance parameters
+- `path_planning.*` - A* planner settings
+- `stm32_params.*` - Parameters sent to STM32 via SET_PARAM
+
+Config file is **required** - scripts throw error if missing.
+
 # Preferences & Conventions
+- **No fallbacks** - always one solution, fail fast if config/dependencies missing
 - Code comments marked with `//THEANH` and `//THEANH END`
 - Uses HAL library for STM32 peripheral access
 - Odometry uses empirical scale factor (ODOM_DISTANCE_SCALE = 0.902521)
@@ -107,3 +124,7 @@ Python sends all params via `STM32_PARAMS` dict in `odom_only_navigator.py` at s
 
 # Historical Notes / Archived
 - [2025-12-06] Added SET_PARAM command for runtime STM32 configuration without reflashing
+- [2025-12-06] Added `robot_config.json` to centralize all settings (replaces env vars)
+- [2025-12-06] Added `test_run.py` and `test_rotate.py` for standalone command testing
+- [2025-12-06] Removed fallback configs - config file now required, fail fast on missing
+
