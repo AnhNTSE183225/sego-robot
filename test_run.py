@@ -10,6 +10,8 @@ Usage:
 """
 
 import json
+import logging
+import logging.handlers
 import math
 import queue
 import serial
@@ -31,11 +33,45 @@ def load_config():
         return json.load(f)
 
 
+def configure_logging(config):
+    """Configure console + rotating file logging (same as odom_only_navigator.py)."""
+    log_file = config.get('logging', {}).get('file', 'robot.log')
+    log_level_str = config.get('logging', {}).get('level', 'INFO').upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+    
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    root = logging.getLogger()
+    if root.handlers:
+        root.handlers.clear()
+    root.setLevel(logging.DEBUG)
+
+    # Console handler
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(log_level)
+    console.setFormatter(formatter)
+
+    # File handler (rotating)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=3
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    root.addHandler(console)
+    root.addHandler(file_handler)
+    
+    logger = logging.getLogger("test.run")
+    logger.info(f"Logging configured: Console={log_level_str}, File=INFO -> {log_file}")
+    return logger
+
+
 class STM32Tester:
     """Minimal STM32 communication for testing - mirrors odom_only_navigator.py"""
     
     def __init__(self, config):
         self.config = config
+        self.logger = logging.getLogger("test.run")
         self.serial_conn = None
         self.response_queue = queue.Queue()
         self._serial_running = False
@@ -49,12 +85,12 @@ class STM32Tester:
         port = self.config['serial']['port']
         baud = self.config['serial']['baud_rate']
         
-        print(f"Connecting to STM32 on {port} @ {baud}...")
+        self.logger.info(f"Connecting to STM32 on {port} @ {baud}...")
         try:
             self.serial_conn = serial.Serial(port, baud, timeout=1)
             time.sleep(1.0)  # Wait for connection to stabilize
         except serial.SerialException as e:
-            print(f"Error: {e}")
+            self.logger.error(f"Serial connection error: {e}")
             return False
         
         self._start_serial_listener()
@@ -69,7 +105,7 @@ class STM32Tester:
         self._send_command("RESET_ODOM")
         self._wait_for_response(["OK RESET_ODOM"], ["ERR"], timeout=2.0)
         
-        print("Connected!")
+        self.logger.info("Connected!")
         return True
     
     def disconnect(self):
@@ -79,7 +115,7 @@ class STM32Tester:
             self._serial_thread.join(timeout=2.0)
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
-        print("Disconnected.")
+        self.logger.info("Disconnected.")
     
     def _start_serial_listener(self):
         """Start background thread to read serial responses"""
@@ -112,7 +148,7 @@ class STM32Tester:
                         pass
                     continue  # Don't put odom in response queue
             
-            print(f"[STM32] {line}")
+            self.logger.info(f"[STM32] {line}")
             self.response_queue.put(line)
     
     def _send_command(self, cmd):
@@ -121,7 +157,7 @@ class STM32Tester:
             return
         full_cmd = cmd.strip() + "\r\n"
         self.serial_conn.write(full_cmd.encode('utf-8'))
-        print(f">>> {cmd}")
+        self.logger.info(f">>> {cmd}")
     
     def _clear_response_queue(self):
         """Clear any pending responses"""
@@ -151,7 +187,7 @@ class STM32Tester:
     
     def _configure_stm32_params(self, params):
         """Send SET_PARAM commands for all parameters"""
-        print("Configuring STM32 parameters...")
+        self.logger.info("Configuring STM32 parameters...")
         for name, value in params.items():
             if name.startswith('_'):  # Skip comments
                 continue
@@ -162,9 +198,11 @@ class STM32Tester:
             
             self._send_command(f"SET_PARAM {name} {value_str}")
             result, _ = self._wait_for_response(["OK SET_PARAM"], ["ERR"], timeout=0.5)
-            if not result:
-                print(f"  Warning: Failed to set {name}")
-        print("Parameters configured.")
+            if result:
+                self.logger.debug(f"  {name} = {value}")
+            else:
+                self.logger.warning(f"  Failed to set {name}")
+        self.logger.info("Parameters configured.")
     
     # =========================================================================
     # RUN COMMAND - Replicates odom_only_navigator.py behavior
@@ -190,13 +228,13 @@ class STM32Tester:
         )
         
         if result:
-            print(f"RUN started. Waiting {duration_ms}ms...")
+            self.logger.info(f"RUN started. Waiting {duration_ms}ms...")
             # Wait for duration + buffer
             time.sleep(duration_ms / 1000.0 + 0.5)
-            print("RUN complete.")
+            self.logger.info("RUN complete.")
             return True
         else:
-            print(f"RUN failed: {line}")
+            self.logger.warning(f"RUN failed: {line}")
             return False
     
     def run_all(self, direction, duration_ms):
@@ -205,6 +243,7 @@ class STM32Tester:
     
     def stop(self):
         """Emergency stop"""
+        self.logger.warning("EMERGENCY STOP!")
         self._send_command("STOP")
         result, _ = self._wait_for_response(["OK STOP"], [], timeout=1.0)
         return result
@@ -220,11 +259,13 @@ class STM32Tester:
     def print_odom(self):
         """Print current odometry"""
         odom = self.get_odom()
-        print(f"Odometry: x={odom['x']:.4f}m, y={odom['y']:.4f}m, theta={odom['theta_deg']:.2f}°")
+        self.logger.info(f"Odometry: x={odom['x']:.4f}m, y={odom['y']:.4f}m, theta={odom['theta_deg']:.2f}°")
 
 
 def main():
     config = load_config()
+    configure_logging(config)
+    
     tester = STM32Tester(config)
     
     if not tester.connect():

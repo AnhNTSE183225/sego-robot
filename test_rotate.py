@@ -10,6 +10,8 @@ Usage:
 """
 
 import json
+import logging
+import logging.handlers
 import math
 import queue
 import serial
@@ -31,11 +33,45 @@ def load_config():
         return json.load(f)
 
 
+def configure_logging(config):
+    """Configure console + rotating file logging (same as odom_only_navigator.py)."""
+    log_file = config.get('logging', {}).get('file', 'robot.log')
+    log_level_str = config.get('logging', {}).get('level', 'INFO').upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+    
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    root = logging.getLogger()
+    if root.handlers:
+        root.handlers.clear()
+    root.setLevel(logging.DEBUG)
+
+    # Console handler
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(log_level)
+    console.setFormatter(formatter)
+
+    # File handler (rotating)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=3
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    root.addHandler(console)
+    root.addHandler(file_handler)
+    
+    logger = logging.getLogger("test.rotate")
+    logger.info(f"Logging configured: Console={log_level_str}, File=INFO -> {log_file}")
+    return logger
+
+
 class STM32Tester:
     """Minimal STM32 communication for testing - mirrors odom_only_navigator.py"""
     
     def __init__(self, config):
         self.config = config
+        self.logger = logging.getLogger("test.rotate")
         self.serial_conn = None
         self.response_queue = queue.Queue()
         self._serial_running = False
@@ -52,12 +88,12 @@ class STM32Tester:
         port = self.config['serial']['port']
         baud = self.config['serial']['baud_rate']
         
-        print(f"Connecting to STM32 on {port} @ {baud}...")
+        self.logger.info(f"Connecting to STM32 on {port} @ {baud}...")
         try:
             self.serial_conn = serial.Serial(port, baud, timeout=1)
             time.sleep(1.0)
         except serial.SerialException as e:
-            print(f"Error: {e}")
+            self.logger.error(f"Serial connection error: {e}")
             return False
         
         self._start_serial_listener()
@@ -72,7 +108,7 @@ class STM32Tester:
         self._send_command("RESET_ODOM")
         self._wait_for_response(["OK RESET_ODOM"], ["ERR"], timeout=2.0)
         
-        print("Connected!")
+        self.logger.info("Connected!")
         return True
     
     def disconnect(self):
@@ -82,7 +118,7 @@ class STM32Tester:
             self._serial_thread.join(timeout=2.0)
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
-        print("Disconnected.")
+        self.logger.info("Disconnected.")
     
     def _start_serial_listener(self):
         """Start background thread to read serial responses"""
@@ -115,7 +151,7 @@ class STM32Tester:
                         pass
                     continue
             
-            print(f"[STM32] {line}")
+            self.logger.info(f"[STM32] {line}")
             self.response_queue.put(line)
     
     def _send_command(self, cmd):
@@ -124,7 +160,7 @@ class STM32Tester:
             return
         full_cmd = cmd.strip() + "\r\n"
         self.serial_conn.write(full_cmd.encode('utf-8'))
-        print(f">>> {cmd}")
+        self.logger.info(f">>> {cmd}")
     
     def _clear_response_queue(self):
         """Clear any pending responses"""
@@ -154,7 +190,7 @@ class STM32Tester:
     
     def _configure_stm32_params(self, params):
         """Send SET_PARAM commands for all parameters"""
-        print("Configuring STM32 parameters...")
+        self.logger.info("Configuring STM32 parameters...")
         for name, value in params.items():
             if name.startswith('_'):
                 continue
@@ -165,9 +201,11 @@ class STM32Tester:
             
             self._send_command(f"SET_PARAM {name} {value_str}")
             result, _ = self._wait_for_response(["OK SET_PARAM"], ["ERR"], timeout=0.5)
-            if not result:
-                print(f"  Warning: Failed to set {name}")
-        print("Parameters configured.")
+            if result:
+                self.logger.debug(f"  {name} = {value}")
+            else:
+                self.logger.warning(f"  Failed to set {name}")
+        self.logger.info("Parameters configured.")
     
     @staticmethod
     def normalize_angle_deg(angle):
@@ -198,7 +236,7 @@ class STM32Tester:
             True if rotation completed successfully
         """
         if abs(angle_deg) < 0.1:
-            print("Angle too small, skipping rotation.")
+            self.logger.info("Angle too small, skipping rotation.")
             return True
         
         rotate_timeout = self.config.get('motion', {}).get('rotate_timeout_sec', 15.0)
@@ -220,10 +258,10 @@ class STM32Tester:
             timeout=2.0
         )
         if not result:
-            print(f"ROTATE_DEG not acknowledged: {line}")
+            self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
             return False
         
-        print(f"Rotation started. Waiting for completion (timeout={rotate_timeout}s)...")
+        self.logger.info(f"Rotation started. Waiting for completion (timeout={rotate_timeout}s)...")
         
         # Step 2: Wait for TARGET_REACHED or TIMEOUT
         result, line = self._wait_for_response(
@@ -233,7 +271,7 @@ class STM32Tester:
         )
         
         if result:
-            print(f"Rotation completed: {line}")
+            self.logger.info(f"Rotation completed: {line}")
             # Reset STM32 odom after successful rotation
             self._send_command("RESET_ODOM")
             time.sleep(0.1)
@@ -244,22 +282,24 @@ class STM32Tester:
         rotation_err = abs(actual_rotation - angle_deg)
         
         if rotation_err <= rotate_timeout_tol:
-            print(f"Rotation TIMEOUT but within tolerance (actual={actual_rotation:.1f}°, "
-                  f"target={angle_deg:.1f}°, err={rotation_err:.1f}° <= {rotate_timeout_tol}°)")
+            self.logger.warning(
+                f"Rotation TIMEOUT but within tolerance (actual={actual_rotation:.1f}°, "
+                f"target={angle_deg:.1f}°, err={rotation_err:.1f}° <= {rotate_timeout_tol}°)"
+            )
             self._send_command("RESET_ODOM")
             time.sleep(0.1)
             return True
         
         if abs(actual_rotation) > 0.5:
-            print(f"Rotation interrupted at {actual_rotation:.1f}° (commanded: {angle_deg:.1f}°)")
+            self.logger.info(f"Rotation interrupted at {actual_rotation:.1f}° (commanded: {angle_deg:.1f}°)")
         
         self._send_command("RESET_ODOM")
         time.sleep(0.1)
         
         if result is False:
-            print(f"Rotation failed: {line}")
+            self.logger.warning(f"Rotation failed: {line}")
         else:
-            print("Rotation timeout with no MCU response.")
+            self.logger.warning("Rotation timeout with no MCU response.")
         return False
     
     def rotate_to_heading(self, target_heading_world):
@@ -278,8 +318,10 @@ class STM32Tester:
         # MCU expects clockwise positive, so invert sign
         command_delta = -world_delta
         
-        print(f"rotate_to_heading: current={current_heading:.1f}°, target={target_heading_world:.1f}°")
-        print(f"  world_delta={world_delta:.1f}°, command_delta={command_delta:.1f}°")
+        self.logger.info(
+            f"rotate_to_heading: current={current_heading:.1f}°, target={target_heading_world:.1f}°, "
+            f"world_delta={world_delta:.1f}°, command_delta={command_delta:.1f}°"
+        )
         
         ok = self.rotate_deg(command_delta)
         
@@ -288,12 +330,13 @@ class STM32Tester:
             self.pose['heading_deg'] = self.normalize_angle_deg(
                 self.pose['heading_deg'] + world_delta
             )
-            print(f"Pose updated: heading={self.pose['heading_deg']:.1f}°")
+            self.logger.info(f"Pose updated: heading={self.pose['heading_deg']:.1f}°")
         
         return ok
     
     def stop(self):
         """Emergency stop"""
+        self.logger.warning("EMERGENCY STOP!")
         self._send_command("STOP")
         result, _ = self._wait_for_response(["OK STOP"], [], timeout=1.0)
         return result
@@ -309,12 +352,14 @@ class STM32Tester:
     def print_odom(self):
         """Print current odometry"""
         odom = self.get_odom()
-        print(f"STM32 Odom: x={odom['x']:.4f}m, y={odom['y']:.4f}m, theta={odom['theta_deg']:.2f}°")
-        print(f"Pose Track: x={self.pose['x']:.4f}m, y={self.pose['y']:.4f}m, heading={self.pose['heading_deg']:.2f}°")
+        self.logger.info(f"STM32 Odom: x={odom['x']:.4f}m, y={odom['y']:.4f}m, theta={odom['theta_deg']:.2f}°")
+        self.logger.info(f"Pose Track: x={self.pose['x']:.4f}m, y={self.pose['y']:.4f}m, heading={self.pose['heading_deg']:.2f}°")
 
 
 def main():
     config = load_config()
+    configure_logging(config)
+    
     tester = STM32Tester(config)
     
     if not tester.connect():
@@ -365,7 +410,7 @@ def main():
                     tester._send_command("RESET_ODOM")
                     tester._wait_for_response(["OK"], ["ERR"], timeout=1.0)
                     tester.pose = {'x': 0.0, 'y': 0.0, 'heading_deg': 0.0}
-                    print("Odometry and pose reset.")
+                    tester.logger.info("Odometry and pose reset.")
                 elif command == 'rotate':
                     if len(parts) >= 2:
                         angle = float(parts[1])
