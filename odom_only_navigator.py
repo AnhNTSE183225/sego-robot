@@ -86,6 +86,45 @@ from odom_kafka_bridge import KafkaBridge
 SERIAL_PORT = '/dev/ttyAMA0'
 BAUD_RATE = 115200
 
+# STM32 configurable parameters (sent on startup via SET_PARAM)
+# These can be tuned without reflashing the STM32
+STM32_PARAMS = {
+    # Odometry calibration
+    'odom_scale': 0.902521,
+    
+    # Closed-loop position control
+    'linear_k': 1.0,
+    'angular_k': 0.55,
+    'max_speed': 0.8,
+    'min_duty_linear': 0.45,
+    'min_duty_rotate': 0.48,
+    'min_duty_brake': 0.18,
+    
+    # MOVE PID control
+    'move_kp': -0.0040,
+    'move_ki': -0.00015,
+    'move_kd': -0.0008,
+    'move_min_pwm': 0.46,
+    'move_max_pwm': 0.70,
+    'move_smoothing': 0.25,
+    'move_skew': 0.015,
+    'move_base_pwm': 0.58,
+    'move_timeout': 20000,
+    
+    # ROTATE tolerances
+    'rotate_tol_dist': 0.02,
+    'rotate_tol_angle': 0.02,
+    'rotate_timeout': 10000,
+    
+    # MOVE_DIST tolerances
+    'move_dist_tol_dist': 0.01,
+    'move_dist_tol_angle': 0.05,
+    'move_dist_timeout': 10000,
+    
+    # Angular rate tolerance
+    'angular_rate_tol': 0.05,
+}
+
 # LIDAR configuration
 LIDAR_PORT = '/dev/ttyUSB0'
 # LIDAR angle mapping: robot forward (0°) corresponds to raw angle with offset + sign flip.
@@ -238,6 +277,11 @@ class OdomOnlyNavigator:
             return False
 
         self._start_serial_listener()
+        time.sleep(0.2)  # Give serial listener time to start
+        
+        # Configure STM32 parameters before any motion commands
+        self._configure_stm32_params()
+        
         self._send_raw_command("RESET_ODOM")
         self._reset_pose()  # Reset internal pose tracking
         self._reset_stm32_odom()  # Reset STM32 odom cache
@@ -423,6 +467,32 @@ class OdomOnlyNavigator:
             return
         cmd = text.strip() + "\r\n"
         self.serial_conn.write(cmd.encode('utf-8'))
+
+    def _configure_stm32_params(self):
+        """Send all configurable parameters to STM32 on startup."""
+        self.logger.info("Configuring STM32 parameters...")
+        for param_name, param_value in STM32_PARAMS.items():
+            # Format value appropriately (int for timeout values, float for others)
+            if 'timeout' in param_name:
+                value_str = str(int(param_value))
+            else:
+                value_str = f"{param_value:.6f}"
+            
+            cmd = f"SET_PARAM {param_name} {value_str}"
+            self._send_raw_command(cmd)
+            
+            # Wait briefly for ACK
+            result, line = self._wait_for_response(
+                success_tokens=["OK SET_PARAM"],
+                failure_tokens=["ERR"],
+                timeout=0.5
+            )
+            if result:
+                self.logger.debug(f"  {param_name} = {param_value}")
+            else:
+                self.logger.warning(f"  Failed to set {param_name}: {line}")
+        
+        self.logger.info("STM32 parameters configured.")
 
     def _clear_response_queue(self):
         while not self.response_queue.empty():
