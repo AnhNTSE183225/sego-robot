@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Test script for RUN command - sends motor commands directly to STM32.
+Test script for MOVE command - sends forward movement commands directly to STM32.
 Replicates serial communication from odom_only_navigator.py for debugging.
 
 Usage:
-    python test_run.py                     # Interactive mode
-    python test_run.py F 1000              # Run all motors Forward for 1000ms
-    python test_run.py F R S 500           # Motor1=Forward, Motor2=Reverse, Motor3=Stop for 500ms
+    python test_run.py              # Interactive mode
+    python test_run.py 0.5          # Move forward 0.5 meters
+    python test_run.py 1.0          # Move forward 1.0 meter
 """
 
 import json
@@ -19,6 +19,19 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+
+# =============================================================================
+# TEST OVERRIDES - Hardcode values here to test before applying to config
+# These override values from robot_config.json when not None
+# =============================================================================
+TEST_OVERRIDES = {
+    # All calibration values now in robot_config.json
+    # Uncomment below to test new values:
+    # 'odom_scale': 0.90,          # Linear distance calibration
+    # 'move_base_pwm': 0.60,       # Base PWM for MOVE
+}
+# =============================================================================
 
 
 def load_config():
@@ -61,7 +74,7 @@ def configure_logging(config):
     root.addHandler(console)
     root.addHandler(file_handler)
     
-    logger = logging.getLogger("test.run")
+    logger = logging.getLogger("test.move")
     logger.info(f"Logging configured: Console={log_level_str}, File=INFO -> {log_file}")
     return logger
 
@@ -71,7 +84,7 @@ class STM32Tester:
     
     def __init__(self, config):
         self.config = config
-        self.logger = logging.getLogger("test.run")
+        self.logger = logging.getLogger("test.move")
         self.serial_conn = None
         self.response_queue = queue.Queue()
         self._serial_running = False
@@ -79,6 +92,9 @@ class STM32Tester:
         
         # Latest odometry from STM32
         self.odom = {'x': 0.0, 'y': 0.0, 'theta_rad': 0.0}
+        
+        # Pose tracking (like odom_only_navigator.py)
+        self.pose = {'x': 0.0, 'y': 0.0, 'heading_deg': 0.0}
     
     def connect(self):
         """Connect to STM32 via serial"""
@@ -88,7 +104,7 @@ class STM32Tester:
         self.logger.info(f"Connecting to STM32 on {port} @ {baud}...")
         try:
             self.serial_conn = serial.Serial(port, baud, timeout=1)
-            time.sleep(1.0)  # Wait for connection to stabilize
+            time.sleep(1.0)
         except serial.SerialException as e:
             self.logger.error(f"Serial connection error: {e}")
             return False
@@ -100,6 +116,9 @@ class STM32Tester:
         stm32_params = self.config.get('stm32_params', {})
         if stm32_params:
             self._configure_stm32_params(stm32_params)
+        
+        # Apply test overrides (for debugging - these override config values)
+        self._apply_test_overrides()
         
         # Reset odometry
         self._send_command("RESET_ODOM")
@@ -146,7 +165,7 @@ class STM32Tester:
                         self.odom['theta_rad'] = float(parts[2])
                     except ValueError:
                         pass
-                    continue  # Don't put odom in response queue
+                    continue
             
             self.logger.info(f"[STM32] {line}")
             self.response_queue.put(line)
@@ -189,7 +208,7 @@ class STM32Tester:
         """Send SET_PARAM commands for all parameters"""
         self.logger.info("Configuring STM32 parameters...")
         for name, value in params.items():
-            if name.startswith('_'):  # Skip comments
+            if name.startswith('_'):
                 continue
             if 'timeout' in name:
                 value_str = str(int(value))
@@ -204,42 +223,119 @@ class STM32Tester:
                 self.logger.warning(f"  Failed to set {name}")
         self.logger.info("Parameters configured.")
     
+    def _apply_test_overrides(self):
+        """Apply TEST_OVERRIDES for debugging (overrides config values)"""
+        if not TEST_OVERRIDES:
+            return
+        
+        has_overrides = any(v is not None for v in TEST_OVERRIDES.values())
+        if not has_overrides:
+            return
+        
+        self.logger.info("Applying TEST OVERRIDES...")
+        for name, value in TEST_OVERRIDES.items():
+            if value is None:
+                continue
+            if 'timeout' in name:
+                value_str = str(int(value))
+            else:
+                value_str = f"{value:.6f}"
+            
+            self._send_command(f"SET_PARAM {name} {value_str}")
+            result, _ = self._wait_for_response(["OK SET_PARAM"], ["ERR"], timeout=0.5)
+            if result:
+                self.logger.info(f"  [OVERRIDE] {name} = {value}")
+            else:
+                self.logger.warning(f"  [OVERRIDE] Failed to set {name}")
+        self.logger.info("Test overrides applied.")
+    
     # =========================================================================
-    # RUN COMMAND - Replicates odom_only_navigator.py behavior
+    # MOVE COMMAND - Replicates odom_only_navigator.py _send_move() EXACTLY
     # =========================================================================
     
-    def run_motors(self, dir1, dir2, dir3, duration_ms):
+    def send_move(self, distance_m):
         """
-        Send RUN command to STM32.
+        Send MOVE command to STM32.
+        
+        This replicates _send_move() from odom_only_navigator.py:
+        - "OK MOVE" = command received, movement started
+        - "MOVE TARGET_REACHED" = movement completed successfully
+        - "MOVE TIMEOUT" = movement timed out
         
         Args:
-            dir1, dir2, dir3: Direction for each motor ('F', 'R', 'S')
-            duration_ms: Duration in milliseconds
+            distance_m: Distance to move forward in meters
+        
+        Returns:
+            True if movement completed successfully
         """
-        cmd = f"RUN {dir1},{dir2},{dir3} {duration_ms}"
+        if distance_m < 0.01:  # Less than 1cm
+            self.logger.info("Distance too small, skipping move.")
+            return True
+        
+        move_timeout = self.config.get('motion', {}).get('move_timeout_sec', 25.0)
+        
+        # Reset STM32 odom before move (like navigator does)
+        self._send_command("RESET_ODOM")
+        self._wait_for_response(["OK"], ["ERR"], timeout=1.0)
+        time.sleep(0.1)
+        
+        cmd = f"MOVE {distance_m:.3f}"
         self._clear_response_queue()
         self._send_command(cmd)
         
-        # Wait for acknowledgment
+        # Step 1: Wait for OK MOVE (command acknowledged)
         result, line = self._wait_for_response(
-            success_tokens=["OK RUN"],
+            success_tokens=["OK MOVE"],
             failure_tokens=["ERR"],
             timeout=2.0
         )
-        
-        if result:
-            self.logger.info(f"RUN started. Waiting {duration_ms}ms...")
-            # Wait for duration + buffer
-            time.sleep(duration_ms / 1000.0 + 0.5)
-            self.logger.info("RUN complete.")
-            return True
-        else:
-            self.logger.warning(f"RUN failed: {line}")
+        if not result:
+            self.logger.warning(f"MOVE not acknowledged: {line}")
             return False
-    
-    def run_all(self, direction, duration_ms):
-        """Run all motors in same direction"""
-        return self.run_motors(direction, direction, direction, duration_ms)
+        
+        self.logger.info(f"Move started. Waiting for completion (timeout={move_timeout}s)...")
+        
+        # Step 2: Wait for MOVE TARGET_REACHED or MOVE TIMEOUT
+        result, line = self._wait_for_response(
+            success_tokens=["MOVE TARGET_REACHED"],
+            failure_tokens=["MOVE TIMEOUT", "OK STOP"],
+            timeout=move_timeout
+        )
+        
+        if result and line and "TARGET_REACHED" in line:
+            self.logger.info(f"Move completed: {line}")
+            # Update pose tracking
+            heading_rad = math.radians(self.pose['heading_deg'])
+            self.pose['x'] += distance_m * math.cos(heading_rad)
+            self.pose['y'] += distance_m * math.sin(heading_rad)
+            self.logger.info(f"Pose updated: ({self.pose['x']:.2f}, {self.pose['y']:.2f}, {self.pose['heading_deg']:.1f}°)")
+            # Reset STM32 odom after successful move
+            self._send_command("RESET_ODOM")
+            time.sleep(0.1)
+            return True
+        
+        # Movement was interrupted/timed out - check actual distance from odom
+        time.sleep(0.1)
+        actual_distance = self.odom['x']  # Forward distance in robot frame
+        
+        if actual_distance > 0.01:
+            self.logger.info(f"Move interrupted at {actual_distance:.3f}m (commanded: {distance_m:.3f}m)")
+            # Update pose with actual distance
+            heading_rad = math.radians(self.pose['heading_deg'])
+            self.pose['x'] += actual_distance * math.cos(heading_rad)
+            self.pose['y'] += actual_distance * math.sin(heading_rad)
+            self.logger.info(f"Pose updated: ({self.pose['x']:.2f}, {self.pose['y']:.2f}, {self.pose['heading_deg']:.1f}°)")
+        else:
+            self.logger.info(f"Move barely started (odom x={self.odom['x']:.3f}m)")
+        
+        self._send_command("RESET_ODOM")
+        time.sleep(0.1)
+        
+        if result is False:
+            self.logger.warning(f"Move failed: {line}")
+        else:
+            self.logger.warning("Move timeout with no MCU response.")
+        return False
     
     def stop(self):
         """Emergency stop"""
@@ -249,7 +345,7 @@ class STM32Tester:
         return result
     
     def get_odom(self):
-        """Get current odometry"""
+        """Get current STM32 odometry"""
         return {
             'x': self.odom['x'],
             'y': self.odom['y'],
@@ -259,7 +355,8 @@ class STM32Tester:
     def print_odom(self):
         """Print current odometry"""
         odom = self.get_odom()
-        self.logger.info(f"Odometry: x={odom['x']:.4f}m, y={odom['y']:.4f}m, theta={odom['theta_deg']:.2f}°")
+        self.logger.info(f"STM32 Odom: x={odom['x']:.4f}m, y={odom['y']:.4f}m, theta={odom['theta_deg']:.2f}°")
+        self.logger.info(f"Pose Track: x={self.pose['x']:.4f}m, y={self.pose['y']:.4f}m, heading={self.pose['heading_deg']:.2f}°")
 
 
 def main():
@@ -273,34 +370,23 @@ def main():
     
     try:
         # Check command line args
-        if len(sys.argv) >= 3:
+        if len(sys.argv) >= 2:
             # Command line mode
-            if len(sys.argv) == 3:
-                # RUN dir duration
-                direction = sys.argv[1].upper()
-                duration_ms = int(sys.argv[2])
-                tester.run_all(direction, duration_ms)
-            elif len(sys.argv) == 5:
-                # RUN dir1 dir2 dir3 duration
-                dir1 = sys.argv[1].upper()
-                dir2 = sys.argv[2].upper()
-                dir3 = sys.argv[3].upper()
-                duration_ms = int(sys.argv[4])
-                tester.run_motors(dir1, dir2, dir3, duration_ms)
-            else:
-                print("Usage: python test_run.py [dir] [duration_ms]")
-                print("       python test_run.py [dir1] [dir2] [dir3] [duration_ms]")
+            distance_m = float(sys.argv[1])
+            tester.send_move(distance_m)
             tester.print_odom()
         else:
             # Interactive mode
-            print("\n=== RUN Command Tester ===")
+            print("\n=== MOVE Command Tester ===")
             print("Commands:")
-            print("  run <dir> <ms>           - Run all motors (F/R/S)")
-            print("  run <d1> <d2> <d3> <ms>  - Run each motor separately")
-            print("  stop                     - Emergency stop")
-            print("  odom                     - Print current odometry")
-            print("  reset                    - Reset odometry")
-            print("  q / quit                 - Exit")
+            print("  move <distance>    - Move forward by distance (meters)")
+            print("  param <name> <val> - Set STM32 parameter (e.g. param odom_scale 0.90)")
+            print("  stop               - Emergency stop")
+            print("  odom               - Print current odometry")
+            print("  reset              - Reset odometry and pose")
+            print("  q / quit           - Exit")
+            print()
+            print(f"TEST_OVERRIDES: {TEST_OVERRIDES}")
             print()
             
             while True:
@@ -324,19 +410,27 @@ def main():
                 elif command == 'reset':
                     tester._send_command("RESET_ODOM")
                     tester._wait_for_response(["OK"], ["ERR"], timeout=1.0)
-                elif command == 'run':
-                    if len(parts) == 3:
-                        tester.run_all(parts[1].upper(), int(parts[2]))
-                    elif len(parts) == 5:
-                        tester.run_motors(parts[1].upper(), parts[2].upper(), 
-                                         parts[3].upper(), int(parts[4]))
+                    tester.pose = {'x': 0.0, 'y': 0.0, 'heading_deg': 0.0}
+                    tester.logger.info("Odometry and pose reset.")
+                elif command == 'move':
+                    if len(parts) >= 2:
+                        distance = float(parts[1])
+                        tester.send_move(distance)
                     else:
-                        print("Usage: run <dir> <ms> OR run <d1> <d2> <d3> <ms>")
+                        print("Usage: move <distance_meters>")
                     tester.print_odom()
+                elif command == 'param':
+                    if len(parts) >= 3:
+                        param_name = parts[1]
+                        param_value = parts[2]
+                        tester._send_command(f"SET_PARAM {param_name} {param_value}")
+                        tester._wait_for_response(["OK SET_PARAM"], ["ERR"], timeout=1.0)
+                    else:
+                        print("Usage: param <name> <value>")
                 else:
                     # Send raw command
                     tester._send_command(cmd)
-                    tester._wait_for_response(["OK", "TARGET", "TIMEOUT"], ["ERR"], timeout=5.0)
+                    tester._wait_for_response(["OK", "TARGET", "TIMEOUT"], ["ERR"], timeout=25.0)
     
     finally:
         tester.disconnect()
