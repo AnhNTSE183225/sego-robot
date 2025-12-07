@@ -58,7 +58,8 @@ Configurable at runtime from Python without reflashing STM32:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `odom_scale` | 0.902521 | Odometry distance calibration |
+| `odom_scale` | 0.902521 | Odometry distance calibration (linear) |
+| `odom_angular_scale` | 1.0 | Odometry angular calibration (rotation only) |
 | `linear_k` | 1.0 | Position P-gain |
 | `angular_k` | 0.55 | Rotation P-gain |
 | `max_speed` | 0.8 | Max wheel speed |
@@ -123,6 +124,7 @@ Config file is **required** - scripts throw error if missing.
 - (none yet)
 
 # Historical Notes / Archived
+- [2025-12-07] Added `odom_angular_scale` parameter for independent rotation calibration (fixes rotation under-reporting ~5%)
 - [2025-12-06] Added SET_PARAM command for runtime STM32 configuration without reflashing
 - [2025-12-06] Added `robot_config.json` to centralize all settings (replaces env vars)
 - [2025-12-06] Added `test_run.py` and `test_rotate.py` for standalone command testing
