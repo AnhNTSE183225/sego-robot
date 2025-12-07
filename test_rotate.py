@@ -21,6 +21,18 @@ import time
 from pathlib import Path
 
 
+# =============================================================================
+# TEST OVERRIDES - Hardcode values here to test before applying to config
+# These override values from robot_config.json when not None
+# =============================================================================
+TEST_OVERRIDES = {
+    'rotate_tol_angle': 0.10,  # Test: increase from 0.02 to 0.10 rad (~5.7°)
+    # 'angular_k': 1.2,        # Uncomment to test higher angular gain
+    # 'min_duty_rotate': 0.35, # Uncomment to test lower deadband
+}
+# =============================================================================
+
+
 def load_config():
     """Load configuration from robot_config.json. Raises error if file missing."""
     config_path = Path(__file__).parent / "robot_config.json"
@@ -103,6 +115,9 @@ class STM32Tester:
         stm32_params = self.config.get('stm32_params', {})
         if stm32_params:
             self._configure_stm32_params(stm32_params)
+        
+        # Apply test overrides (for debugging - these override config values)
+        self._apply_test_overrides()
         
         # Reset odometry
         self._send_command("RESET_ODOM")
@@ -206,6 +221,28 @@ class STM32Tester:
             else:
                 self.logger.warning(f"  Failed to set {name}")
         self.logger.info("Parameters configured.")
+    
+    def _apply_test_overrides(self):
+        """Apply TEST_OVERRIDES for debugging (overrides config values)"""
+        if not TEST_OVERRIDES:
+            return
+        
+        self.logger.info("Applying TEST OVERRIDES...")
+        for name, value in TEST_OVERRIDES.items():
+            if value is None:
+                continue
+            if 'timeout' in name:
+                value_str = str(int(value))
+            else:
+                value_str = f"{value:.6f}"
+            
+            self._send_command(f"SET_PARAM {name} {value_str}")
+            result, _ = self._wait_for_response(["OK SET_PARAM"], ["ERR"], timeout=0.5)
+            if result:
+                self.logger.info(f"  [OVERRIDE] {name} = {value}")
+            else:
+                self.logger.warning(f"  [OVERRIDE] Failed to set {name}")
+        self.logger.info("Test overrides applied.")
     
     @staticmethod
     def normalize_angle_deg(angle):
@@ -378,6 +415,7 @@ def main():
             print("Commands:")
             print("  rotate <angle>     - Rotate by angle (degrees, MCU frame)")
             print("  to <heading>       - Rotate to absolute heading (world frame)")
+            print("  param <name> <val> - Set STM32 parameter (e.g. param rotate_tol_angle 0.10)")
             print("  stop               - Emergency stop")
             print("  odom               - Print current odometry")
             print("  reset              - Reset odometry and pose")
@@ -386,6 +424,8 @@ def main():
             print("NOTE: MCU uses clockwise-positive convention")
             print("      Navigator uses counter-clockwise positive")
             print("      'rotate' sends direct to MCU, 'to' converts like navigator")
+            print()
+            print(f"TEST_OVERRIDES applied: {TEST_OVERRIDES}")
             print()
             
             while True:
@@ -425,6 +465,14 @@ def main():
                     else:
                         print("Usage: to <target_heading_deg>")
                     tester.print_odom()
+                elif command == 'param':
+                    if len(parts) >= 3:
+                        param_name = parts[1]
+                        param_value = parts[2]
+                        tester._send_command(f"SET_PARAM {param_name} {param_value}")
+                        tester._wait_for_response(["OK SET_PARAM"], ["ERR"], timeout=1.0)
+                    else:
+                        print("Usage: param <name> <value>")
                 else:
                     # Send raw command
                     tester._send_command(cmd)
