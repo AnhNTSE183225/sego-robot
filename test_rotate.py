@@ -26,7 +26,7 @@ from pathlib import Path
 # These override values from robot_config.json when not None
 # =============================================================================
 TEST_OVERRIDES = {
-    'odom_angular_scale': 1.05,  # Test: 90/85.82 ≈ 1.05 to fix rotation under-reporting
+    'odom_angular_scale': 0.95,  # Decrease so robot rotates MORE (82°→90°: factor 82/90=0.91)
     # 'rotate_tol_angle': 0.10,  # Tolerance fix (alternative to angular scale)
     # 'angular_k': 1.2,          # Uncomment to test higher angular gain
     # 'min_duty_rotate': 0.35,   # Uncomment to test lower deadband
