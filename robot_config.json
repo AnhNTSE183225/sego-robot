@@ -83,7 +83,7 @@
         "move_min_pwm": 0.46,
         "move_max_pwm": 0.70,
         "move_smoothing": 0.25,
-        "move_skew": 0.015,
+        "move_skew": 0.017,
         "move_base_pwm": 0.58,
         "move_timeout": 20000,
         

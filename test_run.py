@@ -26,11 +26,11 @@ from pathlib import Path
 # These override values from robot_config.json when not None
 # =============================================================================
 TEST_OVERRIDES = {
-    # Drift correction testing:
-    # move_skew=0.015 → drifts LEFT 4.5cm
-    # move_skew=0.018 → drifts RIGHT 2.4cm
-    # Interpolated: 0.017 should be ~zero drift
-    'move_skew': 0.017,
+    # All calibration values now in robot_config.json
+    # Drift calibration history:
+    #   move_skew=0.015 → drifts LEFT 4.5cm/90cm
+    #   move_skew=0.018 → drifts RIGHT 2.4cm/90cm
+    #   move_skew=0.017 → calibrated (in config)
 }
 # =============================================================================
 
