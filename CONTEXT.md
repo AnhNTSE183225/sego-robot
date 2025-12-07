@@ -59,7 +59,7 @@ Configurable at runtime from Python without reflashing STM32:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `odom_scale` | 0.902521 | Odometry distance calibration (linear) |
-| `odom_angular_scale` | 1.0 | Odometry angular calibration (rotation only) |
+| `odom_angular_scale` | 0.95 | Odometry angular calibration (rotation only) |
 | `linear_k` | 1.0 | Position P-gain |
 | `angular_k` | 0.55 | Rotation P-gain |
 | `max_speed` | 0.8 | Max wheel speed |
@@ -76,7 +76,7 @@ Configurable at runtime from Python without reflashing STM32:
 | `move_base_pwm` | 0.58 | MOVE base PWM |
 | `move_timeout` | 20000 | MOVE timeout (ms) |
 | `rotate_tol_dist` | 0.02 | ROTATE position tolerance (m) |
-| `rotate_tol_angle` | 0.02 | ROTATE angle tolerance (rad) |
+| `rotate_tol_angle` | 0.087 | ROTATE angle tolerance (rad, ~5°) |
 | `rotate_timeout` | 10000 | ROTATE timeout (ms) |
 | `move_dist_tol_dist` | 0.01 | MOVE_DIST position tolerance (m) |
 | `move_dist_tol_angle` | 0.05 | MOVE_DIST angle tolerance (rad) |
@@ -124,7 +124,8 @@ Config file is **required** - scripts throw error if missing.
 - (none yet)
 
 # Historical Notes / Archived
-- [2025-12-07] Added `odom_angular_scale` parameter for independent rotation calibration (fixes rotation under-reporting ~5%)
+- [2025-12-07] Increased `rotate_tol_angle` to 0.087 rad (~5°) to match odom under-reporting
+- [2025-12-07] Added `odom_angular_scale` parameter for independent rotation calibration (calibrated to 0.95 for accurate 90° rotation)
 - [2025-12-06] Added SET_PARAM command for runtime STM32 configuration without reflashing
 - [2025-12-06] Added `robot_config.json` to centralize all settings (replaces env vars)
 - [2025-12-06] Added `test_run.py` and `test_rotate.py` for standalone command testing

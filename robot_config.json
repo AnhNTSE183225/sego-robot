@@ -68,7 +68,7 @@
         "_comment": "These are sent to STM32 via SET_PARAM on startup",
         
         "odom_scale": 0.902521,
-        "odom_angular_scale": 1.0,
+        "odom_angular_scale": 0.95,
         
         "linear_k": 1.0,
         "angular_k": 0.55,
@@ -88,7 +88,7 @@
         "move_timeout": 20000,
         
         "rotate_tol_dist": 0.02,
-        "rotate_tol_angle": 0.02,
+        "rotate_tol_angle": 0.087,
         "rotate_timeout": 10000,
         
         "move_dist_tol_dist": 0.01,
