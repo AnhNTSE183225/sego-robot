@@ -27,11 +27,10 @@ from pathlib import Path
 # =============================================================================
 TEST_OVERRIDES = {
     # Drift correction testing:
-    # Current move_skew = 0.015, robot drifts LEFT by ~4.5cm over 90cm
-    # Try increasing move_skew to push robot RIGHT
-    'move_skew': 0.065,  # Test: increase from 0.015 (drift 4.5cm/90cm ≈ 0.05)
-    # 'odom_scale': 0.90,          # Linear distance calibration
-    # 'move_base_pwm': 0.60,       # Base PWM for MOVE
+    # Original: move_skew=0.015 → drifts LEFT 4.5cm/90cm
+    # Test 1: move_skew=0.065 → drifts RIGHT 45° (WAY too much!)
+    # Try smaller increment:
+    'move_skew': 0.018,  # Small increase from 0.015
 }
 # =============================================================================
 
