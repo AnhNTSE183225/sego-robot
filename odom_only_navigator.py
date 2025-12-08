@@ -153,6 +153,7 @@ MOVE_TIMEOUT_SEC = _motion_cfg.get('move_timeout_sec', 25.0)
 ROTATE_TIMEOUT_SEC = _motion_cfg.get('rotate_timeout_sec', 15.0)
 AXIS_ALIGNED_MOVES = _motion_cfg.get('axis_aligned_moves', False)
 HEADING_OFFSET_DEG = _motion_cfg.get('heading_offset_deg', 0.0)
+AXIS_DRIFT_TOLERANCE_M = max(DISTANCE_TOLERANCE_M * 1.5, 0.03)  # How far we allow drift off-axis before correcting
 
 # Obstacle avoidance parameters (from config file)
 _obstacle_cfg = ROBOT_CONFIG.get('obstacle_avoidance', {})
@@ -982,6 +983,15 @@ class OdomOnlyNavigator:
     def _front_clear(self, step_distance, heading_world=None):
         pose = self._get_pose()
         heading = pose['heading_deg'] if heading_world is None else heading_world
+        if not self._step_static_clear(pose, heading, step_distance):
+            self.logger.info(
+                "Static map blocks forward step: pose=(%.2f, %.2f) heading=%.1f° step=%.2f",
+                pose['x'],
+                pose['y'],
+                heading,
+                step_distance,
+            )
+            return False
         clearance = self._heading_clearance(
             heading, pose['heading_deg'], FORWARD_SCAN_ANGLE_DEG, step_distance + CLEARANCE_MARGIN_M
         )
@@ -1206,10 +1216,8 @@ class OdomOnlyNavigator:
             seg_dy = segment_goal[1] - segment_start['y']
             if abs(seg_dx) >= abs(seg_dy):
                 segment_axis = "X"
-                segment_base_heading = 0.0 if seg_dx >= 0 else 180.0
             else:
                 segment_axis = "Y"
-                segment_base_heading = 90.0 if seg_dy >= 0 else -90.0
 
             state = STATE_GOAL_FOLLOW
             detour_side = "RIGHT"
@@ -1243,13 +1251,25 @@ class OdomOnlyNavigator:
                 dx = segment_goal[0] - pose['x']
                 dy = segment_goal[1] - pose['y']
                 distance = math.hypot(dx, dy)
+                if segment_axis == "X":
+                    base_heading = 0.0 if dx >= 0 else 180.0
+                    lateral_error = dy
+                    correction_heading = 90.0 if dy >= 0 else -90.0
+                    correction_target = segment_goal[1]
+                    correction_axis = "Y"
+                else:
+                    base_heading = 90.0 if dy >= 0 else -90.0
+                    lateral_error = dx
+                    correction_heading = 0.0 if dx >= 0 else 180.0
+                    correction_target = segment_goal[0]
+                    correction_axis = "X"
 
                 # Debug the segment state machine
                 self.logger.info(
                     "[SEGMENT DEBUG] axis=%s base_heading=%.1f° state=%s detour=%s "
                     "pose=(%.2f, %.2f, %.1f°) dx=%.2f dy=%.2f dist=%.2f",
                     segment_axis,
-                    segment_base_heading,
+                    base_heading,
                     state,
                     detour_side,
                     pose['x'],
@@ -1263,9 +1283,29 @@ class OdomOnlyNavigator:
                 if distance < DISTANCE_TOLERANCE_M:
                     break  # Segment complete
 
-                base_heading = segment_base_heading
-
                 if state == STATE_GOAL_FOLLOW:
+                    if abs(lateral_error) > AXIS_DRIFT_TOLERANCE_M:
+                        correction_step = min(abs(lateral_error), MOVE_STEP_M)
+                        self.logger.info(
+                            "Axis correction (%s): recovering %s toward %.2f (err=%.2f m)",
+                            segment_axis,
+                            correction_axis,
+                            correction_target,
+                            lateral_error,
+                        )
+                        if self._drive_step(
+                            correction_heading,
+                            correction_step,
+                            allow_detour=True,
+                            current_pose=(pose['x'], pose['y']),
+                        ):
+                            continue
+                        self.logger.warning("Axis correction blocked; switching to obstacle follow.")
+                        state = STATE_OBSTACLE_FOLLOW
+                        detour_side = "RIGHT"
+                        side_switches = 0
+                        continue
+
                     if not self._close_enough_heading(base_heading):
                         self._rotate_to_heading(base_heading)
 
@@ -1793,6 +1833,13 @@ class OdomOnlyNavigator:
             self.logger.info(
                 "Segment %s -> %s leaves boundary: start inside, end outside.",
                 start, end
+            )
+            return True
+        if not inside_start and not inside_end:
+            self.logger.warning(
+                "Segment %s -> %s is outside boundary (start and end).",
+                start,
+                end,
             )
             return True
         self.logger.debug(

@@ -121,9 +121,10 @@ Config file is **required** - scripts throw error if missing.
 - MCU expects clockwise-positive rotation (command_delta = -world_delta)
 
 # Open Questions / TODOs
-- (none yet)
+- [TODO] Pose tracking / odometry sync with STM32 deferred (issue #2 to be fixed later)
 
 # Historical Notes / Archived
+- [2025-12-08] Added static boundary enforcement to forward-clear checks to prevent driving outside map; added axis correction during L-shape navigation to pull robot back to target axis after detours
 - [2025-12-07] **CRITICAL BUG FIX**: Robot couldn't move perpendicular during obstacle avoidance - `cos(90°)=0` was causing ±90° offsets to be skipped. Now allows perpendicular movement in axis-aligned mode.
 - [2025-12-07] Increased `max_side_switches` from 5 → 10 for more persistent obstacle avoidance
 - [2025-12-07] Fixed obstacle avoidance to use only ±90° offsets when axis-aligned mode enabled (was trying 15°, 30°, 45°... causing cumulative drift)
@@ -135,4 +136,3 @@ Config file is **required** - scripts throw error if missing.
 - [2025-12-06] Added `robot_config.json` to centralize all settings (replaces env vars)
 - [2025-12-06] Added `test_run.py` and `test_rotate.py` for standalone command testing
 - [2025-12-06] Removed fallback configs - config file now required, fail fast on missing
-
