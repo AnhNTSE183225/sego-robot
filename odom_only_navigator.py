@@ -368,20 +368,13 @@ class OdomOnlyNavigator:
                             self.stm32_odom['x'] = x
                             self.stm32_odom['y'] = y
                             self.stm32_odom['heading_deg'] = heading_deg
+                            odom_snapshot = dict(self.stm32_odom)
                     except ValueError:
                         pass
+                    else:
+                        # Accumulate live progress for the active MOVE using odom deltas.
+                        self._accumulate_active_motion_progress(odom_snapshot)
                     continue  # Don't put odom lines in response queue
-            # Track closed-loop MOVE progress from CL CMD lines if present
-            if "CL CMD" in line and "dist=" in line:
-                try:
-                    dist_str = line.split("dist=")[1].split()[0]
-                    dist_val = float(dist_str)
-                    if dist_val > 0:
-                        with self.active_motion_lock:
-                            if self.active_motion:
-                                self.active_motion['progress'] += dist_val
-                except Exception:
-                    pass
             self.logger.info(f"[STM32] {line}")
             self.response_queue.put(line.strip())
         self._serial_running = False
@@ -445,6 +438,19 @@ class OdomOnlyNavigator:
             'y': start_pose['y'] + dx * math.sin(rad),
             'heading_deg': heading_deg,
         }
+
+    def _accumulate_active_motion_progress(self, current_odom):
+        """Update active motion progress using odom delta magnitude; ignore sign/axis drift."""
+        with self.active_motion_lock:
+            if not self.active_motion:
+                return 0.0
+            delta = self._odom_delta(self.active_motion['odom_start'], current_odom)
+            incr = abs(delta.get('x', 0.0)) + abs(delta.get('y', 0.0))
+            if incr > 0:
+                self.active_motion['progress'] += incr
+                # Reset baseline so we only accumulate fresh delta next time
+                self.active_motion['odom_start'] = dict(current_odom)
+            return self.active_motion['progress']
 
     def _get_pose(self):
         """Trả về pose tính từ lệnh đã gửi."""
@@ -717,6 +723,7 @@ class OdomOnlyNavigator:
         with self.active_motion_lock:
             self.active_motion = {
                 'start_pose': self._get_pose(),
+                'odom_start': self._get_stm32_odom(),
                 'progress': 0.0,
                 'heading': self._get_pose()['heading_deg'],
             }
@@ -2006,6 +2013,8 @@ class OdomOnlyNavigator:
         pose_anchor = self._get_pose()
 
         # If a MOVE is in-flight, fuse live progress for status only (do not mutate pose)
+        current_odom = self._get_stm32_odom()
+        self._accumulate_active_motion_progress(current_odom)
         with self.active_motion_lock:
             active = dict(self.active_motion) if self.active_motion else None
         if active:
