@@ -89,7 +89,7 @@
         
         "rotate_tol_dist": 0.02,
         "rotate_tol_angle": 0.087,
-        "rotate_timeout": 15000,
+        "rotate_timeout": 10000,
         
         "move_dist_tol_dist": 0.01,
         "move_dist_tol_angle": 0.05,

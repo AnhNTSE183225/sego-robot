@@ -231,9 +231,6 @@ class OdomOnlyNavigator:
             'y': 0.0,
             'heading_deg': 0.0,
         }
-        # Track active motion for live status fusion
-        self.active_motion_lock = threading.Lock()
-        self.active_motion = None  # {'start_pose':..., 'odom_start':..., 'axis':...}
 
         # LIDAR state
         self.lidar = None
@@ -418,78 +415,10 @@ class OdomOnlyNavigator:
             self.cmd_pose['heading_deg'] = normalize_angle_deg(
                 self.cmd_pose['heading_deg'] + angle_deg
             )
-        self.logger.info(
-            "Pose updated after ROTATE: (%.2f, %.2f, %.1f°)",
-            self.cmd_pose['x'], self.cmd_pose['y'], self.cmd_pose['heading_deg']
-        )
-
-    def _odom_delta(self, odom_start, odom_end):
-        """Compute STM32 odom delta (MCU frame, clockwise-positive heading) between two snapshots."""
-        return {
-            'x': odom_end.get('x', 0.0) - odom_start.get('x', 0.0),
-            'y': odom_end.get('y', 0.0) - odom_start.get('y', 0.0),
-            'heading_deg': normalize_angle_deg(
-                odom_end.get('heading_deg', 0.0) - odom_start.get('heading_deg', 0.0)
-            ),
-        }
-
-    def _dominant_axis_from_heading(self, heading_deg):
-        """Return 'X' if heading near 0/180, 'Y' if near 90/-90, else None."""
-        h = normalize_angle_deg(heading_deg)
-        if -45.0 <= h <= 45.0 or h >= 135.0 or h <= -135.0:
-            return "X"
-        if 45.0 <= h <= 135.0 or -135.0 <= h <= -45.0:
-            return "Y"
-        return None
-
-    def _compose_pose_with_delta(self, start_pose, odom_delta, dominant_axis=None):
-        """
-        Compose STM32 odom delta (relative to last RESET_ODOM) onto an absolute start_pose
-        without mutating internal pose.
-        STM32 odom frame: x = forward, y = left, heading_deg = clockwise-positive (MCU frame).
-        """
-        dx_r = odom_delta.get('x', 0.0)
-        dy_r = odom_delta.get('y', 0.0)
-        dtheta_mcu = odom_delta.get('heading_deg', 0.0)
-
-        if dominant_axis == "X":
-            dy_r = 0.0
-        elif dominant_axis == "Y":
-            dx_r = 0.0
-
-        heading_start = start_pose['heading_deg']
-        heading_start_rad = math.radians(heading_start)
-
-        # Rotate robot-frame delta into world frame using heading at command start
-        dx_w = dx_r * math.cos(heading_start_rad) - dy_r * math.sin(heading_start_rad)
-        dy_w = dx_r * math.sin(heading_start_rad) + dy_r * math.cos(heading_start_rad)
-
-        # MCU heading is clockwise-positive -> world heading delta is negative
-        dtheta_world = -dtheta_mcu
-        new_heading = normalize_angle_deg(heading_start + dtheta_world)
-
-        fused = {
-            'x': start_pose['x'] + dx_w,
-            'y': start_pose['y'] + dy_w,
-            'heading_deg': new_heading,
-        }
-        return fused, dx_r, dy_r, dtheta_mcu
-
-    def _update_pose_with_odom_delta(self, start_pose, odom_delta, dominant_axis=None):
-        """Mutate cmd_pose using odom delta (wrapper around _compose_pose_with_delta)."""
-        fused, dx_r, dy_r, dtheta_mcu = self._compose_pose_with_delta(start_pose, odom_delta, dominant_axis=dominant_axis)
-        with self.pose_lock:
-            self.cmd_pose.update(fused)
-
-        self.logger.info(
-            "Pose updated from STM32 odom delta: (%.2f, %.2f, %.1f°) [odom dx=%.3f dy=%.3f dth=%.1f°]",
-            fused['x'],
-            fused['y'],
-            fused['heading_deg'],
-            dx_r,
-            dy_r,
-            dtheta_mcu,
-        )
+            self.logger.info(
+                "Pose updated after ROTATE: (%.2f, %.2f, %.1f°)",
+                self.cmd_pose['x'], self.cmd_pose['y'], self.cmd_pose['heading_deg']
+            )
 
     # --- LIDAR reading ---
     def _start_lidar_listener(self):
@@ -613,14 +542,14 @@ class OdomOnlyNavigator:
         - "TIMEOUT" = rotation timed out
         
         Returns:
-            (success: bool, actual_world_delta: float|None)
-            actual_world_delta uses world sign convention (CCW positive). If rotation fails,
-            delta may be None.
+            True if rotation completed successfully
+            False if rotation failed/interrupted (pose updated with actual rotation)
         """
         if abs(desired_angle_deg) < 0.1:
-            return True, 0.0
+            return True
         
-        odom_start = self._get_stm32_odom()
+        # Reset STM32 odom cache before ROTATE
+        self._reset_stm32_odom()
         
         cmd = f"ROTATE_DEG {desired_angle_deg:.2f}"
         self.logger.info(f"ROTATE: {cmd}")
@@ -635,7 +564,7 @@ class OdomOnlyNavigator:
         )
         if not result:
             self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
-            return False, None
+            return False
         
         # Step 2: wait for TARGET_REACHED or TIMEOUT
         result, line = self._wait_for_response(
@@ -644,63 +573,39 @@ class OdomOnlyNavigator:
             timeout=ROTATE_TIMEOUT_SEC
         )
         
-        # Get actual rotation achieved relative to start snapshot
-        odom_end = self._get_stm32_odom()
-        delta_odom = self._odom_delta(odom_start, odom_end)
-        actual_rotation_mcu = delta_odom['heading_deg']  # MCU frame (clockwise positive)
-        actual_world_delta = -actual_rotation_mcu  # world frame (CCW positive)
-
-        def _sign_mismatch():
-            if world_delta is None:
-                return False
-            return (
-                world_delta * actual_world_delta < 0
-                and abs(actual_world_delta) > ANGLE_TOLERANCE_DEG
-                and abs(world_delta) > ANGLE_TOLERANCE_DEG
-            )
-
         if result:
             self.logger.info(f"Rotation completed: {line}")
-            if _sign_mismatch():
-                self.logger.error(
-                    "Rotation sign mismatch: commanded world_delta=%.1f°, STM32 odom=%.1f° (world %.1f°).",
-                    world_delta,
-                    actual_rotation_mcu,
-                    actual_world_delta,
-                )
-                return False, actual_world_delta
-            return True, actual_world_delta
-
+            # Reset STM32 odometry so the next MOVE starts from (0,0,0)
+            self._send_raw_command("RESET_ODOM")
+            time.sleep(0.1)
+            return True
+        
         # Rotation was interrupted/timed out: use STM32 odom to see how far it got
+        stm32_odom = self._get_stm32_odom()
+        actual_rotation = stm32_odom['heading_deg']
         target_delta_mcu = desired_angle_deg  # MCU frame (same sign as command)
-        rotation_err_mcu = abs(actual_rotation_mcu - target_delta_mcu)
+        rotation_err_mcu = abs(actual_rotation - target_delta_mcu)
         if rotation_err_mcu <= ROTATE_TIMEOUT_TOLERANCE_DEG:
             self.logger.warning(
                 "Rotation TIMEOUT but odom within tolerance in MCU frame (actual=%.1f°, target=%.1f°, err=%.1f° <= %.1f°); accepting.",
-                actual_rotation_mcu, target_delta_mcu, rotation_err_mcu, ROTATE_TIMEOUT_TOLERANCE_DEG
+                actual_rotation, target_delta_mcu, rotation_err_mcu, ROTATE_TIMEOUT_TOLERANCE_DEG
             )
-            return True, actual_world_delta
-
-        if _sign_mismatch():
-            self.logger.error(
-                "Rotation sign mismatch after TIMEOUT: commanded world_delta=%.1f°, STM32 odom=%.1f° (world %.1f°).",
-                world_delta,
-                actual_rotation_mcu,
-                actual_world_delta,
-            )
-
-        if abs(actual_rotation_mcu) > 0.5:  # At least some rotation happened
-            self.logger.info(
-                "Rotation interrupted at %.1f° (commanded: %.1f° MCU frame)",
-                actual_rotation_mcu,
-                desired_angle_deg,
-            )
+            self._send_raw_command("RESET_ODOM")
+            time.sleep(0.1)
+            return True
+        
+        if abs(actual_rotation) > 0.5:  # At least some rotation happened
+            self.logger.info(f"Rotation interrupted at {actual_rotation:.1f}deg (commanded: {desired_angle_deg:.1f}deg)")
+        
+        # Reset STM32 odometry for the next command
+        self._send_raw_command("RESET_ODOM")
+        time.sleep(0.1)
         
         if result is False:
             self.logger.warning(f"Rotation failed ({line}).")
         else:
             self.logger.warning("Rotation timeout with no MCU response.")
-        return False, actual_world_delta
+        return False
 
     def _send_stop(self):
         """Emergency stop - dừng robot ngay lập tức."""
@@ -720,7 +625,7 @@ class OdomOnlyNavigator:
         self.logger.info(f"Stopped at STM32 odom: x={stm32_odom['x']:.3f}, y={stm32_odom['y']:.3f}, heading={stm32_odom['heading_deg']:.1f}°")
         return stm32_odom
 
-    def _send_move(self, target_distance, monitor_lidar=True, dominant_axis=None):
+    def _send_move(self, target_distance, monitor_lidar=True):
         """Move forward by target_distance meters.
         
         Args:
@@ -734,11 +639,9 @@ class OdomOnlyNavigator:
         if target_distance < DISTANCE_TOLERANCE_M:
             return True
         
-        start_pose = self._get_pose()
-        odom_start = self._get_stm32_odom()
-        if dominant_axis is None:
-            dominant_axis = self._dominant_axis_from_heading(start_pose['heading_deg'])
-
+        # Reset STM32 odom cache trước khi MOVE để đo được khoảng cách thực tế
+        self._reset_stm32_odom()
+        
         # Flag để signal stop từ LIDAR monitor thread
         self._move_stop_flag = False
         self._move_stop_reason = None
@@ -747,13 +650,6 @@ class OdomOnlyNavigator:
         self.logger.info(f"MOVE: {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
-
-        with self.active_motion_lock:
-            self.active_motion = {
-                'start_pose': dict(start_pose),
-                'odom_start': dict(odom_start),
-                'axis': dominant_axis,
-            }
         
         # Bước 1: Chờ OK MOVE (command acknowledged)
         result, line = self._wait_for_response(
@@ -791,41 +687,34 @@ class OdomOnlyNavigator:
         self._move_stop_flag = True
         
         if result and line and "TARGET_REACHED" in line:
-            # MOVE hoàn thành thành công -> lấy odom thực tế (có thể có drift/rotation nhỏ)
-            time.sleep(0.05)
-            odom_end = self._get_stm32_odom()
-            delta_odom = self._odom_delta(odom_start, odom_end)
-            self._update_pose_with_odom_delta(start_pose, delta_odom, dominant_axis=dominant_axis)
-            with self.active_motion_lock:
-                self.active_motion = None
+            # MOVE hoàn thành thành công -> trust commanded distance
+            self._update_pose_after_move(target_distance)
+            # Reset STM32 odometry cho lệnh tiếp theo
+            self._send_raw_command("RESET_ODOM")
+            time.sleep(0.1)
             # Publish latest pose so UI sees translation promptly
             self._send_status()
             return True
         
-        # Movement bị gián đoạn -> dùng đầy đủ STM32 odom delta (x,y,heading)
+        # Movement bị gián đoạn -> dùng STM32 odom.x để biết thực tế đã đi bao xa
+        # Chỉ đọc odom.x vì MOVE = forward motion = robot's local X axis
+        # odom.y ≈ 0 (lateral drift), không cần đọc
         time.sleep(0.1)  # Cho STM32 cập nhật odom
-        odom_end = self._get_stm32_odom()
-        delta_odom = self._odom_delta(odom_start, odom_end)
-
-        if delta_odom['x'] < -DISTANCE_TOLERANCE_M:
-            self.logger.warning(f"Negative odom.x ({delta_odom['x']:.3f}m) - robot drifted backward?")
-
-        moved_norm = math.hypot(delta_odom['x'], delta_odom['y'])
-        if moved_norm > DISTANCE_TOLERANCE_M:
-            self.logger.info(
-                "Movement interrupted at %.3fm (cmd %.3fm), odom=(dx=%.3f, dy=%.3f, dth=%.1f°)",
-                moved_norm,
-                target_distance,
-                delta_odom['x'],
-                delta_odom['y'],
-                delta_odom['heading_deg'],
-            )
-            self._update_pose_with_odom_delta(start_pose, delta_odom, dominant_axis=dominant_axis)
+        stm32_odom = self._get_stm32_odom()
+        actual_distance = stm32_odom['x']  # Forward distance
+        if actual_distance < 0:
+            self.logger.warning(f"Negative odom.x ({actual_distance:.3f}m) - robot drifted backward?")
+            actual_distance = 0.0  # Don't update pose if robot went backward
+        
+        if actual_distance > DISTANCE_TOLERANCE_M:
+            self.logger.info(f"Movement interrupted at {actual_distance:.3f}m (commanded: {target_distance:.3f}m)")
+            self._update_pose_after_move(actual_distance)
         else:
-            self.logger.info(f"Movement barely started (odom x={delta_odom['x']:.3f})")
-
-        with self.active_motion_lock:
-            self.active_motion = None
+            self.logger.info(f"Movement barely started (odom x={stm32_odom['x']:.3f})")
+        
+        # Reset STM32 odometry cho lệnh tiếp theo
+        self._send_raw_command("RESET_ODOM")
+        time.sleep(0.1)
         
         if self._move_stop_reason:
             self.logger.warning(f"Move stopped by LIDAR: {self._move_stop_reason}")
@@ -1198,28 +1087,10 @@ class OdomOnlyNavigator:
             "Rotate_to_heading: current=%.1f°, target=%.1f°, world_delta=%.1f°, command_delta=%.1f°",
             current_heading, target_heading_world, world_delta, command_delta
         )
-        ok, actual_world_delta = self._send_rotate(command_delta, target_heading_world, world_delta=world_delta)
+        ok = self._send_rotate(command_delta, target_heading_world, world_delta=world_delta)
         if ok:
-            delta_to_apply = actual_world_delta if actual_world_delta is not None else world_delta
-            if delta_to_apply is not None:
-                self._update_pose_after_rotate(delta_to_apply)
-
-            # Post-rotation residual check (single correction attempt)
-            pose_after = self._get_pose()
-            residual = normalize_angle_deg(target_heading_world - pose_after['heading_deg'])
-            if abs(residual) > ANGLE_TOLERANCE_DEG:
-                self.logger.warning(
-                    "Residual heading error after rotate: %.1f° (target=%.1f°, pose=%.1f°); issuing correction.",
-                    residual,
-                    target_heading_world,
-                    pose_after['heading_deg'],
-                )
-                corr_cmd = -residual
-                ok2, actual_corr = self._send_rotate(corr_cmd, target_heading_world, world_delta=residual)
-                if ok2:
-                    self._update_pose_after_rotate(actual_corr if actual_corr is not None else residual)
-                    return True
-                return False
+            # On success, apply world delta
+            self._update_pose_after_rotate(world_delta)
             return True
         # If rotation reported failure, check if we're already close enough
         pose_after = self._get_pose()
@@ -1263,7 +1134,7 @@ class OdomOnlyNavigator:
                 if heading_clear < OBSTACLE_STOP_DISTANCE_M:
                     self.logger.warning("Obstacle detected ahead; stopping move step.")
                     return False
-            return self._send_move(step_distance, dominant_axis=self._dominant_axis_from_heading(desired_heading_world))
+            return self._send_move(step_distance)
 
         attempts = 0
         while attempts <= MAX_BLOCKED_RETRIES:
@@ -1288,7 +1159,7 @@ class OdomOnlyNavigator:
 
             if not self._rotate_to_heading(chosen_heading):
                 return False
-            if not self._send_move(step_distance, dominant_axis=self._dominant_axis_from_heading(chosen_heading)):
+            if not self._send_move(step_distance):
                 return False
             return True
 
@@ -1586,7 +1457,7 @@ class OdomOnlyNavigator:
                 self._send_status()
             except Exception:
                 pass
-            time.sleep(1.0)
+            time.sleep(5.0)
 
     # --- Kafka command handlers ---
     def _handle_kafka_command(self, envelope):
@@ -2059,20 +1930,6 @@ class OdomOnlyNavigator:
         pose_raw = self._pose_anchor_to_raw(pose_anchor)
         # Publish heading in raw map frame; do not add hardware offset here
         heading_deg = normalize_angle_deg(pose_raw['heading_deg'])
-        with self.active_motion_lock:
-            active_motion = dict(self.active_motion) if self.active_motion else None
-        if active_motion:
-            # Fuse live odom delta for in-flight status without mutating pose
-            odom_live = self._get_stm32_odom()
-            delta_live = self._odom_delta(active_motion['odom_start'], odom_live)
-            fused = self._compose_pose_with_delta(
-                active_motion['start_pose'],
-                delta_live,
-                dominant_axis=active_motion.get('axis'),
-            )
-            pose_anchor = fused
-            pose_raw = self._pose_anchor_to_raw(fused)
-            heading_deg = normalize_angle_deg(pose_raw['heading_deg'])
         payload = {
             "pose": {
                 "x": pose_raw['x'],
