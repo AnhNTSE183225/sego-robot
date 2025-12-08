@@ -422,6 +422,19 @@ class OdomOnlyNavigator:
         }
         return fused
 
+    def _compose_progress_pose(self, start_pose, odom_delta, heading_deg):
+        """
+        Compose forward odom progress along a fixed heading (ignore lateral odom/yaw drift).
+        Use when we assume perfect path but want live progress between start->goal.
+        """
+        dx = max(0.0, odom_delta.get('x', 0.0))  # only forward progress
+        rad = math.radians(heading_deg)
+        return {
+            'x': start_pose['x'] + dx * math.cos(rad),
+            'y': start_pose['y'] + dx * math.sin(rad),
+            'heading_deg': heading_deg,
+        }
+
     def _get_pose(self):
         """Trả về pose tính từ lệnh đã gửi."""
         with self.pose_lock:
@@ -694,6 +707,7 @@ class OdomOnlyNavigator:
             self.active_motion = {
                 'start_pose': self._get_pose(),
                 'odom_start': self._get_stm32_odom(),
+                'heading': self._get_pose()['heading_deg'],
             }
 
         # Bước 1: Chờ OK MOVE (command acknowledged)
@@ -1986,7 +2000,11 @@ class OdomOnlyNavigator:
         if active:
             odom_now = self._get_stm32_odom()
             delta_odom = self._odom_delta(active['odom_start'], odom_now)
-            fused_pose = self._compose_pose_with_delta(active['start_pose'], delta_odom)
+            fused_pose = self._compose_progress_pose(
+                active['start_pose'],
+                delta_odom,
+                heading_deg=active.get('heading', active['start_pose']['heading_deg']),
+            )
             pose_anchor = fused_pose
 
         pose_raw = self._pose_anchor_to_raw(pose_anchor)
