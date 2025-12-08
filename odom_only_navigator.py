@@ -372,7 +372,7 @@ class OdomOnlyNavigator:
                     except ValueError:
                         pass
                     else:
-                        # Accumulate live progress for the active MOVE using odom deltas.
+                        # Accumulate live progress for the active MOVE/ROTATE using odom deltas.
                         self._accumulate_active_motion_progress(odom_snapshot)
                     continue  # Don't put odom lines in response queue
             self.logger.info(f"[STM32] {line}")
@@ -439,18 +439,34 @@ class OdomOnlyNavigator:
             'heading_deg': heading_deg,
         }
 
+    def _compose_rotation_pose(self, start_pose, progress_deg, sign):
+        """Compose heading progress (degrees) without translating position."""
+        signed = max(0.0, progress_deg) * (1 if sign >= 0 else -1)
+        return {
+            'x': start_pose['x'],
+            'y': start_pose['y'],
+            'heading_deg': normalize_angle_deg(start_pose['heading_deg'] + signed),
+        }
+
     def _accumulate_active_motion_progress(self, current_odom):
         """Update active motion progress using odom delta magnitude; ignore sign/axis drift."""
         with self.active_motion_lock:
             if not self.active_motion:
                 return 0.0
             delta = self._odom_delta(self.active_motion['odom_start'], current_odom)
-            incr = abs(delta.get('x', 0.0)) + abs(delta.get('y', 0.0))
+            if self.active_motion.get('mode') == 'rotate':
+                incr = abs(delta.get('heading_deg', 0.0))
+            else:
+                incr = abs(delta.get('x', 0.0)) + abs(delta.get('y', 0.0))
             if incr > 0:
-                self.active_motion['progress'] += incr
+                target_cap = self.active_motion.get('target', float('inf'))
+                self.active_motion['progress'] = min(
+                    target_cap,
+                    self.active_motion.get('progress', 0.0) + incr
+                )
                 # Reset baseline so we only accumulate fresh delta next time
                 self.active_motion['odom_start'] = dict(current_odom)
-            return self.active_motion['progress']
+            return self.active_motion.get('progress', 0.0)
 
     def _get_pose(self):
         """Trả về pose tính từ lệnh đã gửi."""
@@ -633,6 +649,18 @@ class OdomOnlyNavigator:
         if not result:
             self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
             return False
+
+        # Track active rotation for live status fusion
+        world_delta = world_delta if world_delta is not None else -desired_angle_deg
+        with self.active_motion_lock:
+            self.active_motion = {
+                'mode': 'rotate',
+                'start_pose': self._get_pose(),
+                'odom_start': self._get_stm32_odom(),
+                'target': abs(world_delta),
+                'sign': 1.0 if world_delta >= 0 else -1.0,
+                'progress': 0.0,
+            }
         
         # Step 2: wait for TARGET_REACHED or TIMEOUT
         result, line = self._wait_for_response(
@@ -646,6 +674,8 @@ class OdomOnlyNavigator:
             # Reset STM32 odometry so the next MOVE starts from (0,0,0)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
+            with self.active_motion_lock:
+                self.active_motion = None
             return True
         
         # Rotation was interrupted/timed out: use STM32 odom to see how far it got
@@ -660,6 +690,8 @@ class OdomOnlyNavigator:
             )
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
+            with self.active_motion_lock:
+                self.active_motion = None
             return True
         
         if abs(actual_rotation) > 0.5:  # At least some rotation happened
@@ -668,6 +700,8 @@ class OdomOnlyNavigator:
         # Reset STM32 odometry for the next command
         self._send_raw_command("RESET_ODOM")
         time.sleep(0.1)
+        with self.active_motion_lock:
+            self.active_motion = None
         
         if result is False:
             self.logger.warning(f"Rotation failed ({line}).")
@@ -722,8 +756,10 @@ class OdomOnlyNavigator:
         # Track active motion for live status fusion
         with self.active_motion_lock:
             self.active_motion = {
+                'mode': 'move',
                 'start_pose': self._get_pose(),
                 'odom_start': self._get_stm32_odom(),
+                'target': target_distance,
                 'progress': 0.0,
                 'heading': self._get_pose()['heading_deg'],
             }
@@ -2018,11 +2054,22 @@ class OdomOnlyNavigator:
         with self.active_motion_lock:
             active = dict(self.active_motion) if self.active_motion else None
         if active:
-            fused_pose = self._compose_progress_pose(
-                active['start_pose'],
+            progress_capped = min(
                 active.get('progress', 0.0),
-                heading_deg=active.get('heading', active['start_pose']['heading_deg']),
+                active.get('target', float('inf'))
             )
+            if active.get('mode') == 'rotate':
+                fused_pose = self._compose_rotation_pose(
+                    active['start_pose'],
+                    progress_capped,
+                    sign=active.get('sign', 1.0),
+                )
+            else:
+                fused_pose = self._compose_progress_pose(
+                    active['start_pose'],
+                    progress_capped,
+                    heading_deg=active.get('heading', active['start_pose']['heading_deg']),
+                )
             pose_anchor = fused_pose
 
         pose_raw = self._pose_anchor_to_raw(pose_anchor)
