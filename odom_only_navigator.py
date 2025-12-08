@@ -819,6 +819,14 @@ class OdomOnlyNavigator:
         time.sleep(0.1)  # Cho STM32 cập nhật odom
         stm32_odom = self._get_stm32_odom()
         actual_distance = stm32_odom['x']  # Forward distance
+        # Prefer accumulated progress magnitude (capped) when available, so STOP retains mid-position
+        with self.active_motion_lock:
+            if self.active_motion:
+                progress_capped = min(
+                    self.active_motion.get('progress', 0.0),
+                    self.active_motion.get('target', float('inf'))
+                )
+                actual_distance = max(actual_distance, progress_capped)
         if actual_distance < 0:
             self.logger.warning(f"Negative odom.x ({actual_distance:.3f}m) - robot drifted backward?")
             actual_distance = 0.0  # Don't update pose if robot went backward
