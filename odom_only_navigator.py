@@ -231,6 +231,9 @@ class OdomOnlyNavigator:
             'y': 0.0,
             'heading_deg': 0.0,
         }
+        # Track active motion for live status fusion
+        self.active_motion_lock = threading.Lock()
+        self.active_motion = None  # {'start_pose':..., 'odom_start':...}
 
         # LIDAR state
         self.lidar = None
@@ -383,6 +386,41 @@ class OdomOnlyNavigator:
             self.stm32_odom['x'] = 0.0
             self.stm32_odom['y'] = 0.0
             self.stm32_odom['heading_deg'] = 0.0
+
+    def _odom_delta(self, odom_start, odom_end):
+        """Compute STM32 odom delta (MCU frame, clockwise-positive heading) between two snapshots."""
+        return {
+            'x': odom_end.get('x', 0.0) - odom_start.get('x', 0.0),
+            'y': odom_end.get('y', 0.0) - odom_start.get('y', 0.0),
+            'heading_deg': normalize_angle_deg(
+                odom_end.get('heading_deg', 0.0) - odom_start.get('heading_deg', 0.0)
+            ),
+        }
+
+    def _compose_pose_with_delta(self, start_pose, odom_delta):
+        """
+        Compose STM32 odom delta (MCU frame: x fwd, y left, heading clockwise-positive)
+        onto an absolute start_pose without mutating internal pose.
+        """
+        dx_r = odom_delta.get('x', 0.0)
+        dy_r = odom_delta.get('y', 0.0)
+        dtheta_mcu = odom_delta.get('heading_deg', 0.0)
+
+        heading_start = start_pose['heading_deg']
+        heading_start_rad = math.radians(heading_start)
+
+        dx_w = dx_r * math.cos(heading_start_rad) - dy_r * math.sin(heading_start_rad)
+        dy_w = dx_r * math.sin(heading_start_rad) + dy_r * math.cos(heading_start_rad)
+
+        dtheta_world = -dtheta_mcu  # MCU clockwise-positive -> world CCW-positive
+        new_heading = normalize_angle_deg(heading_start + dtheta_world)
+
+        fused = {
+            'x': start_pose['x'] + dx_w,
+            'y': start_pose['y'] + dy_w,
+            'heading_deg': new_heading,
+        }
+        return fused
 
     def _get_pose(self):
         """Trả về pose tính từ lệnh đã gửi."""
@@ -651,6 +689,13 @@ class OdomOnlyNavigator:
         self._clear_response_queue()
         self._send_raw_command(cmd)
         
+        # Track active motion for live status fusion
+        with self.active_motion_lock:
+            self.active_motion = {
+                'start_pose': self._get_pose(),
+                'odom_start': self._get_stm32_odom(),
+            }
+
         # Bước 1: Chờ OK MOVE (command acknowledged)
         result, line = self._wait_for_response(
             success_tokens=["OK MOVE"],
@@ -659,6 +704,8 @@ class OdomOnlyNavigator:
         )
         if not result:
             self.logger.warning(f"MOVE not acknowledged: {line}")
+            with self.active_motion_lock:
+                self.active_motion = None
             return False
         
         # Bước 2: Monitor LIDAR trong khi chờ MOVE TARGET_REACHED
@@ -692,6 +739,8 @@ class OdomOnlyNavigator:
             # Reset STM32 odometry cho lệnh tiếp theo
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
+            with self.active_motion_lock:
+                self.active_motion = None
             # Publish latest pose so UI sees translation promptly
             self._send_status()
             return True
@@ -711,11 +760,14 @@ class OdomOnlyNavigator:
             self._update_pose_after_move(actual_distance)
         else:
             self.logger.info(f"Movement barely started (odom x={stm32_odom['x']:.3f})")
-        
+
         # Reset STM32 odometry cho lệnh tiếp theo
         self._send_raw_command("RESET_ODOM")
         time.sleep(0.1)
-        
+
+        with self.active_motion_lock:
+            self.active_motion = None
+
         if self._move_stop_reason:
             self.logger.warning(f"Move stopped by LIDAR: {self._move_stop_reason}")
         elif result is False:
@@ -1457,7 +1509,7 @@ class OdomOnlyNavigator:
                 self._send_status()
             except Exception:
                 pass
-            time.sleep(5.0)
+            time.sleep(1.0)
 
     # --- Kafka command handlers ---
     def _handle_kafka_command(self, envelope):
@@ -1927,6 +1979,16 @@ class OdomOnlyNavigator:
         if not self.kafka_bridge:
             return
         pose_anchor = self._get_pose()
+
+        # If a MOVE is in-flight, fuse live odom delta for status only (do not mutate pose)
+        with self.active_motion_lock:
+            active = dict(self.active_motion) if self.active_motion else None
+        if active:
+            odom_now = self._get_stm32_odom()
+            delta_odom = self._odom_delta(active['odom_start'], odom_now)
+            fused_pose = self._compose_pose_with_delta(active['start_pose'], delta_odom)
+            pose_anchor = fused_pose
+
         pose_raw = self._pose_anchor_to_raw(pose_anchor)
         # Publish heading in raw map frame; do not add hardware offset here
         heading_deg = normalize_angle_deg(pose_raw['heading_deg'])
