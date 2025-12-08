@@ -231,6 +231,9 @@ class OdomOnlyNavigator:
             'y': 0.0,
             'heading_deg': 0.0,
         }
+        # Track active motion for live status fusion
+        self.active_motion_lock = threading.Lock()
+        self.active_motion = None  # {'start_pose':..., 'odom_start':..., 'axis':...}
 
         # LIDAR state
         self.lidar = None
@@ -430,14 +433,29 @@ class OdomOnlyNavigator:
             ),
         }
 
-    def _update_pose_with_odom_delta(self, start_pose, odom_delta):
+    def _dominant_axis_from_heading(self, heading_deg):
+        """Return 'X' if heading near 0/180, 'Y' if near 90/-90, else None."""
+        h = normalize_angle_deg(heading_deg)
+        if abs(normalize_angle_deg(h)) <= 45 or abs(normalize_angle_deg(abs(h) - 180)) <= 45:
+            return "X"
+        if abs(abs(h) - 90) <= 45:
+            return "Y"
+        return None
+
+    def _compose_pose_with_delta(self, start_pose, odom_delta, dominant_axis=None):
         """
-        Apply STM32 odom delta (relative to last RESET_ODOM) onto an absolute start_pose.
+        Compose STM32 odom delta (relative to last RESET_ODOM) onto an absolute start_pose
+        without mutating internal pose.
         STM32 odom frame: x = forward, y = left, heading_deg = clockwise-positive (MCU frame).
         """
         dx_r = odom_delta.get('x', 0.0)
         dy_r = odom_delta.get('y', 0.0)
         dtheta_mcu = odom_delta.get('heading_deg', 0.0)
+
+        if dominant_axis == "X":
+            dy_r = 0.0
+        elif dominant_axis == "Y":
+            dx_r = 0.0
 
         heading_start = start_pose['heading_deg']
         heading_start_rad = math.radians(heading_start)
@@ -450,16 +468,23 @@ class OdomOnlyNavigator:
         dtheta_world = -dtheta_mcu
         new_heading = normalize_angle_deg(heading_start + dtheta_world)
 
+        return {
+            'x': start_pose['x'] + dx_w,
+            'y': start_pose['y'] + dy_w,
+            'heading_deg': new_heading,
+        }
+
+    def _update_pose_with_odom_delta(self, start_pose, odom_delta, dominant_axis=None):
+        """Mutate cmd_pose using odom delta (wrapper around _compose_pose_with_delta)."""
+        fused = self._compose_pose_with_delta(start_pose, odom_delta, dominant_axis=dominant_axis)
         with self.pose_lock:
-            self.cmd_pose['x'] = start_pose['x'] + dx_w
-            self.cmd_pose['y'] = start_pose['y'] + dy_w
-            self.cmd_pose['heading_deg'] = new_heading
+            self.cmd_pose.update(fused)
 
         self.logger.info(
             "Pose updated from STM32 odom delta: (%.2f, %.2f, %.1f°) [odom dx=%.3f dy=%.3f dth=%.1f°]",
-            self.cmd_pose['x'],
-            self.cmd_pose['y'],
-            self.cmd_pose['heading_deg'],
+            fused['x'],
+            fused['y'],
+            fused['heading_deg'],
             dx_r,
             dy_r,
             dtheta_mcu,
@@ -710,7 +735,8 @@ class OdomOnlyNavigator:
         
         start_pose = self._get_pose()
         odom_start = self._get_stm32_odom()
-        
+        dominant_axis = self._dominant_axis_from_heading(start_pose['heading_deg'])
+
         # Flag để signal stop từ LIDAR monitor thread
         self._move_stop_flag = False
         self._move_stop_reason = None
@@ -719,6 +745,13 @@ class OdomOnlyNavigator:
         self.logger.info(f"MOVE: {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
+
+        with self.active_motion_lock:
+            self.active_motion = {
+                'start_pose': dict(start_pose),
+                'odom_start': dict(odom_start),
+                'axis': dominant_axis,
+            }
         
         # Bước 1: Chờ OK MOVE (command acknowledged)
         result, line = self._wait_for_response(
@@ -760,7 +793,9 @@ class OdomOnlyNavigator:
             time.sleep(0.05)
             odom_end = self._get_stm32_odom()
             delta_odom = self._odom_delta(odom_start, odom_end)
-            self._update_pose_with_odom_delta(start_pose, delta_odom)
+            self._update_pose_with_odom_delta(start_pose, delta_odom, dominant_axis=dominant_axis)
+            with self.active_motion_lock:
+                self.active_motion = None
             # Publish latest pose so UI sees translation promptly
             self._send_status()
             return True
@@ -783,9 +818,12 @@ class OdomOnlyNavigator:
                 delta_odom['y'],
                 delta_odom['heading_deg'],
             )
-            self._update_pose_with_odom_delta(start_pose, delta_odom)
+            self._update_pose_with_odom_delta(start_pose, delta_odom, dominant_axis=dominant_axis)
         else:
             self.logger.info(f"Movement barely started (odom x={delta_odom['x']:.3f})")
+
+        with self.active_motion_lock:
+            self.active_motion = None
         
         if self._move_stop_reason:
             self.logger.warning(f"Move stopped by LIDAR: {self._move_stop_reason}")
@@ -1546,7 +1584,7 @@ class OdomOnlyNavigator:
                 self._send_status()
             except Exception:
                 pass
-            time.sleep(5.0)
+            time.sleep(1.0)
 
     # --- Kafka command handlers ---
     def _handle_kafka_command(self, envelope):
@@ -2019,6 +2057,20 @@ class OdomOnlyNavigator:
         pose_raw = self._pose_anchor_to_raw(pose_anchor)
         # Publish heading in raw map frame; do not add hardware offset here
         heading_deg = normalize_angle_deg(pose_raw['heading_deg'])
+        with self.active_motion_lock:
+            active_motion = dict(self.active_motion) if self.active_motion else None
+        if active_motion:
+            # Fuse live odom delta for in-flight status without mutating pose
+            odom_live = self._get_stm32_odom()
+            delta_live = self._odom_delta(active_motion['odom_start'], odom_live)
+            fused = self._compose_pose_with_delta(
+                active_motion['start_pose'],
+                delta_live,
+                dominant_axis=active_motion.get('axis'),
+            )
+            pose_anchor = fused
+            pose_raw = self._pose_anchor_to_raw(fused)
+            heading_deg = normalize_angle_deg(pose_raw['heading_deg'])
         payload = {
             "pose": {
                 "x": pose_raw['x'],

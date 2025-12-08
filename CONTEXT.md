@@ -124,6 +124,7 @@ Config file is **required** - scripts throw error if missing.
 - [TODO] Pose tracking / odometry sync with STM32 deferred (issue #2 to be fixed later)
 
 # Historical Notes / Archived
+- [2025-12-08] Kafka status loop tightened to ~1s and publishes in-flight pose by fusing live STM32 odom; lateral odom ignored on axis-aligned moves (X move ignores Y drift and vice versa)
 - [2025-12-08] Navigator now consumes STM32 odometry deltas directly (no RESET_ODOM between commands) for MOVE/ROTATE pose updates
 - [2025-12-08] Rotation handling now applies STM32 odom delta (and retries residual error once) to keep heading in sync; detects sign mismatch and stops instead of drifting
 - [2025-12-08] Added static boundary enforcement to forward-clear checks to prevent driving outside map; added axis correction during L-shape navigation to pull robot back to target axis after detours
