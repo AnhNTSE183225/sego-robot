@@ -436,9 +436,9 @@ class OdomOnlyNavigator:
     def _dominant_axis_from_heading(self, heading_deg):
         """Return 'X' if heading near 0/180, 'Y' if near 90/-90, else None."""
         h = normalize_angle_deg(heading_deg)
-        if abs(normalize_angle_deg(h)) <= 45 or abs(normalize_angle_deg(abs(h) - 180)) <= 45:
+        if -45.0 <= h <= 45.0 or h >= 135.0 or h <= -135.0:
             return "X"
-        if abs(abs(h) - 90) <= 45:
+        if 45.0 <= h <= 135.0 or -135.0 <= h <= -45.0:
             return "Y"
         return None
 
@@ -468,15 +468,16 @@ class OdomOnlyNavigator:
         dtheta_world = -dtheta_mcu
         new_heading = normalize_angle_deg(heading_start + dtheta_world)
 
-        return {
+        fused = {
             'x': start_pose['x'] + dx_w,
             'y': start_pose['y'] + dy_w,
             'heading_deg': new_heading,
         }
+        return fused, dx_r, dy_r, dtheta_mcu
 
     def _update_pose_with_odom_delta(self, start_pose, odom_delta, dominant_axis=None):
         """Mutate cmd_pose using odom delta (wrapper around _compose_pose_with_delta)."""
-        fused = self._compose_pose_with_delta(start_pose, odom_delta, dominant_axis=dominant_axis)
+        fused, dx_r, dy_r, dtheta_mcu = self._compose_pose_with_delta(start_pose, odom_delta, dominant_axis=dominant_axis)
         with self.pose_lock:
             self.cmd_pose.update(fused)
 
