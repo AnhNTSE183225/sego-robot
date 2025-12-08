@@ -929,11 +929,15 @@ class OdomOnlyNavigator:
         if not allow_detour:
             return None
 
-        offsets = [0.0]
-        angle = DETOUR_ANGLE_STEP_DEG
-        while angle <= DETOUR_MAX_ANGLE_DEG:
-            offsets.extend([angle, -angle])
-            angle += DETOUR_ANGLE_STEP_DEG
+        # When axis-aligned mode is enabled, only try 90° offsets to minimize cumulative heading errors
+        if AXIS_ALIGNED_MOVES:
+            offsets = [0.0, 90.0, -90.0]
+        else:
+            offsets = [0.0]
+            angle = DETOUR_ANGLE_STEP_DEG
+            while angle <= DETOUR_MAX_ANGLE_DEG:
+                offsets.extend([angle, -angle])
+                angle += DETOUR_ANGLE_STEP_DEG
 
         best_heading = None
         best_score = -math.inf
@@ -953,9 +957,20 @@ class OdomOnlyNavigator:
             if clearance < required_clearance:
                 continue
 
-            progress = max(0.0, math.cos(math.radians(offset)))  # Penalize turns that face away from goal
-            if progress <= 0.0:
-                continue
+            # In axis-aligned mode, allow perpendicular movement (±90°) for obstacle avoidance
+            # even though it doesn't make "progress" toward the goal
+            if AXIS_ALIGNED_MOVES:
+                # For axis-aligned: forward=1.0, perpendicular=0.5, backward=0.1
+                if abs(offset) < 1.0:
+                    progress = 1.0
+                elif abs(offset) <= 90.0:
+                    progress = 0.5
+                else:
+                    progress = 0.1
+            else:
+                progress = max(0.0, math.cos(math.radians(offset)))
+                if progress <= 0.0:
+                    continue
 
             score = clearance * progress
             if score > best_score:

@@ -33,7 +33,7 @@
         "angle_tolerance_deg": 2.0,
         "move_timeout_sec": 25.0,
         "rotate_timeout_sec": 15.0,
-        "axis_aligned_moves": false,
+        "axis_aligned_moves": true,
         "heading_offset_deg": 0.0
     },
     
@@ -53,7 +53,7 @@
         "detour_max_angle_deg": 90.0,
         "blocked_retry_wait_sec": 0.4,
         "max_blocked_retries": 25,
-        "max_side_switches": 5,
+        "max_side_switches": 10,
         "start_min_clearance_m": 0.25,
         "rotate_timeout_tolerance_deg": 15.0,
         "min_valid_lidar_dist_m": 0.20

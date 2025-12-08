@@ -72,7 +72,7 @@ Configurable at runtime from Python without reflashing STM32:
 | `move_min_pwm` | 0.46 | MOVE min correction PWM |
 | `move_max_pwm` | 0.70 | MOVE max correction PWM |
 | `move_smoothing` | 0.25 | MOVE output low-pass filter |
-| `move_skew` | 0.015 | MOVE lateral drift bias |
+| `move_skew` | 0.017 | MOVE lateral drift bias (calibrated) |
 | `move_base_pwm` | 0.58 | MOVE base PWM |
 | `move_timeout` | 20000 | MOVE timeout (ms) |
 | `rotate_tol_dist` | 0.02 | ROTATE position tolerance (m) |
@@ -124,6 +124,11 @@ Config file is **required** - scripts throw error if missing.
 - (none yet)
 
 # Historical Notes / Archived
+- [2025-12-07] **CRITICAL BUG FIX**: Robot couldn't move perpendicular during obstacle avoidance - `cos(90°)=0` was causing ±90° offsets to be skipped. Now allows perpendicular movement in axis-aligned mode.
+- [2025-12-07] Increased `max_side_switches` from 5 → 10 for more persistent obstacle avoidance
+- [2025-12-07] Fixed obstacle avoidance to use only ±90° offsets when axis-aligned mode enabled (was trying 15°, 30°, 45°... causing cumulative drift)
+- [2025-12-07] Enabled `axis_aligned_moves` mode to reduce cumulative heading errors from arbitrary rotations (A* pathfinding was causing 18-30° drift over multiple rotations)
+- [2025-12-07] Calibrated `move_skew` from 0.015 → 0.017 to eliminate ~4.5cm/90cm lateral drift
 - [2025-12-07] Increased `rotate_tol_angle` to 0.087 rad (~5°) to match odom under-reporting
 - [2025-12-07] Added `odom_angular_scale` parameter for independent rotation calibration (calibrated to 0.95 for accurate 90° rotation)
 - [2025-12-06] Added SET_PARAM command for runtime STM32 configuration without reflashing
