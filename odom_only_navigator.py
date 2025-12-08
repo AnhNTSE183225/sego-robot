@@ -719,7 +719,7 @@ class OdomOnlyNavigator:
         self.logger.info(f"Stopped at STM32 odom: x={stm32_odom['x']:.3f}, y={stm32_odom['y']:.3f}, heading={stm32_odom['heading_deg']:.1f}°")
         return stm32_odom
 
-    def _send_move(self, target_distance, monitor_lidar=True):
+    def _send_move(self, target_distance, monitor_lidar=True, dominant_axis=None):
         """Move forward by target_distance meters.
         
         Args:
@@ -735,7 +735,8 @@ class OdomOnlyNavigator:
         
         start_pose = self._get_pose()
         odom_start = self._get_stm32_odom()
-        dominant_axis = self._dominant_axis_from_heading(start_pose['heading_deg'])
+        if dominant_axis is None:
+            dominant_axis = self._dominant_axis_from_heading(start_pose['heading_deg'])
 
         # Flag để signal stop từ LIDAR monitor thread
         self._move_stop_flag = False
@@ -1261,7 +1262,7 @@ class OdomOnlyNavigator:
                 if heading_clear < OBSTACLE_STOP_DISTANCE_M:
                     self.logger.warning("Obstacle detected ahead; stopping move step.")
                     return False
-            return self._send_move(step_distance)
+            return self._send_move(step_distance, dominant_axis=self._dominant_axis_from_heading(desired_heading_world))
 
         attempts = 0
         while attempts <= MAX_BLOCKED_RETRIES:
@@ -1286,7 +1287,7 @@ class OdomOnlyNavigator:
 
             if not self._rotate_to_heading(chosen_heading):
                 return False
-            if not self._send_move(step_distance):
+            if not self._send_move(step_distance, dominant_axis=self._dominant_axis_from_heading(chosen_heading)):
                 return False
             return True
 
