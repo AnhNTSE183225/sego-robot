@@ -371,6 +371,17 @@ class OdomOnlyNavigator:
                     except ValueError:
                         pass
                     continue  # Don't put odom lines in response queue
+            # Track closed-loop MOVE progress from CL CMD lines if present
+            if "CL CMD" in line and "dist=" in line:
+                try:
+                    dist_str = line.split("dist=")[1].split()[0]
+                    dist_val = float(dist_str)
+                    if dist_val > 0:
+                        with self.active_motion_lock:
+                            if self.active_motion:
+                                self.active_motion['progress'] += dist_val
+                except Exception:
+                    pass
             self.logger.info(f"[STM32] {line}")
             self.response_queue.put(line.strip())
         self._serial_running = False
@@ -422,12 +433,12 @@ class OdomOnlyNavigator:
         }
         return fused
 
-    def _compose_progress_pose(self, start_pose, odom_delta, heading_deg):
+    def _compose_progress_pose(self, start_pose, progress_m, heading_deg):
         """
-        Compose forward odom progress along a fixed heading (ignore lateral odom/yaw drift).
+        Compose forward progress along a fixed heading (ignore lateral odom/yaw drift).
         Use when we assume perfect path but want live progress between start->goal.
         """
-        dx = max(0.0, odom_delta.get('x', 0.0))  # only forward progress
+        dx = max(0.0, progress_m)  # only forward progress
         rad = math.radians(heading_deg)
         return {
             'x': start_pose['x'] + dx * math.cos(rad),
@@ -706,7 +717,7 @@ class OdomOnlyNavigator:
         with self.active_motion_lock:
             self.active_motion = {
                 'start_pose': self._get_pose(),
-                'odom_start': self._get_stm32_odom(),
+                'progress': 0.0,
                 'heading': self._get_pose()['heading_deg'],
             }
 
@@ -1994,15 +2005,13 @@ class OdomOnlyNavigator:
             return
         pose_anchor = self._get_pose()
 
-        # If a MOVE is in-flight, fuse live odom delta for status only (do not mutate pose)
+        # If a MOVE is in-flight, fuse live progress for status only (do not mutate pose)
         with self.active_motion_lock:
             active = dict(self.active_motion) if self.active_motion else None
         if active:
-            odom_now = self._get_stm32_odom()
-            delta_odom = self._odom_delta(active['odom_start'], odom_now)
             fused_pose = self._compose_progress_pose(
                 active['start_pose'],
-                delta_odom,
+                active.get('progress', 0.0),
                 heading_deg=active.get('heading', active['start_pose']['heading_deg']),
             )
             pose_anchor = fused_pose
