@@ -709,6 +709,19 @@ class OdomOnlyNavigator:
         
         if result:
             self.logger.info(f"Rotation completed: {line}")
+            # Use actual odom rotation; if not available immediately, wait briefly.
+            applied_world = None
+            for _ in range(3):
+                stm32_odom = self._get_stm32_odom()
+                actual_rotation = stm32_odom.get('heading_deg', 0.0)
+                if abs(actual_rotation) > 0.1:
+                    applied_world = -actual_rotation  # MCU cw+ -> world ccw+
+                    break
+                time.sleep(0.05)
+            if applied_world is not None:
+                self._update_pose_after_rotate(applied_world)
+            else:
+                self.logger.warning("Rotation completed but odom heading ~0; pose not updated.")
             # Reset STM32 odometry so the next MOVE starts from (0,0,0)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
@@ -726,6 +739,8 @@ class OdomOnlyNavigator:
                 "Rotation TIMEOUT but odom within tolerance in MCU frame (actual=%.1f°, target=%.1f°, err=%.1f° <= %.1f°); accepting.",
                 actual_rotation, target_delta_mcu, rotation_err_mcu, ROTATE_TIMEOUT_TOLERANCE_DEG
             )
+            applied_world = -actual_rotation
+            self._update_pose_after_rotate(applied_world)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
             with self.active_motion_lock:
