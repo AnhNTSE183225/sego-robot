@@ -1362,8 +1362,13 @@ class OdomOnlyNavigator:
             if path is None:
                 path = self._plan_path_astar((pose['x'], pose['y']), goal)
             if not path:
-                self.logger.warning("Planner failed to find path to %s", goal)
-                return False
+                self.logger.warning("Planner failed to find path to %s; falling back to reactive LIDAR detours.", goal)
+                # Reactive fallback: local navigation using LIDAR avoidance (no static checks)
+                return self._navigate_direct(
+                    goal,
+                    allow_detour=True,
+                    check_static=False,
+                )
             self.logger.info("Planner produced %d waypoint(s). Executing...", len(path))
 
             if self._follow_path(path):
@@ -2017,6 +2022,27 @@ class OdomOnlyNavigator:
             prev = wp
         return segments
 
+    def _segment_blocked_by_lidar(self, heading_world, distance):
+        """
+        Quick live check: does the corridor for this segment already look blocked by LIDAR?
+        If yes, we bail early to allow a replan that incorporates the current scan.
+        """
+        if not self.first_scan_event.is_set():
+            return False
+        pose = self._get_pose()
+        end = (
+            pose['x'] + distance * math.cos(math.radians(heading_world)),
+            pose['y'] + distance * math.sin(math.radians(heading_world)),
+        )
+        clear = self._path_clear_with_lidar((pose['x'], pose['y']), end)
+        if not clear:
+            self.logger.info(
+                "Live LIDAR blocks segment: start=(%.2f, %.2f) heading=%.1f° dist=%.2f -> replan",
+                pose['x'], pose['y'], heading_world, distance,
+            )
+            return True
+        return False
+
     def _execute_segment_move(self, heading_world, distance):
         """Rotate to heading_world then move distance, chunked by min/max move command."""
         remaining = distance
@@ -2026,6 +2052,8 @@ class OdomOnlyNavigator:
                     return False
             step = min(remaining, MAX_MOVE_COMMAND_M)
             step = self._clamp_move_command(step)
+            if self._segment_blocked_by_lidar(heading_world, step):
+                return False
             if not self._send_move(step):
                 return False
             remaining = max(0.0, remaining - step)
