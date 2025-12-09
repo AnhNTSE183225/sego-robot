@@ -130,6 +130,7 @@ Config file is **required** - scripts throw error if missing.
 - [2025-12-10] Increased rotate drive authority for small turns (`stm32_params.min_duty_rotate` 0.52, `stm32_params.move_base_pwm` 0.62) to help complete 20° rotations without hitting timeout
 - [2025-12-10] Further raised rotate drive floor (`stm32_params.min_duty_rotate` 0.60) to push through stiction on small-angle rotations
 - [2025-12-10] Raised rotate drive floor (`stm32_params.min_duty_rotate` 0.63) to balance 20° completion with reduced 90° overshoot; `motion.max_rotate_deg` capped at 150° to avoid single large spins; later user set `motion.min_rotate_deg` to 26 and `stm32_params.min_duty_rotate` to 0.55 for further tuning
+- [2025-12-10] A* planner now treats boundary/edge points as inside with a looser epsilon (1e-3) to keep boundary goals in free space
 - [2025-12-08] Kafka status loop tightened to ~1s and publishes in-flight pose by fusing live STM32 odom; lateral odom ignored on axis-aligned moves (X move ignores Y drift and vice versa)
 - [2025-12-08] Navigator now consumes STM32 odometry deltas directly (no RESET_ODOM between commands) for MOVE/ROTATE pose updates
 - [2025-12-08] Rotation handling now applies STM32 odom delta (and retries residual error once) to keep heading in sync; detects sign mismatch and stops instead of drifting

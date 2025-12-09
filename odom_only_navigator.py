@@ -1651,7 +1651,7 @@ class OdomOnlyNavigator:
 
         return {'x': x_raw, 'y': y_raw, 'heading_deg': heading_raw}
 
-    def _point_in_polygon(self, point, polygon, epsilon=1e-6):
+    def _point_in_polygon(self, point, polygon, epsilon=1e-3):
         x, y = point
         inside = False
         n = len(polygon)
