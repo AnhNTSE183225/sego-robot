@@ -571,13 +571,13 @@ class OdomOnlyNavigator:
         return sign * clamped
 
     def _clamp_rotate_command(self, angle_deg):
-        """Clamp ROTATE_DEG to configured min/max magnitude to avoid timeouts on tiny turns."""
+        """Clamp ROTATE_DEG to configured min/max magnitude so MCU never gets too small/too large turns."""
         sign = 1.0 if angle_deg >= 0 else -1.0
         abs_val = abs(angle_deg)
-        # For small corrections, let the MCU try the exact angle to avoid oscillation.
-        if abs_val < MIN_ROTATE_COMMAND_DEG:
-            return angle_deg
+
+        # Luôn ép về [MIN_ROTATE_COMMAND_DEG, MAX_ROTATE_COMMAND_DEG]
         clamped = min(max(abs_val, MIN_ROTATE_COMMAND_DEG), MAX_ROTATE_COMMAND_DEG)
+
         if clamped != abs_val:
             self.logger.info(
                 "ROTATE_DEG command clamped from %.1f° to %.1f° (min=%.1f°, max=%.1f°)",
@@ -586,6 +586,7 @@ class OdomOnlyNavigator:
                 MIN_ROTATE_COMMAND_DEG,
                 MAX_ROTATE_COMMAND_DEG,
             )
+
         return sign * clamped
 
     # --- Command helpers ---
