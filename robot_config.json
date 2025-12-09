@@ -79,7 +79,7 @@
         "angular_k": 0.55,
         "max_speed": 0.8,
         "min_duty_linear": 0.45,
-        "min_duty_rotate": 0.48,
+        "min_duty_rotate": 0.52,
         "min_duty_brake": 0.18,
         
         "move_kp": -0.0040,
@@ -89,7 +89,7 @@
         "move_max_pwm": 0.70,
         "move_smoothing": 0.25,
         "move_skew": 0.017,
-        "move_base_pwm": 0.58,
+        "move_base_pwm": 0.62,
         "move_timeout": 20000,
         
         "rotate_tol_dist": 0.02,
