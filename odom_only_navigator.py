@@ -154,6 +154,8 @@ ROTATE_TIMEOUT_SEC = _motion_cfg.get('rotate_timeout_sec', 15.0)
 AXIS_ALIGNED_MOVES = _motion_cfg.get('axis_aligned_moves', False)
 HEADING_OFFSET_DEG = _motion_cfg.get('heading_offset_deg', 0.0)
 AXIS_DRIFT_TOLERANCE_M = max(DISTANCE_TOLERANCE_M * 1.5, 0.03)  # How far we allow drift off-axis before correcting
+DETOUR_AXIS_ALIGNED = _motion_cfg.get('detour_axis_aligned', True)  # Detours snap to axis
+PREFER_CW_FOR_180 = _motion_cfg.get('prefer_cw_for_180', True)  # Prefer clockwise when delta ~180°
 
 # Obstacle avoidance parameters (from config file)
 _obstacle_cfg = ROBOT_CONFIG.get('obstacle_avoidance', {})
@@ -1058,22 +1060,23 @@ class OdomOnlyNavigator:
         if not allow_detour:
             return None
 
-        # When axis-aligned mode is enabled, only try 90° offsets to minimize cumulative heading errors
-        if AXIS_ALIGNED_MOVES:
-            offsets = [0.0, 90.0, -90.0]
+        candidates = []
+        if AXIS_ALIGNED_MOVES or DETOUR_AXIS_ALIGNED:
+            # Include desired heading first, then absolute axis headings to "reset" during detours
+            candidates.append(desired_heading_world)
+            candidates.extend([0.0, 90.0, -90.0, 180.0])
         else:
             offsets = [0.0]
             angle = DETOUR_ANGLE_STEP_DEG
             while angle <= DETOUR_MAX_ANGLE_DEG:
                 offsets.extend([angle, -angle])
                 angle += DETOUR_ANGLE_STEP_DEG
+            candidates = [normalize_angle_deg(desired_heading_world + off) for off in offsets]
 
         best_heading = None
         best_score = -math.inf
 
-        for offset in offsets:
-            candidate_world = normalize_angle_deg(desired_heading_world + offset)
-
+        for candidate_world in candidates:
             if not self._step_static_clear(pose, candidate_world, step_distance):
                 continue
 
@@ -1086,18 +1089,16 @@ class OdomOnlyNavigator:
             if clearance < required_clearance:
                 continue
 
-            # In axis-aligned mode, allow perpendicular movement (±90°) for obstacle avoidance
-            # even though it doesn't make "progress" toward the goal
-            if AXIS_ALIGNED_MOVES:
-                # For axis-aligned: forward=1.0, perpendicular=0.5, backward=0.1
-                if abs(offset) < 1.0:
+            if AXIS_ALIGNED_MOVES or DETOUR_AXIS_ALIGNED:
+                delta = abs(normalize_angle_deg(candidate_world - desired_heading_world))
+                if delta < 1.0:
                     progress = 1.0
-                elif abs(offset) <= 90.0:
-                    progress = 0.5
+                elif delta <= 90.0:
+                    progress = 0.5  # perpendicular detour is acceptable
                 else:
                     progress = 0.1
             else:
-                progress = max(0.0, math.cos(math.radians(offset)))
+                progress = max(0.0, math.cos(math.radians(normalize_angle_deg(candidate_world - desired_heading_world))))
                 if progress <= 0.0:
                     continue
 
@@ -1208,6 +1209,9 @@ class OdomOnlyNavigator:
         current_heading = pose['heading_deg']
         # World delta (CCW positive)
         world_delta = normalize_angle_deg(target_heading_world - current_heading)
+        # Prefer a deterministic direction for ~180° turns to avoid oscillation
+        if abs(world_delta) >= 179.0:
+            world_delta = -180.0 if PREFER_CW_FOR_180 else 180.0
         # MCU expects clockwise positive, so invert sign
         command_delta = -world_delta
 
@@ -1223,10 +1227,11 @@ class OdomOnlyNavigator:
         # If rotation reported failure, check if we're already close enough
         pose_after = self._get_pose()
         err = abs(normalize_angle_deg(target_heading_world - pose_after['heading_deg']))
-        if err <= ANGLE_TOLERANCE_DEG:
+        tol = ANGLE_TOLERANCE_DEG if abs(world_delta) < 150.0 else max(ANGLE_TOLERANCE_DEG, 5.0)
+        if err <= tol:
             self.logger.info(
                 "Rotation reported failure but heading within tolerance (err=%.1f° <= %.1f°); accepting.",
-                err, ANGLE_TOLERANCE_DEG
+                err, tol
             )
             return True
         return False
@@ -1306,27 +1311,13 @@ class OdomOnlyNavigator:
 
         # Non-axis-aligned fallback: preserve previous behavior
         if not AXIS_ALIGNED_MOVES:
-            # Simple A* path plan using static obstacles if detour is allowed
-            waypoints = None
-            if allow_detour:
-                pose = self._get_pose()
-                start = (pose['x'], pose['y'])
-                waypoints = self._plan_path_astar(start, goal)
-                if waypoints:
-                    self.logger.info("Planner produced %d waypoint(s).", len(waypoints))
-                else:
-                    self.logger.info("Planner failed; falling back to direct navigation with LIDAR-only avoidance.")
-                    waypoints = [goal]
-            else:
-                waypoints = [goal]
-
-            for wp in waypoints:
-                if not self._navigate_direct(
-                    wp,
-                    allow_detour=allow_detour,
-                    check_static=True,
-                ):
-                    return
+            # Drive directly toward goal; obstacle detours remain axis-snapped if DETOUR_AXIS_ALIGNED is true
+            if not self._navigate_direct(
+                goal,
+                allow_detour=allow_detour,
+                check_static=True,
+            ):
+                return
             self.logger.info("Goal reached.")
             return
 
@@ -2008,9 +1999,13 @@ class OdomOnlyNavigator:
         elif cmd == "navigate_to_poi":
             args = payload.get("args") or {}
             poi_id = args.get("poiId")
+            # Ensure map is loaded before resolving POI (first command can race map definition)
+            if not self.map_loaded_event.is_set():
+                self.logger.info("Waiting for map definition before executing navigate_to_poi...")
+                self.map_loaded_event.wait(timeout=3.0)
             goal = self._find_poi(poi_id)
             if goal is None:
-                self._send_ack(correlation_id, cmd, False, f"POI {poi_id} not found")
+                self._send_ack(correlation_id, cmd, False, f"POI {poi_id} not found or map not loaded")
                 return
             try:
                 self.navigate_to(goal)
