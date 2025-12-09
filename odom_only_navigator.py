@@ -2095,6 +2095,56 @@ class OdomOnlyNavigator:
         required = min(forward_step, OBSTACLE_STOP_DISTANCE_M)
         return forward_clear >= required
 
+    def _escape_clockwise_loop(self, forward_heading, forward_step):
+        """
+        Stronger escape: try up to 4 clockwise headings (90° increments), moving a short
+        distance if clear, then returning to the original forward heading.
+        """
+        base_heading = self._get_pose()['heading_deg']
+        step = max(MIN_MOVE_COMMAND_M, min(0.25, MAX_MOVE_COMMAND_M))
+        for i in range(4):
+            side_heading = normalize_angle_deg(base_heading - 90.0 * (i + 1))
+            pose = self._get_pose()
+            if not self._step_static_clear(pose, side_heading, step):
+                continue
+            side_clear = self._heading_clearance(
+                side_heading,
+                pose['heading_deg'],
+                FORWARD_SCAN_ANGLE_DEG,
+                step + CLEARANCE_MARGIN_M,
+            )
+            if side_clear < min(step, OBSTACLE_STOP_DISTANCE_M * 0.8):
+                continue
+
+            self.logger.info(
+                "Escape clockwise attempt %d: heading=%.1f°, step=%.2fm (clear=%.2f)",
+                i + 1, side_heading, step, side_clear
+            )
+
+            if not self._rotate_to_heading(side_heading):
+                continue
+            if not self._send_move(step):
+                continue
+            if not self._rotate_to_heading(base_heading):
+                continue
+            time.sleep(0.2)
+
+            pose = self._get_pose()
+            forward_clear = self._heading_clearance(
+                forward_heading,
+                pose['heading_deg'],
+                FORWARD_SCAN_ANGLE_DEG,
+                forward_step + CLEARANCE_MARGIN_M,
+            )
+            required = min(forward_step, OBSTACLE_STOP_DISTANCE_M)
+            self.logger.info(
+                "Post-escape forward check: heading=%.1f°, clear=%.2f required=%.2f",
+                forward_heading, forward_clear, required
+            )
+            if forward_clear >= required:
+                return True
+        return False
+
     def _execute_segment_move(self, heading_world, distance):
         """Rotate to heading_world then move distance, chunked by min/max move command."""
         remaining = distance
@@ -2107,7 +2157,8 @@ class OdomOnlyNavigator:
             if self._segment_blocked_by_lidar(heading_world, step):
                 # Try a quick right-hand sidestep to clear the blockage
                 if self._escape_right_detour(heading_world, step):
-                    # After detour, re-evaluate the same segment from new pose
+                    continue  # After detour, re-evaluate the same segment from new pose
+                if self._escape_clockwise_loop(heading_world, step):
                     continue
                 return False
             if not self._send_move(step):
