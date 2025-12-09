@@ -574,6 +574,9 @@ class OdomOnlyNavigator:
         """Clamp ROTATE_DEG to configured min/max magnitude to avoid timeouts on tiny turns."""
         sign = 1.0 if angle_deg >= 0 else -1.0
         abs_val = abs(angle_deg)
+        # For small corrections, let the MCU try the exact angle to avoid oscillation.
+        if abs_val < MIN_ROTATE_COMMAND_DEG:
+            return angle_deg
         clamped = min(max(abs_val, MIN_ROTATE_COMMAND_DEG), MAX_ROTATE_COMMAND_DEG)
         if clamped != abs_val:
             self.logger.info(
