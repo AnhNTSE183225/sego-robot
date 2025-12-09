@@ -1851,6 +1851,12 @@ class OdomOnlyNavigator:
                 break
             x += ASTAR_GRID_STEP_M
 
+        # Ensure start/goal are considered free if they lie on boundary edges but not sampled
+        if start_g not in free and self._point_free(start):
+            free.add(start_g)
+        if goal_g not in free and self._point_free(goal):
+            free.add(goal_g)
+
         if start_g not in free or goal_g not in free:
             self.logger.info(
                 "Planner abort: start/goal not in free space (start_free=%s, goal_free=%s)",
