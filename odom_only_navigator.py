@@ -2034,11 +2034,18 @@ class OdomOnlyNavigator:
             pose['x'] + distance * math.cos(math.radians(heading_world)),
             pose['y'] + distance * math.sin(math.radians(heading_world)),
         )
-        clear = self._path_clear_with_lidar((pose['x'], pose['y']), end)
-        if not clear:
+        # Use a slightly looser requirement than move-stop threshold so we can creep away from walls.
+        clear = self._heading_clearance(
+            heading_world,
+            pose['heading_deg'],
+            FORWARD_SCAN_ANGLE_DEG,
+            distance + CLEARANCE_MARGIN_M,
+        )
+        required = min(distance, OBSTACLE_STOP_DISTANCE_M)
+        if clear < required:
             self.logger.info(
-                "Live LIDAR blocks segment: start=(%.2f, %.2f) heading=%.1f° dist=%.2f -> replan",
-                pose['x'], pose['y'], heading_world, distance,
+                "Live LIDAR blocks segment: start=(%.2f, %.2f) heading=%.1f° dist=%.2f (clear=%.2f<%.2f) -> replan",
+                pose['x'], pose['y'], heading_world, distance, clear, required
             )
             return True
         return False
