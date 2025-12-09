@@ -1858,13 +1858,31 @@ class OdomOnlyNavigator:
         if goal_g not in free and self._point_free(goal):
             free.add(goal_g)
 
-        if start_g not in free or goal_g not in free:
+        # If start/goal still not free, snap to nearest free cell (within sampled space)
+        def nearest_free(cell):
+            if cell in free:
+                return cell
+            if not free:
+                return None
+            cx, cy = cell
+            best = min(free, key=lambda f: abs(f[0] - cx) + abs(f[1] - cy))
+            return best
+
+        start_snap = nearest_free(start_g)
+        goal_snap = nearest_free(goal_g)
+        if start_snap is None or goal_snap is None:
             self.logger.info(
-                "Planner abort: start/goal not in free space (start_free=%s, goal_free=%s)",
+                "Planner abort: no free cells after sampling (start_free=%s, goal_free=%s)",
                 start_g in free,
                 goal_g in free,
             )
             return None
+        if start_snap != start_g:
+            self.logger.info("Planner snapped start cell %s -> %s", start_g, start_snap)
+            start_g = start_snap
+        if goal_snap != goal_g:
+            self.logger.info("Planner snapped goal cell %s -> %s", goal_g, goal_snap)
+            goal_g = goal_snap
 
         import heapq
         open_set = []
