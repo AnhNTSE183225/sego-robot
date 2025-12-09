@@ -1282,22 +1282,22 @@ class OdomOnlyNavigator:
             )
             ok = self._send_rotate(command_delta, target_heading_world, world_delta=world_delta)
             if ok:
-                # On success, apply world delta
-                self._update_pose_after_rotate(world_delta)
-            else:
-                attempts += 1
-                pose_after = self._get_pose()
-                err_after = abs(normalize_angle_deg(target_heading_world - pose_after['heading_deg']))
-                tol = ANGLE_TOLERANCE_DEG if abs(world_delta) < 150.0 else max(ANGLE_TOLERANCE_DEG, 5.0)
-                if err_after <= tol:
-                    self.logger.info(
-                        "Rotation attempt failed but heading within tolerance (err=%.1f° <= %.1f°); accepting.",
-                        err_after, tol
-                    )
-                    return True
-                if attempts >= 3:
-                    self.logger.warning("Rotation failed after multiple attempts.")
-                    return False
+                # Pose already updated inside _send_rotate using actual odom; do not add again.
+                continue
+
+            attempts += 1
+            pose_after = self._get_pose()
+            err_after = abs(normalize_angle_deg(target_heading_world - pose_after['heading_deg']))
+            tol = ANGLE_TOLERANCE_DEG if abs(world_delta) < 150.0 else max(ANGLE_TOLERANCE_DEG, 5.0)
+            if err_after <= tol:
+                self.logger.info(
+                    "Rotation attempt failed but heading within tolerance (err=%.1f° <= %.1f°); accepting.",
+                    err_after, tol
+                )
+                return True
+            if attempts >= 3:
+                self.logger.warning("Rotation failed after multiple attempts.")
+                return False
             # Loop until heading error is within tolerance
 
     def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None, check_static=True):
