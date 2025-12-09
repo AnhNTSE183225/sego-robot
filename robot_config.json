@@ -38,7 +38,7 @@
         "min_move_command_m": 0.05,
         "max_move_command_m": 1.0,
         "min_rotate_deg": 20.0,
-        "max_rotate_deg": 180.0
+        "max_rotate_deg": 150.0
     },
     
     "obstacle_avoidance": {
