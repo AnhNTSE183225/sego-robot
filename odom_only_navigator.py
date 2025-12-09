@@ -2050,6 +2050,51 @@ class OdomOnlyNavigator:
             return True
         return False
 
+    def _escape_right_detour(self, forward_heading, forward_step):
+        """
+        Reactive escape when front is blocked: try a right-hand sidestep, then return
+        to original heading. Returns True if, after the detour, the original heading
+        looks clear enough to continue.
+        """
+        pose = self._get_pose()
+        base_heading = pose['heading_deg']
+        side_heading = normalize_angle_deg(base_heading - 90.0)
+        sidestep = max(MIN_MOVE_COMMAND_M, min(0.25, MAX_MOVE_COMMAND_M))
+
+        # Check static & LIDAR for the sidestep itself
+        if not self._step_static_clear(pose, side_heading, sidestep):
+            return False
+        side_clear = self._heading_clearance(
+            side_heading,
+            base_heading,
+            FORWARD_SCAN_ANGLE_DEG,
+            sidestep + CLEARANCE_MARGIN_M,
+        )
+        if side_clear < min(sidestep, OBSTACLE_STOP_DISTANCE_M * 0.8):
+            return False
+
+        # Execute sidestep
+        if not self._rotate_to_heading(side_heading):
+            return False
+        if not self._send_move(sidestep):
+            return False
+
+        # Return to original heading
+        if not self._rotate_to_heading(base_heading):
+            return False
+        time.sleep(0.2)  # let LIDAR settle
+
+        # Check whether forward is now clear
+        pose = self._get_pose()
+        forward_clear = self._heading_clearance(
+            forward_heading,
+            pose['heading_deg'],
+            FORWARD_SCAN_ANGLE_DEG,
+            forward_step + CLEARANCE_MARGIN_M,
+        )
+        required = min(forward_step, OBSTACLE_STOP_DISTANCE_M)
+        return forward_clear >= required
+
     def _execute_segment_move(self, heading_world, distance):
         """Rotate to heading_world then move distance, chunked by min/max move command."""
         remaining = distance
@@ -2060,6 +2105,10 @@ class OdomOnlyNavigator:
             step = min(remaining, MAX_MOVE_COMMAND_M)
             step = self._clamp_move_command(step)
             if self._segment_blocked_by_lidar(heading_world, step):
+                # Try a quick right-hand sidestep to clear the blockage
+                if self._escape_right_detour(heading_world, step):
+                    # After detour, re-evaluate the same segment from new pose
+                    continue
                 return False
             if not self._send_move(step):
                 return False
