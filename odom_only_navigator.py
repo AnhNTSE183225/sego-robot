@@ -153,6 +153,7 @@ MOVE_TIMEOUT_SEC = _motion_cfg.get('move_timeout_sec', 25.0)
 ROTATE_TIMEOUT_SEC = _motion_cfg.get('rotate_timeout_sec', 15.0)
 AXIS_ALIGNED_MOVES = _motion_cfg.get('axis_aligned_moves', False)
 HEADING_OFFSET_DEG = _motion_cfg.get('heading_offset_deg', 0.0)
+POI_TOLERANCE_M = _motion_cfg.get('poi_tolerance_m', DISTANCE_TOLERANCE_M)
 AXIS_DRIFT_TOLERANCE_M = max(DISTANCE_TOLERANCE_M * 1.5, 0.03)  # How far we allow drift off-axis before correcting
 DETOUR_AXIS_ALIGNED = _motion_cfg.get('detour_axis_aligned', True)  # Detours snap to axis
 PREFER_CW_FOR_180 = _motion_cfg.get('prefer_cw_for_180', True)  # Prefer clockwise when delta ~180°
@@ -1388,7 +1389,7 @@ class OdomOnlyNavigator:
         return False
 
     # --- Navigation logic ---
-    def _navigate_with_planner(self, goal):
+    def _navigate_with_planner(self, goal, tolerance_m=DISTANCE_TOLERANCE_M):
         """Navigate to goal using A* over static + live LIDAR obstacles with replans on interruption."""
         replan_count = 0
         while True:
@@ -1396,7 +1397,7 @@ class OdomOnlyNavigator:
             dx = goal[0] - pose['x']
             dy = goal[1] - pose['y']
             distance = math.hypot(dx, dy)
-            if distance < DISTANCE_TOLERANCE_M:
+            if distance < tolerance_m:
                 return True
 
             # Try visibility-graph planner first for small/tight maps
@@ -1410,6 +1411,7 @@ class OdomOnlyNavigator:
                     goal,
                     allow_detour=True,
                     check_static=False,
+                    tolerance_m=tolerance_m,
                 )
             self.logger.info("Planner produced %d waypoint(s). Executing...", len(path))
 
@@ -1423,7 +1425,8 @@ class OdomOnlyNavigator:
             self.logger.info("Replanning after interruption (attempt %d/%d)...", replan_count, PLANNER_MAX_REPLANS)
             time.sleep(0.1)
 
-    def navigate_to(self, goal, allow_detour=True):
+    def navigate_to(self, goal, allow_detour=True, tolerance_m=None):
+        tolerance = DISTANCE_TOLERANCE_M if tolerance_m is None else tolerance_m
         if not self.first_scan_event.is_set():
             self.logger.info("Waiting for initial LIDAR data...")
             self.first_scan_event.wait(timeout=3.0)
@@ -1434,7 +1437,7 @@ class OdomOnlyNavigator:
 
         # Prefer planner-based navigation (uses live LIDAR + static map)
         if self.boundary_polygon:
-            if self._navigate_with_planner(goal):
+            if self._navigate_with_planner(goal, tolerance_m=tolerance):
                 self.logger.info("Goal reached.")
             else:
                 self.logger.warning("Navigation ended without reaching goal.")
@@ -1445,6 +1448,7 @@ class OdomOnlyNavigator:
             goal,
             allow_detour=allow_detour,
             check_static=False,
+            tolerance_m=tolerance,
         ):
             return
         self.logger.info("Goal reached.")
@@ -2305,7 +2309,7 @@ class OdomOnlyNavigator:
                 self._send_ack(correlation_id, cmd, False, f"POI {poi_id} not found or map not loaded")
                 return
             try:
-                self.navigate_to(goal)
+                self.navigate_to(goal, tolerance_m=POI_TOLERANCE_M)
                 self._send_ack(correlation_id, cmd, True, None)
                 self._send_status()
             except Exception as exc:
@@ -2563,7 +2567,7 @@ class OdomOnlyNavigator:
 
         return self._send_move(distance, monitor_lidar=True)
 
-    def _navigate_direct(self, goal, allow_detour=True, check_static=True):
+    def _navigate_direct(self, goal, allow_detour=True, check_static=True, tolerance_m=DISTANCE_TOLERANCE_M):
         """
         Navigate toward goal using incremental steps (non-axis-aligned), with optional detour avoidance.
         """
@@ -2572,11 +2576,11 @@ class OdomOnlyNavigator:
             dx = goal[0] - pose['x']
             dy = goal[1] - pose['y']
             distance = math.hypot(dx, dy)
-            if distance < DISTANCE_TOLERANCE_M:
+            if distance < tolerance_m:
                 return True
             desired_heading = math.degrees(math.atan2(dy, dx))
             step_distance = min(MOVE_STEP_M, distance)
-            if step_distance < DISTANCE_TOLERANCE_M:
+            if step_distance < tolerance_m:
                 continue
             if not self._drive_step(
                 desired_heading,

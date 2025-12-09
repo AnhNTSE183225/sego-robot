@@ -30,6 +30,7 @@
     
     "motion": {
         "distance_tolerance_m": 0.02,
+        "poi_tolerance_m": 0.10,
         "angle_tolerance_deg": 2.0,
         "move_timeout_sec": 25.0,
         "rotate_timeout_sec": 15.0,
