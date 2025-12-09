@@ -79,7 +79,7 @@
         "angular_k": 0.55,
         "max_speed": 0.8,
         "min_duty_linear": 0.45,
-        "min_duty_rotate": 0.52,
+        "min_duty_rotate": 0.60,
         "min_duty_brake": 0.18,
         
         "move_kp": -0.0040,
