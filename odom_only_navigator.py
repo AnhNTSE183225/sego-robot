@@ -1765,7 +1765,8 @@ class OdomOnlyNavigator:
         blocked = set()
 
         def to_grid(val, offset):
-            return round((val - offset) / ASTAR_GRID_STEP_M)
+            # Use floor to keep monotonic grid indexing and avoid skipping indices due to rounding.
+            return int(math.floor((val - offset) / ASTAR_GRID_STEP_M + 1e-6))
 
         for _, raw_angle_deg, dist_mm in scan:
             if dist_mm <= 0:
