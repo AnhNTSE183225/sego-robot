@@ -1357,7 +1357,10 @@ class OdomOnlyNavigator:
             if distance < DISTANCE_TOLERANCE_M:
                 return True
 
-            path = self._plan_path_astar((pose['x'], pose['y']), goal)
+            # Try visibility-graph planner first for small/tight maps
+            path = self._plan_path_visibility((pose['x'], pose['y']), goal)
+            if path is None:
+                path = self._plan_path_astar((pose['x'], pose['y']), goal)
             if not path:
                 self.logger.warning("Planner failed to find path to %s", goal)
                 return False
@@ -1729,6 +1732,70 @@ class OdomOnlyNavigator:
             return False
         return True
 
+    def _plan_path_visibility(self, start, goal):
+        """
+        Simple visibility-graph planner using polygon vertices.
+        Returns list of waypoints (including goal) or None if no path.
+        """
+        if self._direct_path_clear(start, goal):
+            return [goal]
+
+        nodes = [start, goal]
+        # Add boundary vertices
+        if self.boundary_polygon:
+            nodes.extend(self.boundary_polygon)
+        # Add obstacle vertices
+        for obs in self.obstacles:
+            nodes.extend(obs)
+
+        # Build visibility edges
+        n = len(nodes)
+        graph = {i: [] for i in range(n)}
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                a = nodes[i]
+                b = nodes[j]
+                if self._segment_crosses_obstacles(a, b):
+                    continue
+                if self._segment_leaves_boundary(a, b):
+                    continue
+                dist = math.hypot(b[0] - a[0], b[1] - a[1])
+                graph[i].append((j, dist))
+                graph[j].append((i, dist))
+
+        # Dijkstra from start (0) to goal (1)
+        import heapq
+        start_idx = 0
+        goal_idx = 1
+        heap = [(0.0, start_idx)]
+        dist_map = {start_idx: 0.0}
+        prev = {}
+
+        while heap:
+            d, u = heapq.heappop(heap)
+            if u == goal_idx:
+                break
+            if d != dist_map.get(u, math.inf):
+                continue
+            for v, w in graph.get(u, []):
+                nd = d + w
+                if nd < dist_map.get(v, math.inf):
+                    dist_map[v] = nd
+                    prev[v] = u
+                    heapq.heappush(heap, (nd, v))
+
+        if goal_idx not in prev and goal_idx != start_idx:
+            return None
+
+        # Reconstruct path (exclude start)
+        path_indices = [goal_idx]
+        while path_indices[-1] != start_idx:
+            path_indices.append(prev[path_indices[-1]])
+        path_indices.reverse()
+        waypoints = [nodes[i] for i in path_indices[1:]]
+        return waypoints
+
     def _path_clear_with_lidar(self, start, goal):
         """Check whether LIDAR sees a clear corridor from start->goal."""
         if not self.first_scan_event.is_set():
@@ -1820,7 +1887,8 @@ class OdomOnlyNavigator:
         margin = ASTAR_GRID_STEP_M
 
         def to_grid(val, offset):
-            return round((val - offset) / ASTAR_GRID_STEP_M)
+            # Use floor to keep monotonic grid indexing and avoid skipping indices due to rounding.
+            return int(math.floor((val - offset) / ASTAR_GRID_STEP_M + 1e-6))
 
         start_g = (to_grid(start[0], min_x), to_grid(start[1], min_y))
         goal_g = (to_grid(goal[0], min_x), to_grid(goal[1], min_y))
