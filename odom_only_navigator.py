@@ -571,11 +571,15 @@ class OdomOnlyNavigator:
         return sign * clamped
 
     def _clamp_rotate_command(self, angle_deg):
-        """Clamp ROTATE_DEG to configured min/max magnitude so MCU never gets too small/too large turns."""
+        """Clamp ROTATE_DEG to configured min/max magnitude."""
         sign = 1.0 if angle_deg >= 0 else -1.0
         abs_val = abs(angle_deg)
 
-        # Luôn ép về [MIN_ROTATE_COMMAND_DEG, MAX_ROTATE_COMMAND_DEG]
+        # Nếu gần 0 thì bỏ qua
+        if abs_val < 0.1:
+            return 0.0
+
+        # Luôn ép magnitude vào [MIN_ROTATE_COMMAND_DEG, MAX_ROTATE_COMMAND_DEG]
         clamped = min(max(abs_val, MIN_ROTATE_COMMAND_DEG), MAX_ROTATE_COMMAND_DEG)
 
         if clamped != abs_val:
@@ -719,16 +723,25 @@ class OdomOnlyNavigator:
                     applied_world = -actual_rotation  # MCU cw+ -> world ccw+
                     break
                 time.sleep(0.05)
+
             if applied_world is not None:
+                # Odom có đổi góc → coi là thành công bình thường
                 self._update_pose_after_rotate(applied_world)
+                self._send_raw_command("RESET_ODOM")
+                time.sleep(0.1)
+                with self.active_motion_lock:
+                    self.active_motion = None
+                return True
             else:
-                self.logger.warning("Rotation completed but odom heading ~0; pose not updated.")
-            # Reset STM32 odometry so the next MOVE starts from (0,0,0)
-            self._send_raw_command("RESET_ODOM")
-            time.sleep(0.1)
-            with self.active_motion_lock:
-                self.active_motion = None
-            return True
+                # Odom KHÔNG đổi (gần 0°) → coi là FAIL để _rotate_to_heading tăng attempts và bỏ.
+                self.logger.warning(
+                    "Rotation completed but odom heading ~0; treating as FAILED rotation."
+                )
+                self._send_raw_command("RESET_ODOM")
+                time.sleep(0.1)
+                with self.active_motion_lock:
+                    self.active_motion = None
+                return False
         
         # Rotation was interrupted/timed out: use STM32 odom to see how far it got
         stm32_odom = self._get_stm32_odom()
@@ -1268,6 +1281,16 @@ class OdomOnlyNavigator:
             # World delta (CCW positive)
             world_delta = normalize_angle_deg(target_heading_world - current_heading)
             if abs(world_delta) <= ANGLE_TOLERANCE_DEG:
+                return True
+            # NEW: nếu sai số nhỏ hơn min rotate thì chấp nhận luôn, không cố quay nữa
+            # vì quay thêm 1 bước min chắc chắn sẽ overshoot và ping–pong.
+            if abs(world_delta) <= MIN_ROTATE_COMMAND_DEG:
+                self.logger.info(
+                    "Rotate_to_heading: remaining error %.1f° < MIN_ROTATE_COMMAND_DEG=%.1f°; "
+                    "accepting heading to avoid oscillation.",
+                    abs(world_delta),
+                    MIN_ROTATE_COMMAND_DEG,
+                )
                 return True
             # Prefer a deterministic direction for ~180° turns to avoid oscillation
             if abs(world_delta) >= 179.0:
