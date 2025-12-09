@@ -73,7 +73,7 @@
         "_comment": "These are sent to STM32 via SET_PARAM on startup",
         
         "odom_scale": 0.902521,
-        "odom_angular_scale": 0.95,
+        "odom_angular_scale": 1.05,
         
         "linear_k": 1.0,
         "angular_k": 0.55,
