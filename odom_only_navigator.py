@@ -1586,7 +1586,7 @@ class OdomOnlyNavigator:
         boundary_anchor_set = False
 
         raw_pois = self.map_definition.get("pointsOfInterest") or []
-        obstacles = self.map_definition.get("obstacles") or []
+        obstacles = (self.map_definition.get("obstacles") or []) + (self.map_definition.get("restricted") or [])
         boundary_pts = (self.map_definition.get("boundary") or {}).get("points") or []
 
         # Anchor boundary to current pose
@@ -1637,7 +1637,7 @@ class OdomOnlyNavigator:
                     boundary_poly[0][0], boundary_poly[0][1], len(boundary_poly)
                 )
 
-        # Anchor obstacles using same offset if boundary exists
+        # Anchor obstacles/restricted using same offset if boundary exists
         for obs in obstacles:
             pts = obs.get("points") or []
             polygon = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in pts if p.get("x") is not None and p.get("y") is not None]
@@ -1669,7 +1669,7 @@ class OdomOnlyNavigator:
         else:
             self.logger.info("Boundary not present in map definition.")
         self.logger.info(
-            "Loaded map data: obstacles=%s pois=%s",
+            "Loaded map data: obstacles+restricted=%s pois=%s",
             len(self.obstacles),
             len(self.points_of_interest),
         )
