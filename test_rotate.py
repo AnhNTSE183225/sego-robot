@@ -256,28 +256,84 @@ class STM32Tester:
             angle += 360.0
         return angle
     
+    def quantize_rotation_angle(self, angle_deg):
+        """
+        Quantize rotation angle to nearest allowed discrete angle.
+        
+        Returns:
+            Quantized angle (one of: 30, 60, 90, 120, 150, 180) with original sign
+            Returns 0.0 if angle is too small (<15°)
+        """
+        abs_angle = abs(angle_deg)
+        sign = 1 if angle_deg >= 0 else -1
+        
+        # Get allowed angles from config
+        rotation_config = self.config.get('rotation_calibration', {})
+        allowed_angles = rotation_config.get('allowed_angles', [30, 60, 90, 120, 150, 180])
+        
+        # Too small to rotate
+        if abs_angle < 15:
+            self.logger.info(f"Angle {angle_deg:.1f}° too small (<15°), skipping rotation")
+            return 0.0
+        
+        # Find nearest allowed angle
+        nearest = min(allowed_angles, key=lambda x: abs(x - abs_angle))
+        quantized = sign * nearest
+        
+        if abs(quantized - angle_deg) > 0.1:
+            self.logger.info(f"Quantized {angle_deg:.1f}° → {quantized:.1f}°")
+        
+        return quantized
+    
+    def get_calibration_scale(self, angle_deg):
+        """
+        Get calibration scale factor for a specific rotation angle.
+        
+        Args:
+            angle_deg: Quantized rotation angle (should be one of allowed_angles)
+        
+        Returns:
+            Calibration scale factor (default 1.0 if not found)
+        """
+        rotation_config = self.config.get('rotation_calibration', {})
+        abs_angle = abs(int(angle_deg))
+        scale = float(rotation_config.get(str(abs_angle), 1.0))
+        return scale
+    
     # =========================================================================
     # ROTATE_DEG COMMAND - Replicates odom_only_navigator.py behavior EXACTLY
     # =========================================================================
     
     def rotate_deg(self, angle_deg):
         """
-        Send ROTATE_DEG command to STM32.
+        Send ROTATE_DEG command to STM32 with discrete angle quantization and calibration.
         
-        This replicates _send_rotate() from odom_only_navigator.py:
+        This replicates _send_rotate() from odom_only_navigator.py with enhancements:
+        - Quantizes requested angle to nearest allowed discrete angle (30°, 60°, 90°, etc.)
+        - Applies angle-specific calibration factor from robot_config.json
         - "OK ROTATE_DEG" = command received, rotation started
         - "TARGET_REACHED" = rotation completed successfully
         - "TIMEOUT" = rotation timed out
         
         Args:
-            angle_deg: Angle to rotate in degrees (positive = counterclockwise in MCU frame)
+            angle_deg: Requested rotation angle in degrees (will be quantized)
         
         Returns:
             True if rotation completed successfully
         """
-        if abs(angle_deg) < 0.1:
-            self.logger.info("Angle too small, skipping rotation.")
+        # Step 1: Quantize to nearest allowed angle
+        quantized_angle = self.quantize_rotation_angle(angle_deg)
+        if abs(quantized_angle) < 0.1:
             return True
+        
+        # Step 2: Apply calibration for this specific angle
+        calibration_scale = self.get_calibration_scale(quantized_angle)
+        calibrated_angle = quantized_angle * calibration_scale
+        
+        self.logger.info(
+            f"Rotation: requested={angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
+            f"scale={calibration_scale:.4f}, calibrated={calibrated_angle:.2f}°"
+        )
         
         rotate_timeout = self.config.get('motion', {}).get('rotate_timeout_sec', 15.0)
         rotate_timeout_tol = self.config.get('obstacle_avoidance', {}).get('rotate_timeout_tolerance_deg', 15.0)
@@ -287,7 +343,8 @@ class STM32Tester:
         self._wait_for_response(["OK"], ["ERR"], timeout=1.0)
         time.sleep(0.1)
         
-        cmd = f"ROTATE_DEG {angle_deg:.2f}"
+        # Step 3: Send calibrated angle to STM32
+        cmd = f"ROTATE_DEG {calibrated_angle:.2f}"
         self._clear_response_queue()
         self._send_command(cmd)
         
