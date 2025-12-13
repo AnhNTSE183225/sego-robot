@@ -2,16 +2,34 @@ import json
 import logging
 import logging.handlers
 import math
-import os
 import queue
 import serial
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
-LOG_FILE = os.environ.get("ROBOT_LOG_FILE", "robot.log")
-LOG_LEVEL = os.environ.get("ROBOT_LOG_LEVEL", "DEBUG").upper()
+
+def load_robot_config():
+    """Load configuration from robot_config.json. Raises error if file missing."""
+    config_path = Path(__file__).parent / "robot_config.json"
+    
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Configuration file not found: {config_path}\n"
+            "Please create robot_config.json with required settings."
+        )
+    
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+
+# Load config once at module level
+ROBOT_CONFIG = load_robot_config()
+
+LOG_FILE = ROBOT_CONFIG.get('logging', {}).get('file', 'robot.log')
+LOG_LEVEL = ROBOT_CONFIG.get('logging', {}).get('level', 'INFO').upper()
 
 
 def configure_logging():
@@ -82,64 +100,95 @@ except ImportError:
 from odom_kafka_bridge import KafkaBridge
 
 
-# Serial configuration
-SERIAL_PORT = '/dev/ttyAMA0'
-BAUD_RATE = 115200
+# Serial configuration (from config file)
+SERIAL_PORT = ROBOT_CONFIG.get('serial', {}).get('port', '/dev/ttyAMA0')
+BAUD_RATE = ROBOT_CONFIG.get('serial', {}).get('baud_rate', 115200)
 
-# LIDAR configuration
-LIDAR_PORT = '/dev/ttyUSB0'
-# LIDAR angle mapping: robot forward (0°) corresponds to raw angle with offset + sign flip.
-# From measurements: obstacle in front ~120.6°, obstacle left ~27.5° => offset ≈119°, robot_angle = -raw + offset
-LIDAR_FRONT_OFFSET_DEG = 119.0
+# STM32 configurable parameters (sent on startup via SET_PARAM)
+# These can be tuned without reflashing the STM32
+STM32_PARAMS = ROBOT_CONFIG.get('stm32_params', {
+    'odom_scale': 0.902521,
+    'linear_k': 1.0,
+    'angular_k': 0.55,
+    'max_speed': 0.8,
+    'min_duty_linear': 0.45,
+    'min_duty_rotate': 0.48,
+    'min_duty_brake': 0.18,
+    'move_kp': -0.0040,
+    'move_ki': -0.00015,
+    'move_kd': -0.0008,
+    'move_min_pwm': 0.46,
+    'move_max_pwm': 0.70,
+    'move_smoothing': 0.25,
+    'move_skew': 0.015,
+    'move_base_pwm': 0.58,
+    'move_timeout': 20000,
+    'rotate_tol_dist': 0.02,
+    'rotate_tol_angle': 0.02,
+    'rotate_timeout': 10000,
+    'move_dist_tol_dist': 0.01,
+    'move_dist_tol_angle': 0.05,
+    'move_dist_timeout': 10000,
+    'angular_rate_tol': 0.05,
+})
 
-# Kafka configuration (shared topics)
-KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TOPIC_COMMAND = os.environ.get("KAFKA_TOPIC_COMMAND", "robot.cmd")
-KAFKA_TOPIC_TELEMETRY = os.environ.get("KAFKA_TOPIC_TELEMETRY", "robot.telemetry")
-KAFKA_TOPIC_MAP = os.environ.get("KAFKA_TOPIC_MAP", "robot.map")
-KAFKA_TOPIC_EVENTS = os.environ.get("KAFKA_TOPIC_EVENTS", "robot.events")
-ROBOT_ID = os.environ.get("ROBOT_ID")
+# LIDAR configuration (from config file)
+LIDAR_PORT = ROBOT_CONFIG.get('lidar', {}).get('port', '/dev/ttyUSB0')
+LIDAR_FRONT_OFFSET_DEG = ROBOT_CONFIG.get('lidar', {}).get('front_offset_deg', 119.0)
 
-# Motion tolerances
-DISTANCE_TOLERANCE_M = 0.02
-ANGLE_TOLERANCE_DEG = 2.0
+# Kafka configuration (from config file)
+_kafka_cfg = ROBOT_CONFIG.get('kafka', {})
+KAFKA_BOOTSTRAP_SERVERS = _kafka_cfg.get('bootstrap_servers', 'localhost:9092')
+KAFKA_TOPIC_COMMAND = _kafka_cfg.get('topic_command', 'robot.cmd')
+KAFKA_TOPIC_TELEMETRY = _kafka_cfg.get('topic_telemetry', 'robot.telemetry')
+KAFKA_TOPIC_MAP = _kafka_cfg.get('topic_map', 'robot.map')
+KAFKA_TOPIC_EVENTS = _kafka_cfg.get('topic_events', 'robot.events')
+ROBOT_ID = ROBOT_CONFIG.get('robot', {}).get('id')
 
-# Command timeouts
-MOVE_TIMEOUT_SEC = 25.0
-ROTATE_TIMEOUT_SEC = 15.0
+# Motion tolerances (from config file)
+_motion_cfg = ROBOT_CONFIG.get('motion', {})
+DISTANCE_TOLERANCE_M = _motion_cfg.get('distance_tolerance_m', 0.02)
+ANGLE_TOLERANCE_DEG = _motion_cfg.get('angle_tolerance_deg', 2.0)
+MOVE_TIMEOUT_SEC = _motion_cfg.get('move_timeout_sec', 25.0)
+ROTATE_TIMEOUT_SEC = _motion_cfg.get('rotate_timeout_sec', 15.0)
+AXIS_ALIGNED_MOVES = _motion_cfg.get('axis_aligned_moves', False)
+HEADING_OFFSET_DEG = _motion_cfg.get('heading_offset_deg', 0.0)
+POI_TOLERANCE_M = _motion_cfg.get('poi_tolerance_m', DISTANCE_TOLERANCE_M)
+AXIS_DRIFT_TOLERANCE_M = max(DISTANCE_TOLERANCE_M * 1.5, 0.03)  # How far we allow drift off-axis before correcting
+DETOUR_AXIS_ALIGNED = _motion_cfg.get('detour_axis_aligned', True)  # Detours snap to axis
+PREFER_CW_FOR_180 = _motion_cfg.get('prefer_cw_for_180', True)  # Prefer clockwise when delta ~180°
+MIN_MOVE_COMMAND_M = _motion_cfg.get('min_move_command_m', 0.05)
+MAX_MOVE_COMMAND_M = _motion_cfg.get('max_move_command_m', 1.0)
+MIN_ROTATE_COMMAND_DEG = _motion_cfg.get('min_rotate_deg', 5.0)
+MAX_ROTATE_COMMAND_DEG = _motion_cfg.get('max_rotate_deg', 180.0)
 
-# Movement mode: False -> use direct heading (no forced L-shape)
-AXIS_ALIGNED_MOVES = False
+# Obstacle avoidance parameters (from config file)
+_obstacle_cfg = ROBOT_CONFIG.get('obstacle_avoidance', {})
+MOVE_STEP_M = _obstacle_cfg.get('move_step_m', 0.25)
+CLEARANCE_MARGIN_M = _obstacle_cfg.get('clearance_margin_m', 0.05)
+OBSTACLE_STOP_DISTANCE_M = _obstacle_cfg.get('obstacle_stop_distance_m', 0.25)
+OBSTACLE_LOOKAHEAD_M = _obstacle_cfg.get('obstacle_lookahead_m', 1.2)
+ROBOT_RADIUS_M = _obstacle_cfg.get('robot_radius_m', 0.15)
+CORRIDOR_HALF_WIDTH_M = _obstacle_cfg.get('corridor_half_width_m', 0.20)
+SIDE_WALL_MIN_M = _obstacle_cfg.get('side_wall_min_m', 0.05)
+SIDE_WALL_MAX_M = _obstacle_cfg.get('side_wall_max_m', 0.80)
+SIDE_CONE_DEG = _obstacle_cfg.get('side_cone_deg', 60.0)
+FORWARD_SCAN_ANGLE_DEG = _obstacle_cfg.get('forward_scan_angle_deg', 140.0)
+DETOUR_SCAN_ANGLE_DEG = _obstacle_cfg.get('detour_scan_angle_deg', 120.0)
+DETOUR_ANGLE_STEP_DEG = _obstacle_cfg.get('detour_angle_step_deg', 15.0)
+DETOUR_MAX_ANGLE_DEG = _obstacle_cfg.get('detour_max_angle_deg', 90.0)
+BLOCKED_RETRY_WAIT_SEC = _obstacle_cfg.get('blocked_retry_wait_sec', 0.4)
+MAX_BLOCKED_RETRIES = _obstacle_cfg.get('max_blocked_retries', 25)
+MAX_SIDE_SWITCHES = _obstacle_cfg.get('max_side_switches', 5)
+START_MIN_CLEARANCE_M = _obstacle_cfg.get('start_min_clearance_m', 0.25)
+ROTATE_TIMEOUT_TOLERANCE_DEG = _obstacle_cfg.get('rotate_timeout_tolerance_deg', 15.0)
+MIN_VALID_LIDAR_DIST_M = _obstacle_cfg.get('min_valid_lidar_dist_m', 0.20)
 
-# Heading offset (deg) to align MCU frame with map frame if needed (e.g., set to 90 to face +Y by default)
-HEADING_OFFSET_DEG = float(os.environ.get("HEADING_OFFSET_DEG", "0"))
-
-# Obstacle avoidance parameters
-MOVE_STEP_M = 0.25                 # Distance per motion burst; keeps reactiveness high
-CLEARANCE_MARGIN_M = 0.05          # Buffer added to the intended step distance
-OBSTACLE_STOP_DISTANCE_M = 0.25    # Stop distance tuned for small map demo
-OBSTACLE_LOOKAHEAD_M = 1.2         # Max range to consider when scoring headings
-ROBOT_RADIUS_M = 0.15              # Approx robot radius (m) for corridor checks
-CORRIDOR_HALF_WIDTH_M = 0.20       # Half-width of forward corridor to catch obstacles near edges
-SIDE_WALL_MIN_M = 0.05             # Min distance to consider "along the wall"
-SIDE_WALL_MAX_M = 0.80             # Max distance to consider "along the wall"
-SIDE_CONE_DEG = 60.0               # ±30° cone for side wall detection
-FORWARD_SCAN_ANGLE_DEG = 140.0     # Forward corridor; narrower to avoid side walls on small maps
-DETOUR_SCAN_ANGLE_DEG = 120.0      # Wider cone used when looking for alternate headings
-DETOUR_ANGLE_STEP_DEG = 15.0       # Angular resolution when sampling detour headings
-DETOUR_MAX_ANGLE_DEG = 90.0        # How far left/right we are willing to turn for a detour
-BLOCKED_RETRY_WAIT_SEC = 0.4
-MAX_BLOCKED_RETRIES = 25
-MAX_SIDE_SWITCHES = 5
-START_MIN_CLEARANCE_M = 0.25       # Minimum clearance required before starting a MOVE
-ROTATE_TIMEOUT_TOLERANCE_DEG = 15.0  # Accept larger odom error on rotation timeout to avoid false blockage
-MIN_VALID_LIDAR_DIST_M = 0.20      # Ignore hits closer than this (likely robot body/noise)
-# Path planning
-ASTAR_GRID_STEP_M = 0.05           # Finer grid for A* planner to find narrow corridors
-ASTAR_MAX_NODES = 20000            # Safety cap to avoid runaway planning
-
-STATE_GOAL_FOLLOW = "GOAL_FOLLOW"
-STATE_OBSTACLE_FOLLOW = "OBSTACLE_FOLLOW"
+# Path planning (from config file)
+_path_cfg = ROBOT_CONFIG.get('path_planning', {})
+ASTAR_GRID_STEP_M = _path_cfg.get('astar_grid_step_m', 0.05)
+ASTAR_MAX_NODES = _path_cfg.get('astar_max_nodes', 20000)
+PLANNER_MAX_REPLANS = _path_cfg.get('max_replans', 10)
 
 
 def normalize_angle_deg(angle):
@@ -187,6 +236,9 @@ class OdomOnlyNavigator:
             'y': 0.0,
             'heading_deg': 0.0,
         }
+        # Track active motion for live status fusion
+        self.active_motion_lock = threading.Lock()
+        self.active_motion = None  # {'start_pose':..., 'odom_start':...}
 
         # LIDAR state
         self.lidar = None
@@ -238,6 +290,11 @@ class OdomOnlyNavigator:
             return False
 
         self._start_serial_listener()
+        time.sleep(0.2)  # Give serial listener time to start
+        
+        # Configure STM32 parameters before any motion commands
+        self._configure_stm32_params()
+        
         self._send_raw_command("RESET_ODOM")
         self._reset_pose()  # Reset internal pose tracking
         self._reset_stm32_odom()  # Reset STM32 odom cache
@@ -316,8 +373,12 @@ class OdomOnlyNavigator:
                             self.stm32_odom['x'] = x
                             self.stm32_odom['y'] = y
                             self.stm32_odom['heading_deg'] = heading_deg
+                            odom_snapshot = dict(self.stm32_odom)
                     except ValueError:
                         pass
+                    else:
+                        # Accumulate live progress for the active MOVE/ROTATE using odom deltas.
+                        self._accumulate_active_motion_progress(odom_snapshot)
                     continue  # Don't put odom lines in response queue
             self.logger.info(f"[STM32] {line}")
             self.response_queue.put(line.strip())
@@ -334,6 +395,83 @@ class OdomOnlyNavigator:
             self.stm32_odom['x'] = 0.0
             self.stm32_odom['y'] = 0.0
             self.stm32_odom['heading_deg'] = 0.0
+
+    def _odom_delta(self, odom_start, odom_end):
+        """Compute STM32 odom delta (MCU frame, clockwise-positive heading) between two snapshots."""
+        return {
+            'x': odom_end.get('x', 0.0) - odom_start.get('x', 0.0),
+            'y': odom_end.get('y', 0.0) - odom_start.get('y', 0.0),
+            'heading_deg': normalize_angle_deg(
+                odom_end.get('heading_deg', 0.0) - odom_start.get('heading_deg', 0.0)
+            ),
+        }
+
+    def _compose_pose_with_delta(self, start_pose, odom_delta):
+        """
+        Compose STM32 odom delta (MCU frame: x fwd, y left, heading clockwise-positive)
+        onto an absolute start_pose without mutating internal pose.
+        """
+        dx_r = odom_delta.get('x', 0.0)
+        dy_r = odom_delta.get('y', 0.0)
+        dtheta_mcu = odom_delta.get('heading_deg', 0.0)
+
+        heading_start = start_pose['heading_deg']
+        heading_start_rad = math.radians(heading_start)
+
+        dx_w = dx_r * math.cos(heading_start_rad) - dy_r * math.sin(heading_start_rad)
+        dy_w = dx_r * math.sin(heading_start_rad) + dy_r * math.cos(heading_start_rad)
+
+        dtheta_world = -dtheta_mcu  # MCU clockwise-positive -> world CCW-positive
+        new_heading = normalize_angle_deg(heading_start + dtheta_world)
+
+        fused = {
+            'x': start_pose['x'] + dx_w,
+            'y': start_pose['y'] + dy_w,
+            'heading_deg': new_heading,
+        }
+        return fused
+
+    def _compose_progress_pose(self, start_pose, progress_m, heading_deg):
+        """
+        Compose forward progress along a fixed heading (ignore lateral odom/yaw drift).
+        Use when we assume perfect path but want live progress between start->goal.
+        """
+        dx = max(0.0, progress_m)  # only forward progress
+        rad = math.radians(heading_deg)
+        return {
+            'x': start_pose['x'] + dx * math.cos(rad),
+            'y': start_pose['y'] + dx * math.sin(rad),
+            'heading_deg': heading_deg,
+        }
+
+    def _compose_rotation_pose(self, start_pose, progress_deg, sign):
+        """Compose heading progress (degrees) without translating position."""
+        signed = max(0.0, progress_deg) * (1 if sign >= 0 else -1)
+        return {
+            'x': start_pose['x'],
+            'y': start_pose['y'],
+            'heading_deg': normalize_angle_deg(start_pose['heading_deg'] + signed),
+        }
+
+    def _accumulate_active_motion_progress(self, current_odom):
+        """Update active motion progress using odom delta magnitude; ignore sign/axis drift."""
+        with self.active_motion_lock:
+            if not self.active_motion:
+                return 0.0
+            delta = self._odom_delta(self.active_motion['odom_start'], current_odom)
+            if self.active_motion.get('mode') == 'rotate':
+                incr = abs(delta.get('heading_deg', 0.0))
+            else:
+                incr = abs(delta.get('x', 0.0)) + abs(delta.get('y', 0.0))
+            if incr > 0:
+                target_cap = self.active_motion.get('target', float('inf'))
+                self.active_motion['progress'] = min(
+                    target_cap,
+                    self.active_motion.get('progress', 0.0) + incr
+                )
+                # Reset baseline so we only accumulate fresh delta next time
+                self.active_motion['odom_start'] = dict(current_odom)
+            return self.active_motion.get('progress', 0.0)
 
     def _get_pose(self):
         """Trả về pose tính từ lệnh đã gửi."""
@@ -417,12 +555,81 @@ class OdomOnlyNavigator:
         with self.scan_lock:
             return list(self.latest_scan)
 
+    # --- Command clamps ---
+    def _clamp_move_command(self, distance):
+        """Clamp MOVE distance to configured min/max to avoid too-small or oversized commands."""
+        sign = 1.0 if distance >= 0 else -1.0
+        abs_val = abs(distance)
+        clamped = min(max(abs_val, MIN_MOVE_COMMAND_M), MAX_MOVE_COMMAND_M)
+        if clamped != abs_val:
+            self.logger.info(
+                "MOVE command clamped from %.3fm to %.3fm (min=%.3fm, max=%.3fm)",
+                abs_val * sign,
+                clamped * sign,
+                MIN_MOVE_COMMAND_M,
+                MAX_MOVE_COMMAND_M,
+            )
+        return sign * clamped
+
+    def _clamp_rotate_command(self, angle_deg):
+        """Clamp ROTATE_DEG to configured min/max magnitude."""
+        sign = 1.0 if angle_deg >= 0 else -1.0
+        abs_val = abs(angle_deg)
+
+        # Nếu gần 0 thì bỏ qua
+        if abs_val < 0.1:
+            return 0.0
+
+        # Luôn ép magnitude vào [MIN_ROTATE_COMMAND_DEG, MAX_ROTATE_COMMAND_DEG]
+        clamped = min(max(abs_val, MIN_ROTATE_COMMAND_DEG), MAX_ROTATE_COMMAND_DEG)
+
+        if clamped != abs_val:
+            self.logger.info(
+                "ROTATE_DEG command clamped from %.1f° to %.1f° (min=%.1f°, max=%.1f°)",
+                abs_val * sign,
+                clamped * sign,
+                MIN_ROTATE_COMMAND_DEG,
+                MAX_ROTATE_COMMAND_DEG,
+            )
+
+        return sign * clamped
+
     # --- Command helpers ---
     def _send_raw_command(self, text):
         if not self.serial_conn:
             return
         cmd = text.strip() + "\r\n"
         self.serial_conn.write(cmd.encode('utf-8'))
+
+    def _configure_stm32_params(self):
+        """Send all configurable parameters to STM32 on startup."""
+        self.logger.info("Configuring STM32 parameters...")
+        for param_name, param_value in STM32_PARAMS.items():
+            # Skip comment keys (start with '_')
+            if param_name.startswith('_'):
+                continue
+            
+            # Format value appropriately (int for timeout values, float for others)
+            if 'timeout' in param_name:
+                value_str = str(int(param_value))
+            else:
+                value_str = f"{param_value:.6f}"
+            
+            cmd = f"SET_PARAM {param_name} {value_str}"
+            self._send_raw_command(cmd)
+            
+            # Wait briefly for ACK
+            result, line = self._wait_for_response(
+                success_tokens=["OK SET_PARAM"],
+                failure_tokens=["ERR"],
+                timeout=0.5
+            )
+            if result:
+                self.logger.debug(f"  {param_name} = {param_value}")
+            else:
+                self.logger.warning(f"  Failed to set {param_name}: {line}")
+        
+        self.logger.info("STM32 parameters configured.")
 
     def _clear_response_queue(self):
         while not self.response_queue.empty():
@@ -486,6 +693,18 @@ class OdomOnlyNavigator:
         if not result:
             self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
             return False
+
+        # Track active rotation for live status fusion
+        world_delta = world_delta if world_delta is not None else -desired_angle_deg
+        with self.active_motion_lock:
+            self.active_motion = {
+                'mode': 'rotate',
+                'start_pose': self._get_pose(),
+                'odom_start': self._get_stm32_odom(),
+                'target': abs(world_delta),
+                'sign': 1.0 if world_delta >= 0 else -1.0,
+                'progress': 0.0,
+            }
         
         # Step 2: wait for TARGET_REACHED or TIMEOUT
         result, line = self._wait_for_response(
@@ -496,10 +715,34 @@ class OdomOnlyNavigator:
         
         if result:
             self.logger.info(f"Rotation completed: {line}")
-            # Reset STM32 odometry so the next MOVE starts from (0,0,0)
-            self._send_raw_command("RESET_ODOM")
-            time.sleep(0.1)
-            return True
+            # Use actual odom rotation; if not available immediately, wait briefly.
+            applied_world = None
+            for _ in range(3):
+                stm32_odom = self._get_stm32_odom()
+                actual_rotation = stm32_odom.get('heading_deg', 0.0)
+                if abs(actual_rotation) > 0.1:
+                    applied_world = -actual_rotation  # MCU cw+ -> world ccw+
+                    break
+                time.sleep(0.05)
+
+            if applied_world is not None:
+                # Odom có đổi góc → coi là thành công bình thường
+                self._update_pose_after_rotate(applied_world)
+                self._send_raw_command("RESET_ODOM")
+                time.sleep(0.1)
+                with self.active_motion_lock:
+                    self.active_motion = None
+                return True
+            else:
+                # Odom KHÔNG đổi (gần 0°) → coi là FAIL để _rotate_to_heading tăng attempts và bỏ.
+                self.logger.warning(
+                    "Rotation completed but odom heading ~0; treating as FAILED rotation."
+                )
+                self._send_raw_command("RESET_ODOM")
+                time.sleep(0.1)
+                with self.active_motion_lock:
+                    self.active_motion = None
+                return False
         
         # Rotation was interrupted/timed out: use STM32 odom to see how far it got
         stm32_odom = self._get_stm32_odom()
@@ -511,8 +754,12 @@ class OdomOnlyNavigator:
                 "Rotation TIMEOUT but odom within tolerance in MCU frame (actual=%.1f°, target=%.1f°, err=%.1f° <= %.1f°); accepting.",
                 actual_rotation, target_delta_mcu, rotation_err_mcu, ROTATE_TIMEOUT_TOLERANCE_DEG
             )
+            applied_world = -actual_rotation
+            self._update_pose_after_rotate(applied_world)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
+            with self.active_motion_lock:
+                self.active_motion = None
             return True
         
         if abs(actual_rotation) > 0.5:  # At least some rotation happened
@@ -521,6 +768,8 @@ class OdomOnlyNavigator:
         # Reset STM32 odometry for the next command
         self._send_raw_command("RESET_ODOM")
         time.sleep(0.1)
+        with self.active_motion_lock:
+            self.active_motion = None
         
         if result is False:
             self.logger.warning(f"Rotation failed ({line}).")
@@ -559,6 +808,10 @@ class OdomOnlyNavigator:
         """
         if target_distance < DISTANCE_TOLERANCE_M:
             return True
+
+        commanded_distance = self._clamp_move_command(target_distance)
+        if commanded_distance != target_distance:
+            target_distance = commanded_distance
         
         # Reset STM32 odom cache trước khi MOVE để đo được khoảng cách thực tế
         self._reset_stm32_odom()
@@ -572,6 +825,17 @@ class OdomOnlyNavigator:
         self._clear_response_queue()
         self._send_raw_command(cmd)
         
+        # Track active motion for live status fusion
+        with self.active_motion_lock:
+            self.active_motion = {
+                'mode': 'move',
+                'start_pose': self._get_pose(),
+                'odom_start': self._get_stm32_odom(),
+                'target': target_distance,
+                'progress': 0.0,
+                'heading': self._get_pose()['heading_deg'],
+            }
+
         # Bước 1: Chờ OK MOVE (command acknowledged)
         result, line = self._wait_for_response(
             success_tokens=["OK MOVE"],
@@ -580,6 +844,8 @@ class OdomOnlyNavigator:
         )
         if not result:
             self.logger.warning(f"MOVE not acknowledged: {line}")
+            with self.active_motion_lock:
+                self.active_motion = None
             return False
         
         # Bước 2: Monitor LIDAR trong khi chờ MOVE TARGET_REACHED
@@ -613,6 +879,8 @@ class OdomOnlyNavigator:
             # Reset STM32 odometry cho lệnh tiếp theo
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
+            with self.active_motion_lock:
+                self.active_motion = None
             # Publish latest pose so UI sees translation promptly
             self._send_status()
             return True
@@ -623,6 +891,14 @@ class OdomOnlyNavigator:
         time.sleep(0.1)  # Cho STM32 cập nhật odom
         stm32_odom = self._get_stm32_odom()
         actual_distance = stm32_odom['x']  # Forward distance
+        # Prefer accumulated progress magnitude (capped) when available, so STOP retains mid-position
+        with self.active_motion_lock:
+            if self.active_motion:
+                progress_capped = min(
+                    self.active_motion.get('progress', 0.0),
+                    self.active_motion.get('target', float('inf'))
+                )
+                actual_distance = max(actual_distance, progress_capped)
         if actual_distance < 0:
             self.logger.warning(f"Negative odom.x ({actual_distance:.3f}m) - robot drifted backward?")
             actual_distance = 0.0  # Don't update pose if robot went backward
@@ -632,11 +908,14 @@ class OdomOnlyNavigator:
             self._update_pose_after_move(actual_distance)
         else:
             self.logger.info(f"Movement barely started (odom x={stm32_odom['x']:.3f})")
-        
+
         # Reset STM32 odometry cho lệnh tiếp theo
         self._send_raw_command("RESET_ODOM")
         time.sleep(0.1)
-        
+
+        with self.active_motion_lock:
+            self.active_motion = None
+
         if self._move_stop_reason:
             self.logger.warning(f"Move stopped by LIDAR: {self._move_stop_reason}")
         elif result is False:
@@ -803,38 +1082,95 @@ class OdomOnlyNavigator:
 
         return min_forward
 
-    def _choose_heading_with_avoidance(self, desired_heading_world, step_distance, allow_detour=True):
-        """Pick a heading that is both safe (clear corridor) and still progresses toward the goal."""
-        pose_heading_deg = self._get_pose()['heading_deg']
+    def _step_static_clear(self, pose, heading_world_deg, step_distance):
+        """
+        Check whether a forward step of step_distance along heading_world_deg stays within boundary
+        and does not cut through any static obstacle.
+        """
+        sx, sy = pose['x'], pose['y']
+        rad = math.radians(heading_world_deg)
+        ex = sx + step_distance * math.cos(rad)
+        ey = sy + step_distance * math.sin(rad)
+        start = (sx, sy)
+        end = (ex, ey)
+
+        if self._segment_leaves_boundary(start, end):
+            return False
+        if self._segment_crosses_obstacles(start, end):
+            return False
+        return True
+
+    def _choose_heading_with_avoidance(
+        self,
+        desired_heading_world,
+        step_distance,
+        allow_detour=True,
+        pose=None,
+    ):
+        """Pick a heading that is safe against both static map and LIDAR while progressing toward the goal."""
+        if pose is None:
+            pose = self._get_pose()
+
+        pose_heading_deg = pose['heading_deg']
         required_clearance = max(step_distance + CLEARANCE_MARGIN_M, OBSTACLE_STOP_DISTANCE_M)
 
-        forward_clear = self._heading_clearance(
-            desired_heading_world, pose_heading_deg, FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
-        )
+        if self._step_static_clear(pose, desired_heading_world, step_distance):
+            forward_clear = self._heading_clearance(
+                desired_heading_world,
+                pose_heading_deg,
+                FORWARD_SCAN_ANGLE_DEG,
+                OBSTACLE_LOOKAHEAD_M,
+            )
+        else:
+            forward_clear = 0.0
+
         if forward_clear >= required_clearance:
             return desired_heading_world
 
         if not allow_detour:
             return None
 
-        offsets = [0.0]
-        angle = DETOUR_ANGLE_STEP_DEG
-        while angle <= DETOUR_MAX_ANGLE_DEG:
-            offsets.extend([angle, -angle])
-            angle += DETOUR_ANGLE_STEP_DEG
+        candidates = []
+        if AXIS_ALIGNED_MOVES or DETOUR_AXIS_ALIGNED:
+            # Include desired heading first, then absolute axis headings to "reset" during detours
+            candidates.append(desired_heading_world)
+            candidates.extend([0.0, 90.0, -90.0, 180.0])
+        else:
+            offsets = [0.0]
+            angle = DETOUR_ANGLE_STEP_DEG
+            while angle <= DETOUR_MAX_ANGLE_DEG:
+                offsets.extend([angle, -angle])
+                angle += DETOUR_ANGLE_STEP_DEG
+            candidates = [normalize_angle_deg(desired_heading_world + off) for off in offsets]
 
         best_heading = None
         best_score = -math.inf
 
-        for offset in offsets:
-            candidate_world = normalize_angle_deg(desired_heading_world + offset)
-            clearance = self._heading_clearance(
-                candidate_world, pose_heading_deg, DETOUR_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
-            )
-            progress = max(0.0, math.cos(math.radians(offset)))  # Penalize turns that face away from goal
-
-            if clearance < required_clearance or progress <= 0.0:
+        for candidate_world in candidates:
+            if not self._step_static_clear(pose, candidate_world, step_distance):
                 continue
+
+            clearance = self._heading_clearance(
+                candidate_world,
+                pose_heading_deg,
+                DETOUR_SCAN_ANGLE_DEG,
+                OBSTACLE_LOOKAHEAD_M,
+            )
+            if clearance < required_clearance:
+                continue
+
+            if AXIS_ALIGNED_MOVES or DETOUR_AXIS_ALIGNED:
+                delta = abs(normalize_angle_deg(candidate_world - desired_heading_world))
+                if delta < 1.0:
+                    progress = 1.0
+                elif delta <= 90.0:
+                    progress = 0.5  # perpendicular detour is acceptable
+                else:
+                    progress = 0.1
+            else:
+                progress = max(0.0, math.cos(math.radians(normalize_angle_deg(candidate_world - desired_heading_world))))
+                if progress <= 0.0:
+                    continue
 
             score = clearance * progress
             if score > best_score:
@@ -846,6 +1182,15 @@ class OdomOnlyNavigator:
     def _front_clear(self, step_distance, heading_world=None):
         pose = self._get_pose()
         heading = pose['heading_deg'] if heading_world is None else heading_world
+        if not self._step_static_clear(pose, heading, step_distance):
+            self.logger.info(
+                "Static map blocks forward step: pose=(%.2f, %.2f) heading=%.1f° step=%.2f",
+                pose['x'],
+                pose['y'],
+                heading,
+                step_distance,
+            )
+            return False
         clearance = self._heading_clearance(
             heading, pose['heading_deg'], FORWARD_SCAN_ANGLE_DEG, step_distance + CLEARANCE_MARGIN_M
         )
@@ -930,52 +1275,83 @@ class OdomOnlyNavigator:
         return True
 
     def _rotate_to_heading(self, target_heading_world):
-        pose = self._get_pose()
-        current_heading = pose['heading_deg']
-        # World delta (CCW positive)
-        world_delta = normalize_angle_deg(target_heading_world - current_heading)
-        # MCU expects clockwise positive, so invert sign
-        command_delta = -world_delta
+        attempts = 0
+        while True:
+            pose = self._get_pose()
+            current_heading = pose['heading_deg']
+            # World delta (CCW positive)
+            world_delta = normalize_angle_deg(target_heading_world - current_heading)
+            if abs(world_delta) <= ANGLE_TOLERANCE_DEG:
+                return True
+            # NEW: nếu sai số nhỏ hơn min rotate thì chấp nhận luôn, không cố quay nữa
+            # vì quay thêm 1 bước min chắc chắn sẽ overshoot và ping–pong.
+            if abs(world_delta) <= MIN_ROTATE_COMMAND_DEG:
+                self.logger.info(
+                    "Rotate_to_heading: remaining error %.1f° < MIN_ROTATE_COMMAND_DEG=%.1f°; "
+                    "accepting heading to avoid oscillation.",
+                    abs(world_delta),
+                    MIN_ROTATE_COMMAND_DEG,
+                )
+                return True
+            # Prefer a deterministic direction for ~180° turns to avoid oscillation
+            if abs(world_delta) >= 179.0:
+                world_delta = -180.0 if PREFER_CW_FOR_180 else 180.0
+            # MCU expects clockwise positive, so invert sign
+            command_delta = -world_delta
+            command_delta = self._clamp_rotate_command(command_delta)
+            world_delta = -command_delta  # keep world delta in sync after clamp
 
-        self.logger.info(
-            "Rotate_to_heading: current=%.1f°, target=%.1f°, world_delta=%.1f°, command_delta=%.1f°",
-            current_heading, target_heading_world, world_delta, command_delta
-        )
-        ok = self._send_rotate(command_delta, target_heading_world, world_delta=world_delta)
-        if ok:
-            # On success, apply world delta
-            self._update_pose_after_rotate(world_delta)
-            return True
-        # If rotation reported failure, check if we're already close enough
-        pose_after = self._get_pose()
-        err = abs(normalize_angle_deg(target_heading_world - pose_after['heading_deg']))
-        if err <= ANGLE_TOLERANCE_DEG:
             self.logger.info(
-                "Rotation reported failure but heading within tolerance (err=%.1f° <= %.1f°); accepting.",
-                err, ANGLE_TOLERANCE_DEG
+                "Rotate_to_heading: current=%.1f°, target=%.1f°, step_world=%.1f°, command_delta=%.1f°",
+                current_heading, target_heading_world, world_delta, command_delta
             )
-            return True
-        return False
+            ok = self._send_rotate(command_delta, target_heading_world, world_delta=world_delta)
+            if ok:
+                # Pose already updated inside _send_rotate using actual odom; do not add again.
+                continue
 
-    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None, check_static=False):
+            attempts += 1
+            pose_after = self._get_pose()
+            err_after = abs(normalize_angle_deg(target_heading_world - pose_after['heading_deg']))
+            tol = ANGLE_TOLERANCE_DEG if abs(world_delta) < 150.0 else max(ANGLE_TOLERANCE_DEG, 5.0)
+            if err_after <= tol:
+                self.logger.info(
+                    "Rotation attempt failed but heading within tolerance (err=%.1f° <= %.1f°); accepting.",
+                    err_after, tol
+                )
+                return True
+            if attempts >= 3:
+                self.logger.warning("Rotation failed after multiple attempts.")
+                return False
+            # Loop until heading error is within tolerance
+
+    def _drive_step(self, desired_heading_world, step_distance, allow_detour=True, current_pose=None, check_static=True):
         """
         Drive one step toward desired_heading_world.
-        - When allow_detour is False (perimeter verification), we bypass LIDAR gating to guarantee
-          the robot keeps tracing the boundary; obstacle avoidance is not applied.
-        - check_static is kept for compatibility but defaults to False so local motion
-          relies on LIDAR; static obstacles should be handled by the global planner.
+        - When allow_detour is False (perimeter verification), we rotate/move in the requested
+          direction without exploring detours, but still gate by LIDAR/static safety.
+        - check_static is kept for compatibility; static checks are always applied.
         """
-        start_point = current_pose if current_pose else (self._get_pose()['x'], self._get_pose()['y'])
+        if current_pose:
+            pose = {'x': current_pose[0], 'y': current_pose[1], 'heading_deg': self._get_pose()['heading_deg']}
+        else:
+            pose = self._get_pose()
 
         if not allow_detour:
-            # Pure odom move: rotate then move, ignore LIDAR/obstacle sampling.
+            # Rotate then move in-place without exploring alternate headings.
+            if not self._step_static_clear(pose, desired_heading_world, step_distance):
+                self.logger.warning("Static map blocks requested step; aborting move.")
+                return False
             if not self._rotate_to_heading(desired_heading_world):
                 return False
             # Simple safety gate: if LIDAR says blocked, abort
             if self.first_scan_event.is_set():
+                pose['heading_deg'] = self._get_pose()['heading_deg']
                 heading_clear = self._heading_clearance(
-                    desired_heading_world, self._get_pose()['heading_deg'],
-                    FORWARD_SCAN_ANGLE_DEG, OBSTACLE_LOOKAHEAD_M
+                    desired_heading_world,
+                    pose['heading_deg'],
+                    FORWARD_SCAN_ANGLE_DEG,
+                    step_distance + CLEARANCE_MARGIN_M,
                 )
                 if heading_clear < OBSTACLE_STOP_DISTANCE_M:
                     self.logger.warning("Obstacle detected ahead; stopping move step.")
@@ -990,7 +1366,13 @@ class OdomOnlyNavigator:
                 attempts += 1
                 continue
 
-            chosen_heading = self._choose_heading_with_avoidance(desired_heading_world, step_distance, allow_detour)
+            pose['heading_deg'] = self._get_pose()['heading_deg']
+            chosen_heading = self._choose_heading_with_avoidance(
+                desired_heading_world,
+                step_distance,
+                allow_detour=True,
+                pose=pose,
+            )
             if chosen_heading is None:
                 attempts += 1
                 self.logger.warning("Path blocked; waiting for an opening...")
@@ -1007,7 +1389,44 @@ class OdomOnlyNavigator:
         return False
 
     # --- Navigation logic ---
-    def navigate_to(self, goal, allow_detour=True):
+    def _navigate_with_planner(self, goal, tolerance_m=DISTANCE_TOLERANCE_M):
+        """Navigate to goal using A* over static + live LIDAR obstacles with replans on interruption."""
+        replan_count = 0
+        while True:
+            pose = self._get_pose()
+            dx = goal[0] - pose['x']
+            dy = goal[1] - pose['y']
+            distance = math.hypot(dx, dy)
+            if distance < tolerance_m:
+                return True
+
+            # Try visibility-graph planner first for small/tight maps
+            path = self._plan_path_visibility((pose['x'], pose['y']), goal)
+            if path is None:
+                path = self._plan_path_astar((pose['x'], pose['y']), goal)
+            if not path:
+                self.logger.warning("Planner failed to find path to %s; falling back to reactive LIDAR detours.", goal)
+                # Reactive fallback: local navigation using LIDAR avoidance (no static checks)
+                return self._navigate_direct(
+                    goal,
+                    allow_detour=True,
+                    check_static=False,
+                    tolerance_m=tolerance_m,
+                )
+            self.logger.info("Planner produced %d waypoint(s). Executing...", len(path))
+
+            if self._follow_path(path):
+                continue  # Check distance again; may need another short plan
+
+            replan_count += 1
+            if replan_count >= PLANNER_MAX_REPLANS:
+                self.logger.warning("Navigation aborted after %d replans.", replan_count)
+                return False
+            self.logger.info("Replanning after interruption (attempt %d/%d)...", replan_count, PLANNER_MAX_REPLANS)
+            time.sleep(0.1)
+
+    def navigate_to(self, goal, allow_detour=True, tolerance_m=None):
+        tolerance = DISTANCE_TOLERANCE_M if tolerance_m is None else tolerance_m
         if not self.first_scan_event.is_set():
             self.logger.info("Waiting for initial LIDAR data...")
             self.first_scan_event.wait(timeout=3.0)
@@ -1016,181 +1435,28 @@ class OdomOnlyNavigator:
             self.logger.warning("navigate_to(%s) rejected: goal invalid wrt map.", goal)
             raise ValueError("Goal lies inside an obstacle")
 
-        # Non-axis-aligned fallback: preserve previous behavior
-        if not AXIS_ALIGNED_MOVES:
-            # Simple A* path plan using static obstacles if detour is allowed
-            waypoints = None
-            if allow_detour:
-                pose = self._get_pose()
-                start = (pose['x'], pose['y'])
-                waypoints = self._plan_path_astar(start, goal)
-                if waypoints:
-                    self.logger.info("Planner produced %d waypoint(s).", len(waypoints))
-                else:
-                    self.logger.info("Planner failed; falling back to direct navigation with LIDAR-only avoidance.")
-                    waypoints = [goal]
+        # Prefer planner-based navigation (uses live LIDAR + static map)
+        if self.boundary_polygon:
+            if self._navigate_with_planner(goal, tolerance_m=tolerance):
+                self.logger.info("Goal reached.")
             else:
-                waypoints = [goal]
-
-            for wp in waypoints:
-                if not self._navigate_direct(
-                    wp,
-                    allow_detour=allow_detour,
-                    check_static=False if len(waypoints) > 1 else False,
-                ):
-                    return
-            self.logger.info("Goal reached.")
+                self.logger.warning("Navigation ended without reaching goal.")
             return
 
-        # Axis-aligned L-shape: two segments (X then Y)
-        pose = self._get_pose()
-        segments = [
-            (goal[0], pose['y']),  # X segment
-            (goal[0], goal[1]),    # Y segment
-        ]
-
-        for segment_goal in segments:
-            # Fix axis and heading for this segment once at start
-            segment_start = self._get_pose()
-            seg_dx = segment_goal[0] - segment_start['x']
-            seg_dy = segment_goal[1] - segment_start['y']
-            if abs(seg_dx) >= abs(seg_dy):
-                segment_axis = "X"
-                segment_base_heading = 0.0 if seg_dx >= 0 else 180.0
-            else:
-                segment_axis = "Y"
-                segment_base_heading = 90.0 if seg_dy >= 0 else -90.0
-
-            state = STATE_GOAL_FOLLOW
-            detour_side = "RIGHT"
-            side_switches = 0
-
-            # If detour is disabled, perform simple rotate+move with LIDAR gate
-            if not allow_detour:
-                while True:
-                    pose = self._get_pose()
-                    dx = segment_goal[0] - pose['x']
-                    dy = segment_goal[1] - pose['y']
-                    distance = math.hypot(dx, dy)
-                    if distance < DISTANCE_TOLERANCE_M:
-                        break
-                    if abs(dx) >= DISTANCE_TOLERANCE_M:
-                        base_heading = 0.0 if dx >= 0 else 180.0
-                    else:
-                        base_heading = 90.0 if dy >= 0 else -90.0
-                    if not self._close_enough_heading(base_heading):
-                        self._rotate_to_heading(base_heading)
-                    if self.first_scan_event.is_set() and not self._front_clear(distance, heading_world=base_heading):
-                        self.logger.warning("Path blocked and detour disabled; aborting segment.")
-                        return
-                    if not self._send_move(distance):
-                        self.logger.warning("Move failed and detour disabled; aborting segment.")
-                        return
-                continue
-
-            while True:
-                pose = self._get_pose()
-                dx = segment_goal[0] - pose['x']
-                dy = segment_goal[1] - pose['y']
-                distance = math.hypot(dx, dy)
-
-                # Debug the segment state machine
-                self.logger.info(
-                    "[SEGMENT DEBUG] axis=%s base_heading=%.1f° state=%s detour=%s "
-                    "pose=(%.2f, %.2f, %.1f°) dx=%.2f dy=%.2f dist=%.2f",
-                    segment_axis,
-                    segment_base_heading,
-                    state,
-                    detour_side,
-                    pose['x'],
-                    pose['y'],
-                    pose['heading_deg'],
-                    dx,
-                    dy,
-                    distance
-                )
-
-                if distance < DISTANCE_TOLERANCE_M:
-                    break  # Segment complete
-
-                base_heading = segment_base_heading
-
-                if state == STATE_GOAL_FOLLOW:
-                    if not self._close_enough_heading(base_heading):
-                        self._rotate_to_heading(base_heading)
-
-                    step = min(MOVE_STEP_M, distance)
-                    if step < DISTANCE_TOLERANCE_M:
-                        continue
-
-                    if self._front_clear(step):
-                        if not self._send_move(step):
-                            # Treat failed move as obstacle encounter
-                            state = STATE_OBSTACLE_FOLLOW
-                            detour_side = "RIGHT"
-                            side_switches = 0
-                        continue
-
-                    # Blocked ahead: choose detour side
-                    preferred = "RIGHT"
-                    if not self._detour_side_available(pose, base_heading, preferred):
-                        preferred = "LEFT"
-                    detour_side = preferred
-                    detour_heading = self._detour_heading(base_heading, detour_side)
-                    self.logger.info(
-                        "[DETOUR] Blocked ahead → detour_side=%s, detour_heading=%.1f°",
-                        detour_side, detour_heading
-                    )
-                    self._rotate_to_heading(detour_heading)
-                    state = STATE_OBSTACLE_FOLLOW
-                    side_switches = 0
-                    continue
-
-                if state == STATE_OBSTACLE_FOLLOW:
-                    # Can we return to base path?
-                    if self._path_to_goal_clear(pose, segment_goal, base_heading):
-                        self.logger.info(
-                            "[RETURN_TO_PATH] Path clear → switching to GOAL_FOLLOW heading %.1f°",
-                            base_heading
-                        )
-                        self._rotate_to_heading(base_heading)
-                        state = STATE_GOAL_FOLLOW
-                        detour_side = "RIGHT"
-                        side_switches = 0
-                        continue
-
-                    detour_heading = self._detour_heading(base_heading, detour_side)
-                    step = min(MOVE_STEP_M, distance)
-                    if step < DISTANCE_TOLERANCE_M:
-                        continue
-
-                    moved = self._drive_step(
-                        detour_heading,
-                        step,
-                        allow_detour=True,
-                        current_pose=(pose['x'], pose['y']),
-                    )
-                    if moved:
-                        # Made progress along detour; continue following obstacle
-                        continue
-
-                    # Detour heading blocked: switch side and retry
-                    self.logger.info(
-                        "Detour side %s blocked when following obstacle; switching side.",
-                        detour_side,
-                    )
-                    detour_side = "LEFT" if detour_side == "RIGHT" else "RIGHT"
-                    side_switches += 1
-                    if side_switches > MAX_SIDE_SWITCHES:
-                        self.logger.warning("Too many detour side switches; aborting segment.")
-                        raise RuntimeError("Segment blocked after obstacle-follow retries")
-                    continue
-
+        # Fallback when no boundary/map available: drive direct with detours
+        if not self._navigate_direct(
+            goal,
+            allow_detour=allow_detour,
+            check_static=False,
+            tolerance_m=tolerance,
+        ):
+            return
         self.logger.info("Goal reached.")
 
 
     # --- CLI loop ---
     def run(self):
+        self.logger.info("Config loaded from: robot_config.json")
         self.logger.info(
             "Startup config serial_port=%s baud=%s lidar_port=%s kafka_bootstrap=%s robot_id=%s axis_aligned=%s",
             SERIAL_PORT,
@@ -1266,7 +1532,7 @@ class OdomOnlyNavigator:
                 self._send_status()
             except Exception:
                 pass
-            time.sleep(5.0)
+            time.sleep(1.0)
 
     # --- Kafka command handlers ---
     def _handle_kafka_command(self, envelope):
@@ -1320,7 +1586,7 @@ class OdomOnlyNavigator:
         boundary_anchor_set = False
 
         raw_pois = self.map_definition.get("pointsOfInterest") or []
-        obstacles = self.map_definition.get("obstacles") or []
+        obstacles = (self.map_definition.get("obstacles") or []) + (self.map_definition.get("restricted") or [])
         boundary_pts = (self.map_definition.get("boundary") or {}).get("points") or []
 
         # Anchor boundary to current pose
@@ -1371,7 +1637,7 @@ class OdomOnlyNavigator:
                     boundary_poly[0][0], boundary_poly[0][1], len(boundary_poly)
                 )
 
-        # Anchor obstacles using same offset if boundary exists
+        # Anchor obstacles/restricted using same offset if boundary exists
         for obs in obstacles:
             pts = obs.get("points") or []
             polygon = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in pts if p.get("x") is not None and p.get("y") is not None]
@@ -1403,7 +1669,7 @@ class OdomOnlyNavigator:
         else:
             self.logger.info("Boundary not present in map definition.")
         self.logger.info(
-            "Loaded map data: obstacles=%s pois=%s",
+            "Loaded map data: obstacles+restricted=%s pois=%s",
             len(self.obstacles),
             len(self.points_of_interest),
         )
@@ -1439,7 +1705,7 @@ class OdomOnlyNavigator:
 
         return {'x': x_raw, 'y': y_raw, 'heading_deg': heading_raw}
 
-    def _point_in_polygon(self, point, polygon, epsilon=1e-6):
+    def _point_in_polygon(self, point, polygon, epsilon=1e-3):
         x, y = point
         inside = False
         n = len(polygon)
@@ -1517,13 +1783,149 @@ class OdomOnlyNavigator:
             return False
         return True
 
+    def _plan_path_visibility(self, start, goal):
+        """
+        Simple visibility-graph planner using polygon vertices.
+        Returns list of waypoints (including goal) or None if no path.
+        """
+        if self._direct_path_clear(start, goal):
+            return [goal]
+
+        nodes = [start, goal]
+        # Add boundary vertices
+        if self.boundary_polygon:
+            nodes.extend(self.boundary_polygon)
+        # Add obstacle vertices
+        for obs in self.obstacles:
+            nodes.extend(obs)
+
+        # Build visibility edges
+        n = len(nodes)
+        graph = {i: [] for i in range(n)}
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                a = nodes[i]
+                b = nodes[j]
+                if self._segment_crosses_obstacles(a, b):
+                    continue
+                if self._segment_leaves_boundary(a, b):
+                    continue
+                dist = math.hypot(b[0] - a[0], b[1] - a[1])
+                graph[i].append((j, dist))
+                graph[j].append((i, dist))
+
+        # Dijkstra from start (0) to goal (1)
+        import heapq
+        start_idx = 0
+        goal_idx = 1
+        heap = [(0.0, start_idx)]
+        dist_map = {start_idx: 0.0}
+        prev = {}
+
+        while heap:
+            d, u = heapq.heappop(heap)
+            if u == goal_idx:
+                break
+            if d != dist_map.get(u, math.inf):
+                continue
+            for v, w in graph.get(u, []):
+                nd = d + w
+                if nd < dist_map.get(v, math.inf):
+                    dist_map[v] = nd
+                    prev[v] = u
+                    heapq.heappush(heap, (nd, v))
+
+        if goal_idx not in prev and goal_idx != start_idx:
+            return None
+
+        # Reconstruct path (exclude start)
+        path_indices = [goal_idx]
+        while path_indices[-1] != start_idx:
+            path_indices.append(prev[path_indices[-1]])
+        path_indices.reverse()
+        waypoints = [nodes[i] for i in path_indices[1:]]
+        return waypoints
+
+    def _path_clear_with_lidar(self, start, goal):
+        """Check whether LIDAR sees a clear corridor from start->goal."""
+        if not self.first_scan_event.is_set():
+            return True
+        distance = math.hypot(goal[0] - start[0], goal[1] - start[1])
+        if distance < DISTANCE_TOLERANCE_M:
+            return True
+        heading_world = math.degrees(math.atan2(goal[1] - start[1], goal[0] - start[0]))
+        pose_heading = self._get_pose()['heading_deg']
+        clearance = self._heading_clearance(
+            heading_world,
+            pose_heading,
+            FORWARD_SCAN_ANGLE_DEG,
+            distance + CLEARANCE_MARGIN_M,
+        )
+        required = min(distance, OBSTACLE_STOP_DISTANCE_M + CLEARANCE_MARGIN_M)
+        return clearance >= required
+
+    def _lidar_blocked_cells(self, min_x, min_y, max_x, max_y):
+        """
+        Build a set of grid cells blocked by live LIDAR returns (inflated by robot radius).
+        Returns grid coords (gx, gy) consistent with planner's to_grid() rounding.
+        """
+        if not self.first_scan_event.is_set():
+            return set()
+        scan = self._get_scan_snapshot()
+        if not scan:
+            return set()
+
+        pose = self._get_pose()
+        heading = pose['heading_deg']
+        inflation = ROBOT_RADIUS_M + CLEARANCE_MARGIN_M
+        inflation_cells = max(1, math.ceil(inflation / ASTAR_GRID_STEP_M))
+        blocked = set()
+
+        def to_grid(val, offset):
+            # Use floor to keep monotonic grid indexing and avoid skipping indices due to rounding.
+            return int(math.floor((val - offset) / ASTAR_GRID_STEP_M + 1e-6))
+
+        for _, raw_angle_deg, dist_mm in scan:
+            if dist_mm <= 0:
+                continue
+            dist_m = dist_mm / 1000.0
+            if dist_m < MIN_VALID_LIDAR_DIST_M or dist_m > OBSTACLE_LOOKAHEAD_M:
+                continue
+
+            robot_angle = lidar_angle_to_robot(raw_angle_deg)
+            world_angle_rad = math.radians(normalize_angle_deg(heading + robot_angle))
+            wx = pose['x'] + dist_m * math.cos(world_angle_rad)
+            wy = pose['y'] + dist_m * math.sin(world_angle_rad)
+
+            if wx < min_x - inflation or wx > max_x + inflation or wy < min_y - inflation or wy > max_y + inflation:
+                continue
+
+            cx = to_grid(wx, min_x)
+            cy = to_grid(wy, min_y)
+
+            for dx in range(-inflation_cells, inflation_cells + 1):
+                for dy in range(-inflation_cells, inflation_cells + 1):
+                    gx = cx + dx
+                    gy = cy + dy
+                    center_x = min_x + gx * ASTAR_GRID_STEP_M
+                    center_y = min_y + gy * ASTAR_GRID_STEP_M
+                    if math.hypot(center_x - wx, center_y - wy) <= inflation + (ASTAR_GRID_STEP_M * 0.5):
+                        blocked.add((gx, gy))
+
+        if blocked:
+            self.logger.info("Planner: LIDAR contributed %d blocked cells.", len(blocked))
+        return blocked
+
     def _plan_path_astar(self, start, goal):
         """
         Very simple grid-based A* planner on anchored frame.
         Returns list of waypoints (including goal) or None if no path.
         """
         if self._direct_path_clear(start, goal):
-            return [goal]
+            if self._path_clear_with_lidar(start, goal):
+                return [goal]
+            self.logger.info("Direct path blocked by live LIDAR; computing detour via A*.") 
 
         if not self.boundary_polygon:
             self.logger.info("Planner abort: no boundary polygon.")
@@ -1536,10 +1938,15 @@ class OdomOnlyNavigator:
         margin = ASTAR_GRID_STEP_M
 
         def to_grid(val, offset):
-            return round((val - offset) / ASTAR_GRID_STEP_M)
+            # Use floor to keep monotonic grid indexing and avoid skipping indices due to rounding.
+            return int(math.floor((val - offset) / ASTAR_GRID_STEP_M + 1e-6))
 
         start_g = (to_grid(start[0], min_x), to_grid(start[1], min_y))
         goal_g = (to_grid(goal[0], min_x), to_grid(goal[1], min_y))
+
+        lidar_blocked = self._lidar_blocked_cells(min_x, min_y, max_x, max_y)
+        lidar_blocked.discard(start_g)
+        lidar_blocked.discard(goal_g)
 
         # Precompute free cells
         free = set()
@@ -1548,8 +1955,13 @@ class OdomOnlyNavigator:
         while x <= max_x + margin:
             y = min_y + ASTAR_GRID_STEP_M * 0.5
             while y <= max_y + margin:
+                cell = (to_grid(x, min_x), to_grid(y, min_y))
+                if cell in lidar_blocked:
+                    y += ASTAR_GRID_STEP_M
+                    count_nodes += 1
+                    continue
                 if self._point_free((x, y)):
-                    free.add((to_grid(x, min_x), to_grid(y, min_y)))
+                    free.add(cell)
                 y += ASTAR_GRID_STEP_M
                 count_nodes += 1
                 if count_nodes > ASTAR_MAX_NODES:
@@ -1559,13 +1971,37 @@ class OdomOnlyNavigator:
                 break
             x += ASTAR_GRID_STEP_M
 
-        if start_g not in free or goal_g not in free:
+        # Ensure start/goal are considered free if they lie on boundary edges but not sampled
+        if start_g not in free and self._point_free(start):
+            free.add(start_g)
+        if goal_g not in free and self._point_free(goal):
+            free.add(goal_g)
+
+        # If start/goal still not free, snap to nearest free cell (within sampled space)
+        def nearest_free(cell):
+            if cell in free:
+                return cell
+            if not free:
+                return None
+            cx, cy = cell
+            best = min(free, key=lambda f: abs(f[0] - cx) + abs(f[1] - cy))
+            return best
+
+        start_snap = nearest_free(start_g)
+        goal_snap = nearest_free(goal_g)
+        if start_snap is None or goal_snap is None:
             self.logger.info(
-                "Planner abort: start/goal not in free space (start_free=%s, goal_free=%s)",
+                "Planner abort: no free cells after sampling (start_free=%s, goal_free=%s)",
                 start_g in free,
                 goal_g in free,
             )
             return None
+        if start_snap != start_g:
+            self.logger.info("Planner snapped start cell %s -> %s", start_g, start_snap)
+            start_g = start_snap
+        if goal_snap != goal_g:
+            self.logger.info("Planner snapped goal cell %s -> %s", goal_g, goal_snap)
+            goal_g = goal_snap
 
         import heapq
         open_set = []
@@ -1612,6 +2048,181 @@ class OdomOnlyNavigator:
         self.logger.info("Planner failed to find path after visiting %d nodes (cap=%d).", visited, ASTAR_MAX_NODES)
         return None
 
+    def _path_to_segments(self, start, waypoints):
+        """Convert waypoints into straight segments with heading + total distance."""
+        segments = []
+        prev = start
+        for wp in waypoints:
+            dx = wp[0] - prev[0]
+            dy = wp[1] - prev[1]
+            distance = math.hypot(dx, dy)
+            if distance < DISTANCE_TOLERANCE_M:
+                prev = wp
+                continue
+            heading = normalize_angle_deg(math.degrees(math.atan2(dy, dx)))
+            if segments and abs(normalize_angle_deg(heading - segments[-1]['heading'])) < 1.0:
+                segments[-1]['distance'] += distance
+                segments[-1]['target'] = wp
+            else:
+                segments.append({'heading': heading, 'distance': distance, 'target': wp})
+            prev = wp
+        return segments
+
+    def _segment_blocked_by_lidar(self, heading_world, distance):
+        """
+        Quick live check: does the corridor for this segment already look blocked by LIDAR?
+        If yes, we bail early to allow a replan that incorporates the current scan.
+        """
+        if not self.first_scan_event.is_set():
+            return False
+        pose = self._get_pose()
+        end = (
+            pose['x'] + distance * math.cos(math.radians(heading_world)),
+            pose['y'] + distance * math.sin(math.radians(heading_world)),
+        )
+        # Use a slightly looser requirement than move-stop threshold so we can creep away from walls.
+        clear = self._heading_clearance(
+            heading_world,
+            pose['heading_deg'],
+            FORWARD_SCAN_ANGLE_DEG,
+            distance + CLEARANCE_MARGIN_M,
+        )
+        required = min(distance, OBSTACLE_STOP_DISTANCE_M)
+        if clear < required:
+            self.logger.info(
+                "Live LIDAR blocks segment: start=(%.2f, %.2f) heading=%.1f° dist=%.2f (clear=%.2f<%.2f) -> replan",
+                pose['x'], pose['y'], heading_world, distance, clear, required
+            )
+            return True
+        return False
+
+    def _escape_right_detour(self, forward_heading, forward_step):
+        """
+        Reactive escape when front is blocked: try a right-hand sidestep, then return
+        to original heading. Returns True if, after the detour, the original heading
+        looks clear enough to continue.
+        """
+        pose = self._get_pose()
+        base_heading = pose['heading_deg']
+        side_heading = normalize_angle_deg(base_heading - 90.0)
+        sidestep = max(MIN_MOVE_COMMAND_M, min(0.25, MAX_MOVE_COMMAND_M))
+
+        # Check static & LIDAR for the sidestep itself
+        if not self._step_static_clear(pose, side_heading, sidestep):
+            return False
+        side_clear = self._heading_clearance(
+            side_heading,
+            base_heading,
+            FORWARD_SCAN_ANGLE_DEG,
+            sidestep + CLEARANCE_MARGIN_M,
+        )
+        if side_clear < min(sidestep, OBSTACLE_STOP_DISTANCE_M * 0.8):
+            return False
+
+        # Execute sidestep
+        if not self._rotate_to_heading(side_heading):
+            return False
+        if not self._send_move(sidestep):
+            return False
+
+        # Return to original heading
+        if not self._rotate_to_heading(base_heading):
+            return False
+        time.sleep(0.2)  # let LIDAR settle
+
+        # Check whether forward is now clear
+        pose = self._get_pose()
+        forward_clear = self._heading_clearance(
+            forward_heading,
+            pose['heading_deg'],
+            FORWARD_SCAN_ANGLE_DEG,
+            forward_step + CLEARANCE_MARGIN_M,
+        )
+        required = min(forward_step, OBSTACLE_STOP_DISTANCE_M)
+        return forward_clear >= required
+
+    def _escape_clockwise_loop(self, forward_heading, forward_step):
+        """
+        Stronger escape: try up to 4 clockwise headings (90° increments), moving a short
+        distance if clear, then returning to the original forward heading.
+        """
+        base_heading = self._get_pose()['heading_deg']
+        step = max(MIN_MOVE_COMMAND_M, min(0.25, MAX_MOVE_COMMAND_M))
+        for i in range(4):
+            side_heading = normalize_angle_deg(base_heading - 90.0 * (i + 1))
+            pose = self._get_pose()
+            if not self._step_static_clear(pose, side_heading, step):
+                continue
+            side_clear = self._heading_clearance(
+                side_heading,
+                pose['heading_deg'],
+                FORWARD_SCAN_ANGLE_DEG,
+                step + CLEARANCE_MARGIN_M,
+            )
+            if side_clear < min(step, OBSTACLE_STOP_DISTANCE_M * 0.8):
+                continue
+
+            self.logger.info(
+                "Escape clockwise attempt %d: heading=%.1f°, step=%.2fm (clear=%.2f)",
+                i + 1, side_heading, step, side_clear
+            )
+
+            if not self._rotate_to_heading(side_heading):
+                continue
+            if not self._send_move(step):
+                continue
+            if not self._rotate_to_heading(base_heading):
+                continue
+            time.sleep(0.2)
+
+            pose = self._get_pose()
+            forward_clear = self._heading_clearance(
+                forward_heading,
+                pose['heading_deg'],
+                FORWARD_SCAN_ANGLE_DEG,
+                forward_step + CLEARANCE_MARGIN_M,
+            )
+            required = min(forward_step, OBSTACLE_STOP_DISTANCE_M)
+            self.logger.info(
+                "Post-escape forward check: heading=%.1f°, clear=%.2f required=%.2f",
+                forward_heading, forward_clear, required
+            )
+            if forward_clear >= required:
+                return True
+        return False
+
+    def _execute_segment_move(self, heading_world, distance):
+        """Rotate to heading_world then move distance, chunked by min/max move command."""
+        remaining = distance
+        while remaining > DISTANCE_TOLERANCE_M:
+            if not self._close_enough_heading(heading_world):
+                if not self._rotate_to_heading(heading_world):
+                    return False
+            step = min(remaining, MAX_MOVE_COMMAND_M)
+            step = self._clamp_move_command(step)
+            if self._segment_blocked_by_lidar(heading_world, step):
+                # Try a quick right-hand sidestep to clear the blockage
+                if self._escape_right_detour(heading_world, step):
+                    continue  # After detour, re-evaluate the same segment from new pose
+                if self._escape_clockwise_loop(heading_world, step):
+                    continue
+                return False
+            if not self._send_move(step):
+                return False
+            remaining = max(0.0, remaining - step)
+        return True
+
+    def _follow_path(self, waypoints):
+        """Execute a path (list of waypoints) using rotate+move primitives."""
+        start_pose = self._get_pose()
+        segments = self._path_to_segments((start_pose['x'], start_pose['y']), waypoints)
+        for seg in segments:
+            if not self._rotate_to_heading(seg['heading']):
+                return False
+            if not self._execute_segment_move(seg['heading'], seg['distance']):
+                return False
+        return True
+
     def _goal_valid(self, goal):
         if self.boundary_polygon and not self._point_in_polygon(goal, self.boundary_polygon):
             self.logger.warning(
@@ -1642,6 +2253,13 @@ class OdomOnlyNavigator:
             self.logger.info(
                 "Segment %s -> %s leaves boundary: start inside, end outside.",
                 start, end
+            )
+            return True
+        if not inside_start and not inside_end:
+            self.logger.warning(
+                "Segment %s -> %s is outside boundary (start and end).",
+                start,
+                end,
             )
             return True
         self.logger.debug(
@@ -1682,12 +2300,16 @@ class OdomOnlyNavigator:
         elif cmd == "navigate_to_poi":
             args = payload.get("args") or {}
             poi_id = args.get("poiId")
+            # Ensure map is loaded before resolving POI (first command can race map definition)
+            if not self.map_loaded_event.is_set():
+                self.logger.info("Waiting for map definition before executing navigate_to_poi...")
+                self.map_loaded_event.wait(timeout=3.0)
             goal = self._find_poi(poi_id)
             if goal is None:
-                self._send_ack(correlation_id, cmd, False, f"POI {poi_id} not found")
+                self._send_ack(correlation_id, cmd, False, f"POI {poi_id} not found or map not loaded")
                 return
             try:
-                self.navigate_to(goal)
+                self.navigate_to(goal, tolerance_m=POI_TOLERANCE_M)
                 self._send_ack(correlation_id, cmd, True, None)
                 self._send_status()
             except Exception as exc:
@@ -1729,6 +2351,31 @@ class OdomOnlyNavigator:
         if not self.kafka_bridge:
             return
         pose_anchor = self._get_pose()
+
+        # If a MOVE is in-flight, fuse live progress for status only (do not mutate pose)
+        current_odom = self._get_stm32_odom()
+        self._accumulate_active_motion_progress(current_odom)
+        with self.active_motion_lock:
+            active = dict(self.active_motion) if self.active_motion else None
+        if active:
+            progress_capped = min(
+                active.get('progress', 0.0),
+                active.get('target', float('inf'))
+            )
+            if active.get('mode') == 'rotate':
+                fused_pose = self._compose_rotation_pose(
+                    active['start_pose'],
+                    progress_capped,
+                    sign=active.get('sign', 1.0),
+                )
+            else:
+                fused_pose = self._compose_progress_pose(
+                    active['start_pose'],
+                    progress_capped,
+                    heading_deg=active.get('heading', active['start_pose']['heading_deg']),
+                )
+            pose_anchor = fused_pose
+
         pose_raw = self._pose_anchor_to_raw(pose_anchor)
         # Publish heading in raw map frame; do not add hardware offset here
         heading_deg = normalize_angle_deg(pose_raw['heading_deg'])
@@ -1920,7 +2567,7 @@ class OdomOnlyNavigator:
 
         return self._send_move(distance, monitor_lidar=True)
 
-    def _navigate_direct(self, goal, allow_detour=True, check_static=True):
+    def _navigate_direct(self, goal, allow_detour=True, check_static=True, tolerance_m=DISTANCE_TOLERANCE_M):
         """
         Navigate toward goal using incremental steps (non-axis-aligned), with optional detour avoidance.
         """
@@ -1929,11 +2576,11 @@ class OdomOnlyNavigator:
             dx = goal[0] - pose['x']
             dy = goal[1] - pose['y']
             distance = math.hypot(dx, dy)
-            if distance < DISTANCE_TOLERANCE_M:
+            if distance < tolerance_m:
                 return True
             desired_heading = math.degrees(math.atan2(dy, dx))
             step_distance = min(MOVE_STEP_M, distance)
-            if step_distance < DISTANCE_TOLERANCE_M:
+            if step_distance < tolerance_m:
                 continue
             if not self._drive_step(
                 desired_heading,
