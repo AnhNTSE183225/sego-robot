@@ -304,22 +304,24 @@ class STM32Tester:
     # ROTATE_DEG COMMAND - Replicates odom_only_navigator.py behavior EXACTLY
     # =========================================================================
     
-    def rotate_deg(self, angle_deg):
+    def rotate_deg(self, angle_deg, repeat_count=1):
         """
         Send ROTATE_DEG command to STM32 with discrete angle quantization and calibration.
         
         This replicates _send_rotate() from odom_only_navigator.py with enhancements:
         - Quantizes requested angle to nearest allowed discrete angle (30°, 60°, 90°, etc.)
         - Applies angle-specific calibration factor from robot_config.json
+        - Can repeat rotation multiple times without resetting odometry (for testing)
         - "OK ROTATE_DEG" = command received, rotation started
         - "TARGET_REACHED" = rotation completed successfully
         - "TIMEOUT" = rotation timed out
         
         Args:
             angle_deg: Requested rotation angle in degrees (will be quantized)
+            repeat_count: Number of times to repeat the rotation (default: 1)
         
         Returns:
-            True if rotation completed successfully
+            True if all rotations completed successfully
         """
         # Step 1: Quantize to nearest allowed angle
         quantized_angle = self.quantize_rotation_angle(angle_deg)
@@ -330,49 +332,88 @@ class STM32Tester:
         calibration_scale = self.get_calibration_scale(quantized_angle)
         calibrated_angle = quantized_angle * calibration_scale
         
-        self.logger.info(
-            f"Rotation: requested={angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
-            f"scale={calibration_scale:.4f}, calibrated={calibrated_angle:.2f}°"
-        )
+        if repeat_count > 1:
+            self.logger.info(
+                f"Rotation: requested={angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
+                f"scale={calibration_scale:.4f}, calibrated={calibrated_angle:.2f}°, "
+                f"repeat={repeat_count}x"
+            )
+        else:
+            self.logger.info(
+                f"Rotation: requested={angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
+                f"scale={calibration_scale:.4f}, calibrated={calibrated_angle:.2f}°"
+            )
         
         rotate_timeout = self.config.get('motion', {}).get('rotate_timeout_sec', 15.0)
         rotate_timeout_tol = self.config.get('obstacle_avoidance', {}).get('rotate_timeout_tolerance_deg', 15.0)
         
-        # Reset STM32 odom before rotation (like navigator does)
+        # Reset STM32 odom before first rotation
         self._send_command("RESET_ODOM")
         self._wait_for_response(["OK"], ["ERR"], timeout=1.0)
         time.sleep(0.1)
         
-        # Step 3: Send calibrated angle to STM32
-        cmd = f"ROTATE_DEG {calibrated_angle:.2f}"
-        self._clear_response_queue()
-        self._send_command(cmd)
-        
-        # Step 1: Wait for OK ROTATE_DEG (command acknowledged)
-        result, line = self._wait_for_response(
-            success_tokens=["OK ROTATE_DEG"],
+        # Execute rotation repeat_count times
+        all_success = True
+        for i in range(repeat_count):
+            if repeat_count > 1:
+                self.logger.info(f"--- Rotation {i+1}/{repeat_count} ---")
+            
+            # Step 3: Send calibrated angle to STM32
+            cmd = f"ROTATE_DEG {calibrated_angle:.2f}"
+            self._clear_response_queue()
+            self._send_command(cmd)
+            
+            # Step 4: Wait for OK ROTATE_DEG (command acknowledged)
+            result, line = self._wait_for_response(
+                success_tokens=["OK ROTATE_DEG"],
             failure_tokens=["ERR"],
             timeout=2.0
         )
-        if not result:
-            self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
-            return False
-        
-        self.logger.info(f"Rotation started. Waiting for completion (timeout={rotate_timeout}s)...")
-        
-        # Step 2: Wait for TARGET_REACHED or TIMEOUT
-        result, line = self._wait_for_response(
+            if not result:
+                self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
+                all_success = False
+                break
+            
+            if repeat_count == 1:
+                self.logger.info(f"Rotation started. Waiting for completion (timeout={rotate_timeout}s)...")
+            
+            # Step 5: Wait for TARGET_REACHED or TIMEOUT
+            result, line = self._wait_for_response(
             success_tokens=["TARGET_REACHED"],
             failure_tokens=["TIMEOUT"],
             timeout=rotate_timeout
         )
+            
+            if result:
+                if repeat_count > 1:
+                    self.logger.info(f"Rotation {i+1} completed: {line}")
+                else:
+                    self.logger.info(f"Rotation completed: {line}")
+                # Don't reset odom between repetitions - only at the end
+                if i == repeat_count - 1:
+                    # Final rotation done - show cumulative result
+                    time.sleep(0.1)
+                    final_odom = self.get_odom()
+                    self.logger.info(
+                        f"=== After {repeat_count}x {quantized_angle:.1f}° rotations ==="
+                    )
+                    self.logger.info(
+                        f"Cumulative STM32 Odom: theta={final_odom['theta_deg']:.2f}° "
+                        f"(expected: {quantized_angle * repeat_count:.1f}°)"
+                    )
+                    self._send_command("RESET_ODOM")
+                    time.sleep(0.1)
+                continue
+            else:
+                # Rotation failed
+                all_success = False
+                break
         
-        if result:
-            self.logger.info(f"Rotation completed: {line}")
-            # Reset STM32 odom after successful rotation
-            self._send_command("RESET_ODOM")
-            time.sleep(0.1)
-            return True
+        return all_success
+        
+        # Old single-rotation code below (unreachable now)
+        if False:  # Keep for reference
+            pass
         
         # Rotation timed out - check how far it got
         actual_rotation = math.degrees(self.odom['theta_rad'])
@@ -467,15 +508,16 @@ def main():
         if len(sys.argv) >= 2:
             # Command line mode
             angle_deg = float(sys.argv[1])
-            tester.rotate_deg(angle_deg)
+            repeat_count = int(sys.argv[2]) if len(sys.argv) >= 3 else 1
+            tester.rotate_deg(angle_deg, repeat_count)
             tester.print_odom()
         else:
             # Interactive mode
             print("\n=== ROTATE_DEG Command Tester ===")
             print("Commands:")
-            print("  rotate <angle>     - Rotate by angle (degrees, MCU frame)")
-            print("  to <heading>       - Rotate to absolute heading (world frame)")
-            print("  param <name> <val> - Set STM32 parameter (e.g. param rotate_tol_angle 0.10)")
+            print("  rotate <angle> [count]  - Rotate by angle (degrees, MCU frame), optionally repeat count times")
+            print("  to <heading>            - Rotate to absolute heading (world frame)")
+            print("  param <name> <val>      - Set STM32 parameter (e.g. param rotate_tol_angle 0.10)")
             print("  stop               - Emergency stop")
             print("  odom               - Print current odometry")
             print("  reset              - Reset odometry and pose")
@@ -514,9 +556,10 @@ def main():
                 elif command == 'rotate':
                     if len(parts) >= 2:
                         angle = float(parts[1])
-                        tester.rotate_deg(angle)
+                        repeat_count = int(parts[2]) if len(parts) >= 3 else 1
+                        tester.rotate_deg(angle, repeat_count)
                     else:
-                        print("Usage: rotate <angle_deg>")
+                        print("Usage: rotate <angle_deg> [repeat_count]")
                     tester.print_odom()
                 elif command == 'to':
                     if len(parts) >= 2:
