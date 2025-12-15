@@ -200,6 +200,140 @@ def normalize_angle_deg(angle):
     return angle
 
 
+# =============================================================================
+# FRAME CONVERSION FUNCTIONS
+# World frame: CCW positive (standard math convention)
+# Robot/STM32 frame: CW positive (what STM32 expects)
+# =============================================================================
+
+def world_to_robot_rotation(world_delta_deg: float) -> float:
+    """Convert world-frame rotation to robot/STM32 command.
+    
+    World frame: CCW positive (planner/world)
+    Robot frame: CW positive (STM32 expects this)
+    
+    Args:
+        world_delta_deg: Rotation in world frame (CCW positive)
+    
+    Returns:
+        Rotation command for STM32 (CW positive)
+    """
+    return -world_delta_deg
+
+
+def robot_to_world_rotation(robot_delta_deg: float) -> float:
+    """Convert robot/STM32 rotation to world frame.
+    
+    Robot frame: CW positive (STM32 reports this)
+    World frame: CCW positive (planner/world)
+    
+    Args:
+        robot_delta_deg: Rotation from STM32 (CW positive)
+    
+    Returns:
+        Rotation in world frame (CCW positive)
+    """
+    return -robot_delta_deg
+
+
+# =============================================================================
+# DISCRETE ROTATION PRIMITIVES
+# TEMPORARY: Quantization is executor-level. Phase 2 moves to planner.
+# =============================================================================
+
+# Load rotation primitives from config
+_rotation_primitives = ROBOT_CONFIG.get('rotation_primitives', {})
+ROTATION_ALLOWED_ANGLES = _rotation_primitives.get('allowed_angles', [30, 60, 90, 120, 150, 180])
+ROTATION_MIN_THRESHOLD_DEG = _rotation_primitives.get('min_angle_threshold_deg', 15)
+
+
+def quantize_rotation_angle(angle_deg: float) -> float:
+    """Quantize rotation angle to nearest allowed discrete angle.
+    
+    TEMPORARY: This executor-level quantization is Phase 1.
+    Phase 2 will move this logic into the path planner for better optimization.
+    
+    Rules:
+    - If abs(angle) < min_threshold: return 0 (skip rotation)
+    - Otherwise: round to nearest allowed angle
+    - Preserve sign (direction)
+    
+    Args:
+        angle_deg: Requested rotation angle in degrees
+    
+    Returns:
+        Quantized angle (one of allowed_angles with original sign)
+        Returns 0.0 if angle is too small
+    """
+    # Normalize to [-180, 180] first
+    angle_deg = normalize_angle_deg(angle_deg)
+    
+    abs_angle = abs(angle_deg)
+    sign = 1 if angle_deg >= 0 else -1
+    
+    # Too small to rotate - clamp to 0
+    if abs_angle < ROTATION_MIN_THRESHOLD_DEG:
+        return 0.0
+    
+    # Find nearest allowed angle
+    if not ROTATION_ALLOWED_ANGLES:
+        return angle_deg  # Fallback if no angles configured
+    
+    nearest = min(ROTATION_ALLOWED_ANGLES, key=lambda x: abs(x - abs_angle))
+    return sign * nearest
+
+
+def get_rotation_primitive(angle_deg: float) -> dict:
+    """Get rotation primitive parameters for a specific angle.
+    
+    Args:
+        angle_deg: Quantized rotation angle (should be one of allowed_angles)
+    
+    Returns:
+        Dict with {scale, drift_x_m, drift_y_m} or defaults if not found
+    """
+    abs_angle = abs(int(round(angle_deg)))
+    primitive = _rotation_primitives.get(str(abs_angle), {})
+    
+    if isinstance(primitive, dict):
+        return {
+            'scale': primitive.get('scale', 1.0),
+            'drift_x_m': primitive.get('drift_x_m', 0.0),
+            'drift_y_m': primitive.get('drift_y_m', 0.0),
+        }
+    else:
+        # Legacy format (just a number for scale)
+        return {
+            'scale': float(primitive) if primitive else 1.0,
+            'drift_x_m': 0.0,
+            'drift_y_m': 0.0,
+        }
+
+
+def get_calibrated_rotation(angle_deg: float) -> tuple:
+    """Apply quantization and calibration to rotation angle.
+    
+    Args:
+        angle_deg: Requested rotation angle in degrees
+    
+    Returns:
+        Tuple of (quantized_angle, calibrated_angle, primitive)
+        - quantized_angle: Angle after quantization to allowed angles
+        - calibrated_angle: Angle with scale factor applied (for STM32)
+        - primitive: Dict with scale and drift values
+    """
+    quantized = quantize_rotation_angle(angle_deg)
+    if abs(quantized) < 0.1:
+        return 0.0, 0.0, {'scale': 1.0, 'drift_x_m': 0.0, 'drift_y_m': 0.0}
+    
+    primitive = get_rotation_primitive(quantized)
+    calibrated = quantized * primitive['scale']
+    
+    return quantized, calibrated, primitive
+
+
+
+
 def lidar_angle_to_robot(angle_deg: float) -> float:
     """
     Convert raw LIDAR angle (per RPLidar frame) into robot-forward frame.
@@ -664,6 +798,10 @@ class OdomOnlyNavigator:
     def _send_rotate(self, desired_angle_deg, target_heading_world=None, world_delta=None):
         """Rotate by desired_angle_deg relative to current heading.
         
+        Uses discrete angle quantization and per-angle calibration.
+        
+        TEMPORARY: Quantization is executor-level. Phase 2 moves to planner.
+        
         STM32 ROTATE_DEG behavior:
         - "OK ROTATE_DEG" = command received, rotation started
         - "TARGET_REACHED" = rotation completed successfully
@@ -676,11 +814,28 @@ class OdomOnlyNavigator:
         if abs(desired_angle_deg) < 0.1:
             return True
         
+        # Step 1: Apply discrete angle quantization
+        quantized_angle = quantize_rotation_angle(desired_angle_deg)
+        if abs(quantized_angle) < 0.1:
+            self.logger.info(f"Rotation {desired_angle_deg:.1f}° too small after quantization, skipping")
+            return True
+        
+        # Step 2: Get calibration from rotation primitive
+        primitive = get_rotation_primitive(quantized_angle)
+        calibrated_angle = quantized_angle * primitive['scale']
+        
+        self.logger.info(
+            f"ROTATE: requested={desired_angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
+            f"scale={primitive['scale']:.4f}, calibrated={calibrated_angle:.2f}°"
+        )
+        
         # Reset STM32 odom cache before ROTATE
         self._reset_stm32_odom()
         
-        cmd = f"ROTATE_DEG {desired_angle_deg:.2f}"
-        self.logger.info(f"ROTATE: {cmd}")
+        # Step 3: Send calibrated angle to STM32 (uses frame conversion: world->robot)
+        # Note: The angle here is already in the expected direction for STM32
+        cmd = f"ROTATE_DEG {calibrated_angle:.2f}"
+        self.logger.info(f">>> {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
         
@@ -695,7 +850,8 @@ class OdomOnlyNavigator:
             return False
 
         # Track active rotation for live status fusion
-        world_delta = world_delta if world_delta is not None else -desired_angle_deg
+        # Use quantized angle for tracking (what we're actually commanding)
+        world_delta = world_delta if world_delta is not None else robot_to_world_rotation(quantized_angle)
         with self.active_motion_lock:
             self.active_motion = {
                 'mode': 'rotate',
@@ -706,7 +862,7 @@ class OdomOnlyNavigator:
                 'progress': 0.0,
             }
         
-        # Step 2: wait for TARGET_REACHED or TIMEOUT
+        # Step 4: wait for TARGET_REACHED or TIMEOUT
         result, line = self._wait_for_response(
             success_tokens=["TARGET_REACHED"],
             failure_tokens=["TIMEOUT"],
@@ -721,7 +877,7 @@ class OdomOnlyNavigator:
                 stm32_odom = self._get_stm32_odom()
                 actual_rotation = stm32_odom.get('heading_deg', 0.0)
                 if abs(actual_rotation) > 0.1:
-                    applied_world = -actual_rotation  # MCU cw+ -> world ccw+
+                    applied_world = robot_to_world_rotation(actual_rotation)  # Use frame conversion
                     break
                 time.sleep(0.05)
 
@@ -754,7 +910,7 @@ class OdomOnlyNavigator:
                 "Rotation TIMEOUT but odom within tolerance in MCU frame (actual=%.1f°, target=%.1f°, err=%.1f° <= %.1f°); accepting.",
                 actual_rotation, target_delta_mcu, rotation_err_mcu, ROTATE_TIMEOUT_TOLERANCE_DEG
             )
-            applied_world = -actual_rotation
+            applied_world = robot_to_world_rotation(actual_rotation)  # Use frame conversion
             self._update_pose_after_rotate(applied_world)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)

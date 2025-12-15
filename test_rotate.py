@@ -260,20 +260,30 @@ class STM32Tester:
         """
         Quantize rotation angle to nearest allowed discrete angle.
         
+        TEMPORARY: This executor-level quantization is Phase 1.
+        Phase 2 will move this logic into the path planner for better optimization.
+        
         Returns:
-            Quantized angle (one of: 30, 60, 90, 120, 150, 180) with original sign
-            Returns 0.0 if angle is too small (<15°)
+            Quantized angle (one of allowed_angles) with original sign
+            Returns 0.0 if angle is too small
         """
+        # Normalize to [-180, 180]
+        while angle_deg > 180.0:
+            angle_deg -= 360.0
+        while angle_deg < -180.0:
+            angle_deg += 360.0
+        
         abs_angle = abs(angle_deg)
         sign = 1 if angle_deg >= 0 else -1
         
-        # Get allowed angles from config
-        rotation_config = self.config.get('rotation_calibration', {})
+        # Get rotation primitives from config
+        rotation_config = self.config.get('rotation_primitives', {})
         allowed_angles = rotation_config.get('allowed_angles', [30, 60, 90, 120, 150, 180])
+        min_threshold = rotation_config.get('min_angle_threshold_deg', 15)
         
-        # Too small to rotate
-        if abs_angle < 15:
-            self.logger.info(f"Angle {angle_deg:.1f}° too small (<15°), skipping rotation")
+        # Too small to rotate - clamp to 0
+        if abs_angle < min_threshold:
+            self.logger.info(f"Angle {angle_deg:.1f}° too small (<{min_threshold}°), skipping rotation")
             return 0.0
         
         # Find nearest allowed angle
@@ -285,20 +295,33 @@ class STM32Tester:
         
         return quantized
     
-    def get_calibration_scale(self, angle_deg):
+    def get_rotation_primitive(self, angle_deg):
         """
-        Get calibration scale factor for a specific rotation angle.
+        Get rotation primitive parameters for a specific angle.
         
         Args:
             angle_deg: Quantized rotation angle (should be one of allowed_angles)
         
         Returns:
-            Calibration scale factor (default 1.0 if not found)
+            Dict with {scale, drift_x_m, drift_y_m} or defaults if not found
         """
-        rotation_config = self.config.get('rotation_calibration', {})
-        abs_angle = abs(int(angle_deg))
-        scale = float(rotation_config.get(str(abs_angle), 1.0))
-        return scale
+        rotation_config = self.config.get('rotation_primitives', {})
+        abs_angle = abs(int(round(angle_deg)))
+        primitive = rotation_config.get(str(abs_angle), {})
+        
+        if isinstance(primitive, dict):
+            return {
+                'scale': primitive.get('scale', 1.0),
+                'drift_x_m': primitive.get('drift_x_m', 0.0),
+                'drift_y_m': primitive.get('drift_y_m', 0.0),
+            }
+        else:
+            # Legacy format (just a number for scale)
+            return {
+                'scale': float(primitive) if primitive else 1.0,
+                'drift_x_m': 0.0,
+                'drift_y_m': 0.0,
+            }
     
     # =========================================================================
     # ROTATE_DEG COMMAND - Replicates odom_only_navigator.py behavior EXACTLY
@@ -328,20 +351,22 @@ class STM32Tester:
         if abs(quantized_angle) < 0.1:
             return True
         
-        # Step 2: Apply calibration for this specific angle
-        calibration_scale = self.get_calibration_scale(quantized_angle)
-        calibrated_angle = quantized_angle * calibration_scale
+        # Step 2: Get rotation primitive (scale + drift)
+        primitive = self.get_rotation_primitive(quantized_angle)
+        calibrated_angle = quantized_angle * primitive['scale']
         
         if repeat_count > 1:
             self.logger.info(
                 f"Rotation: requested={angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
-                f"scale={calibration_scale:.4f}, calibrated={calibrated_angle:.2f}°, "
+                f"scale={primitive['scale']:.4f}, calibrated={calibrated_angle:.2f}°, "
+                f"drift=({primitive['drift_x_m']:.3f}, {primitive['drift_y_m']:.3f})m, "
                 f"repeat={repeat_count}x"
             )
         else:
             self.logger.info(
                 f"Rotation: requested={angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
-                f"scale={calibration_scale:.4f}, calibrated={calibrated_angle:.2f}°"
+                f"scale={primitive['scale']:.4f}, calibrated={calibrated_angle:.2f}°, "
+                f"drift=({primitive['drift_x_m']:.3f}, {primitive['drift_y_m']:.3f})m"
             )
         
         rotate_timeout = self.config.get('motion', {}).get('rotate_timeout_sec', 15.0)
