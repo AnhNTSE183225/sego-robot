@@ -693,6 +693,116 @@ class OdomOnlyNavigator:
         with self.scan_lock:
             return list(self.latest_scan)
 
+    def _build_scan_profile(self, scan, bin_count=360, max_range_m=5.0, min_range_m=0.15):
+        """
+        Build a 360° range profile from raw LIDAR scan data.
+        
+        Args:
+            scan: List of (quality, angle_deg, distance_mm) tuples from LIDAR
+            bin_count: Number of angular bins (default 360 for 1° resolution)
+            max_range_m: Points beyond this are clamped
+            min_range_m: Points closer than this are ignored (invalid readings)
+        
+        Returns:
+            List of bin_count floats representing range at each angle bin.
+            Invalid bins are set to max_range_m.
+        """
+        profile = [max_range_m] * bin_count  # Default to max range (clear)
+        counts = [0] * bin_count  # Count how many readings per bin
+        
+        for quality, angle_deg, distance_mm in scan:
+            if quality < 10:  # Low quality reading
+                continue
+            distance_m = distance_mm / 1000.0
+            if distance_m < min_range_m or distance_m > max_range_m:
+                continue
+            
+            # Normalize angle to [0, 360)
+            angle_norm = angle_deg % 360.0
+            bin_idx = int(angle_norm * bin_count / 360.0) % bin_count
+            
+            # Keep minimum distance for each bin (closest obstacle)
+            if counts[bin_idx] == 0 or distance_m < profile[bin_idx]:
+                profile[bin_idx] = distance_m
+            counts[bin_idx] += 1
+        
+        return profile, counts
+
+    def _estimate_yaw_from_scans(self, profile0, profile1, counts0, counts1, max_shift_deg=180):
+        """
+        Estimate yaw change (degrees) between two scan profiles using 1D correlation.
+        
+        Uses circular shift matching: finds the angular shift that maximizes 
+        correlation between profile0 and profile1.
+        
+        Args:
+            profile0, profile1: 360° range profiles (lists of floats)
+            counts0, counts1: Valid reading counts per bin
+            max_shift_deg: Maximum shift to search (±max_shift_deg)
+        
+        Returns:
+            (delta_yaw_deg, confidence): 
+            - delta_yaw_deg: Estimated rotation (positive = CCW in LIDAR frame)
+            - confidence: 0.0-1.0 indicating correlation quality
+        """
+        import numpy as np
+        
+        bin_count = len(profile0)
+        if len(profile1) != bin_count:
+            return 0.0, 0.0
+        
+        # Convert to numpy for efficiency
+        p0 = np.array(profile0)
+        p1 = np.array(profile1)
+        c0 = np.array(counts0)
+        c1 = np.array(counts1)
+        
+        # Only use bins with valid data in BOTH scans
+        valid_mask = (c0 > 0) & (c1 > 0)
+        valid_count = np.sum(valid_mask)
+        
+        if valid_count < 30:  # Need enough valid bins
+            self.logger.warning(
+                "LIDAR yaw estimation: insufficient valid bins (%d < 30)",
+                valid_count
+            )
+            return 0.0, 0.0
+        
+        # Search for best shift
+        max_shift_bins = int(max_shift_deg * bin_count / 360.0)
+        best_corr = -1.0
+        best_shift = 0
+        
+        for shift in range(-max_shift_bins, max_shift_bins + 1):
+            # Shift profile1 by 'shift' bins (circular)
+            p1_shifted = np.roll(p1, shift)
+            
+            # Compute correlation only on valid bins
+            diff = np.abs(p0 - p1_shifted)
+            # Use inverse of mean absolute difference as correlation metric
+            # Lower diff = better match
+            mean_diff = np.mean(diff[valid_mask])
+            corr = 1.0 / (1.0 + mean_diff)
+            
+            if corr > best_corr:
+                best_corr = corr
+                best_shift = shift
+        
+        # Convert shift to degrees (positive shift = profile1 rotated CW = robot rotated CCW)
+        delta_yaw_deg = best_shift * 360.0 / bin_count
+        
+        # Confidence based on how distinct the peak is
+        # Simple heuristic: if correlation > 0.5, consider it reliable
+        confidence = min(1.0, best_corr)
+        
+        self.logger.info(
+            "LIDAR yaw estimation: shift=%d bins (%.1f°), correlation=%.3f, valid_bins=%d",
+            best_shift, delta_yaw_deg, best_corr, valid_count
+        )
+        
+        return delta_yaw_deg, confidence
+
+
     # --- Command clamps ---
     def _clamp_move_command(self, distance):
         """Clamp MOVE distance to configured min/max to avoid too-small or oversized commands."""
@@ -846,6 +956,15 @@ class OdomOnlyNavigator:
         # Reset STM32 odom cache before ROTATE
         self._reset_stm32_odom()
         
+        # LIDAR heading correction: capture scan profile BEFORE rotation
+        scan_before = None
+        profile_before = None
+        counts_before = None
+        if self.first_scan_event.is_set():
+            scan_before = self._get_scan_snapshot()
+            profile_before, counts_before = self._build_scan_profile(scan_before)
+            self.logger.debug("Captured pre-rotation scan profile (%d valid bins)", sum(1 for c in counts_before if c > 0))
+        
         # Step 3: Send calibrated angle to STM32 (uses frame conversion: world->robot)
         # Note: The angle here is already in the expected direction for STM32
         cmd = f"ROTATE_DEG {calibrated_angle:.2f}"
@@ -885,16 +1004,52 @@ class OdomOnlyNavigator:
         
         if result:
             self.logger.info(f"Rotation completed: {line}")
-            # Use actual odom rotation; if not available immediately, wait briefly.
-            applied_world = None
+            
+            # LIDAR heading correction: capture scan profile AFTER rotation
+            lidar_yaw = None
+            lidar_confidence = 0.0
+            if profile_before is not None and self.first_scan_event.is_set():
+                time.sleep(0.1)  # Brief pause to let LIDAR stabilize after rotation
+                scan_after = self._get_scan_snapshot()
+                profile_after, counts_after = self._build_scan_profile(scan_after)
+                lidar_yaw, lidar_confidence = self._estimate_yaw_from_scans(
+                    profile_before, profile_after, counts_before, counts_after
+                )
+                self.logger.info(
+                    "LIDAR heading correction: yaw=%.1f°, confidence=%.2f (threshold=0.5)",
+                    lidar_yaw, lidar_confidence
+                )
+            
+            # Get STM32 odom rotation as fallback/comparison
+            stm32_applied_world = None
             for _ in range(3):
                 stm32_odom = self._get_stm32_odom()
                 actual_rotation = stm32_odom.get('heading_deg', 0.0)
                 if abs(actual_rotation) > 0.1:
-                    applied_world = robot_to_world_rotation(actual_rotation)  # Use frame conversion
+                    stm32_applied_world = robot_to_world_rotation(actual_rotation)
                     break
                 time.sleep(0.05)
-
+            
+            # Choose heading source: prefer LIDAR if confident, else STM32
+            LIDAR_CONFIDENCE_THRESHOLD = 0.5
+            if lidar_confidence >= LIDAR_CONFIDENCE_THRESHOLD and lidar_yaw is not None:
+                # LIDAR-based heading correction
+                # Note: LIDAR yaw is in LIDAR frame; convert to world frame
+                # LIDAR rotation sign may differ from world convention
+                applied_world = lidar_yaw  # Positive = CCW in LIDAR frame
+                self.logger.info(
+                    "Using LIDAR yaw for heading update: %.1f° (STM32 would be: %.1f°)",
+                    applied_world, stm32_applied_world if stm32_applied_world else 0.0
+                )
+            elif stm32_applied_world is not None:
+                applied_world = stm32_applied_world
+                self.logger.info(
+                    "Using STM32 odom for heading update: %.1f° (LIDAR confidence too low: %.2f < %.2f)",
+                    applied_world, lidar_confidence, LIDAR_CONFIDENCE_THRESHOLD
+                )
+            else:
+                applied_world = None
+            
             if applied_world is not None:
                 # Odom có đổi góc → coi là thành công bình thường
                 self._update_pose_after_rotate(applied_world)
@@ -2198,6 +2353,22 @@ class OdomOnlyNavigator:
 
         def heuristic(a, b):
             return abs(a[0] - b[0]) + abs(a[1] - b[1])
+        
+        # Track cells that are outside boundary - these get a HIGH penalty
+        # so the planner prefers inside paths when both options exist
+        outside_penalty = 10  # 10x cost for outside-boundary cells
+        
+        def is_cell_outside(cell):
+            wx = min_x + cell[0] * ASTAR_GRID_STEP_M
+            wy = min_y + cell[1] * ASTAR_GRID_STEP_M
+            return not self._in_boundary((wx, wy))
+        
+        def move_cost(from_cell, to_cell):
+            """Cost to move from one cell to another. High penalty for outside cells."""
+            base_cost = 1
+            if is_cell_outside(to_cell):
+                return base_cost + outside_penalty  # Heavy penalty for outside paths
+            return base_cost
 
         moves = [(1,0), (-1,0), (0,1), (0,-1)]
 
@@ -2225,7 +2396,8 @@ class OdomOnlyNavigator:
                 nb = (current[0] + dx, current[1] + dy)
                 if nb not in free:
                     continue
-                tentative = g_score[current] + 1
+                # Use move_cost instead of fixed cost of 1
+                tentative = g_score[current] + move_cost(current, nb)
                 if tentative < g_score.get(nb, math.inf):
                     came[nb] = current
                     g_score[nb] = tentative
@@ -2607,6 +2779,15 @@ class OdomOnlyNavigator:
             pose_raw['y'],
             heading_deg,
             payload["state"],
+        )
+        # DEBUG: Verify frame/offset issue - is discrepancy ~119° (LIDAR_FRONT_OFFSET_DEG)?
+        cmd_pose = self._get_pose()
+        self.logger.debug(
+            "HEADING DEBUG: cmd_pose.heading=%.1f anchor_rotation=%.1f raw_heading=%.1f delta=%.1f",
+            cmd_pose['heading_deg'],
+            self.anchor_rotation_deg if self.anchor_rotation_deg is not None else 0.0,
+            heading_deg,
+            normalize_angle_deg(cmd_pose['heading_deg'] - heading_deg),
         )
         self.kafka_bridge.send_status(payload)
 
