@@ -388,6 +388,12 @@ class ScanMatchingCalibrator:
         """
         self.logger.info(f"Running {trials} trials of {angle_deg}°...")
         
+        # Get current scale from config (tests use this scale)
+        primitives = self.config.get('rotation_primitives', {})
+        angle_key = str(abs(angle_deg))
+        current_primitive = primitives.get(angle_key, {})
+        old_scale = current_primitive.get('scale', 1.0)
+        
         trial_results = []
         for trial_num in range(trials):
             self.logger.info(f"\n--- Trial {trial_num + 1}/{trials} ---")
@@ -401,20 +407,22 @@ class ScanMatchingCalibrator:
         if valid_lidar:
             avg_lidar = np.mean([abs(m) for m in valid_lidar])
             avg_confidence = np.mean([r['confidence'] for r in trial_results if r['measured_lidar'] is not None])
-            scale = abs(angle_deg) / avg_lidar if avg_lidar > 0.1 else 1.0
+            # CORRECT FORMULA: new_scale = old_scale × (expected / measured)
+            # Since the test already applied old_scale, measured is the actual physical rotation
+            new_scale = old_scale * (abs(angle_deg) / avg_lidar) if avg_lidar > 0.1 else old_scale
             measurement_source = 'lidar'
         else:
             # Fallback to encoder
             avg_encoder = np.mean([abs(r['measured_encoder']) for r in trial_results])
             avg_lidar = None
             avg_confidence = 0.5
-            scale = abs(angle_deg) / avg_encoder if avg_encoder > 0.1 else 1.0
+            new_scale = old_scale * (abs(angle_deg) / avg_encoder) if avg_encoder > 0.1 else old_scale
             measurement_source = 'encoder'
         
         self.logger.info(
             f"Trials complete: expected={abs(angle_deg):.1f}°, "
             f"measured={avg_lidar if avg_lidar else avg_encoder:.1f}° ({measurement_source}), "
-            f"scale={scale:.4f}, confidence={avg_confidence:.2f}"
+            f"old_scale={old_scale:.4f}, new_scale={new_scale:.4f}, confidence={avg_confidence:.2f}"
         )
         
         return {
@@ -423,7 +431,8 @@ class ScanMatchingCalibrator:
             'measured_lidar': avg_lidar,
             'measured_used': avg_lidar if avg_lidar else avg_encoder,
             'measurement_source': measurement_source,
-            'scale': scale,
+            'old_scale': old_scale,
+            'scale': new_scale,
             'confidence': avg_confidence,
         }
     
