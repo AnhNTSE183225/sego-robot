@@ -74,10 +74,10 @@
         ],
         "min_angle_threshold_deg": 15,
         "30": {
-            "scale": 1.0345,
-            "min_duty_rotate": 0.52,
-            "angular_k": 0.52,
-            "drift_x_m": 0.002,
+            "scale": 1.1,
+            "min_duty_rotate": 0.50,
+            "angular_k": 0.50,
+            "drift_x_m": 0.018,
             "drift_y_m": 0.0
         },
         "60": {
