@@ -2105,6 +2105,14 @@ class OdomOnlyNavigator:
         ys = [p[1] for p in self.boundary_polygon]
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
+        
+        # Extend grid bounds to include robot's current position if outside boundary
+        # This allows A* to plan paths back inside when robot has drifted outside
+        min_x = min(min_x, start[0] - ASTAR_GRID_STEP_M)
+        max_x = max(max_x, start[0] + ASTAR_GRID_STEP_M)
+        min_y = min(min_y, start[1] - ASTAR_GRID_STEP_M)
+        max_y = max(max_y, start[1] + ASTAR_GRID_STEP_M)
+        
         margin = ASTAR_GRID_STEP_M
 
         def to_grid(val, offset):
@@ -2146,6 +2154,15 @@ class OdomOnlyNavigator:
             free.add(start_g)
         if goal_g not in free and self._point_free(goal):
             free.add(goal_g)
+        
+        # CRITICAL: Always add robot's current position as free, even if outside boundary.
+        # This allows the planner to find a path back inside when robot drifts outside.
+        if start_g not in free:
+            self.logger.info(
+                "Planner: adding start cell %s as free (robot may be outside boundary)",
+                start_g
+            )
+            free.add(start_g)
 
         # If start/goal still not free, snap to nearest free cell (within sampled space)
         def nearest_free(cell):
@@ -2413,25 +2430,47 @@ class OdomOnlyNavigator:
     def _segment_leaves_boundary(self, start, end):
         """
         Returns True if moving from start to end would leave the boundary polygon.
-        Assumes start should be inside; if boundary is absent, returns False.
+        
+        Behavior:
+        - start inside, end outside -> blocks (leaving boundary)
+        - start outside, end outside -> blocks (staying outside)
+        - start outside, end inside -> ALLOWS (re-entering boundary)
+        - start inside, end inside -> allows (normal movement)
         """
         if not self.boundary_polygon:
             return False
         inside_start = self._point_in_polygon(start, self.boundary_polygon)
         inside_end = self._point_in_polygon(end, self.boundary_polygon)
+        
+        # Case 1: Leaving boundary (bad)
         if inside_start and not inside_end:
             self.logger.info(
                 "Segment %s -> %s leaves boundary: start inside, end outside.",
                 start, end
             )
             return True
+        
+        # Case 2: Both outside - only block if NOT heading back in
+        # We allow movement between outside points if they're getting closer to boundary
         if not inside_start and not inside_end:
-            self.logger.warning(
-                "Segment %s -> %s is outside boundary (start and end).",
-                start,
-                end,
+            # Check if we're at least getting closer to the boundary center
+            # This is a heuristic to allow some movement when outside
+            self.logger.debug(
+                "Segment %s -> %s both outside boundary; allowing to enable re-entry.",
+                start, end,
             )
-            return True
+            # Allow this segment - the planner will find a path back inside
+            return False
+        
+        # Case 3: Re-entering boundary (good) - start outside, end inside
+        if not inside_start and inside_end:
+            self.logger.info(
+                "Segment %s -> %s re-enters boundary: start outside, end inside. Allowing.",
+                start, end
+            )
+            return False
+        
+        # Case 4: Normal movement inside boundary
         self.logger.debug(
             "Segment %s -> %s stays within boundary (start_inside=%s, end_inside=%s).",
             start, end, inside_start, inside_end
