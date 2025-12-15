@@ -68,12 +68,13 @@ SCAN_MATCH_CONFIG = {
 # SCAN MATCHING FUNCTIONS
 # =============================================================================
 
-def capture_lidar_scan(lidar: 'RPLidar', num_scans: int = 3) -> Optional[np.ndarray]:
+def capture_lidar_scan(lidar: 'RPLidar', num_scans: int = 3, timeout_sec: float = 2.5) -> Optional[np.ndarray]:
     """Capture and average multiple LIDAR scans.
     
     Args:
         lidar: RPLidar instance
         num_scans: Number of scans to average
+        timeout_sec: Hard timeout to prevent blocking forever
     
     Returns:
         Array of (angle, distance) tuples, or None if failed
@@ -83,25 +84,46 @@ def capture_lidar_scan(lidar: 'RPLidar', num_scans: int = 3) -> Optional[np.ndar
     
     all_points = []
     scan_count = 0
+    t0 = time.time()
     
     try:
+        # Flush before starting a scan session
+        try:
+            if hasattr(lidar, "_serial"):
+                lidar._serial.reset_input_buffer()
+                lidar._serial.reset_output_buffer()
+        except:
+            pass
+        
         for scan in lidar.iter_scans():
+            # Hard timeout so we never block forever
+            if time.time() - t0 > timeout_sec:
+                logging.warning("LIDAR capture timeout")
+                break
+            
             points = np.array([(angle, distance) for _, angle, distance in scan if distance > 0])
             if len(points) > 0:
                 all_points.append(points)
                 scan_count += 1
                 if scan_count >= num_scans:
                     break
+    
     except RPLidarException as e:
         logging.error(f"LIDAR scan error: {e}")
         return None
     
+    finally:
+        # CRITICAL: stop scanning after every capture to prevent blocking on next call
+        try:
+            lidar.stop()
+        except:
+            pass
+        time.sleep(0.05)
+    
     if not all_points:
         return None
     
-    # Combine all scans (simple concatenation for now)
-    combined = np.vstack(all_points)
-    return combined
+    return np.vstack(all_points)
 
 
 def scan_to_cartesian(scan: np.ndarray) -> np.ndarray:
@@ -414,44 +436,27 @@ class ScanMatchingCalibrator:
         Returns:
             Dict with {expected, measured_encoder, measured_lidar, scale, confidence}
         """
-        # Capture initial scan
+        # Capture initial scan (capture_lidar_scan handles buffer flushing and stop())
         settle_time = SCAN_MATCH_CONFIG['scan_settle_time_sec']
         time.sleep(settle_time)
         
         scan_before = None
         if self.lidar:
-            # Flush serial buffer before scan
-            try:
-                if hasattr(self.lidar, '_serial'):
-                    self.lidar._serial.reset_input_buffer()
-                    self.lidar._serial.reset_output_buffer()
-            except:
-                pass
-            
             scan_before = capture_lidar_scan(self.lidar)
             if scan_before is not None:
                 self.logger.info(f"Captured {len(scan_before)} points (before)")
         
-        # Execute single rotation (no need to stop LIDAR for 1 rotation)
+        # Execute single rotation
         success = self.tester.rotate_deg(angle_deg, repeat_count=1)
         
         if not success:
             self.logger.warning("Rotation command failed during execution")
         
-        # Capture final scan
+        # Capture final scan (capture_lidar_scan handles buffer flushing and stop())
         time.sleep(settle_time)
         
         scan_after = None
         if self.lidar:
-            # Flush serial buffer before scan
-            try:
-                if hasattr(self.lidar, '_serial'):
-                    self.lidar._serial.reset_input_buffer()
-                    self.lidar._serial.reset_output_buffer()
-            except:
-                pass
-            
-            time.sleep(0.2)  # Brief settle
             scan_after = capture_lidar_scan(self.lidar)
             if scan_after is not None:
                 self.logger.info(f"Captured {len(scan_after)} points (after)")
