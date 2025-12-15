@@ -1030,25 +1030,21 @@ class OdomOnlyNavigator:
                     break
                 time.sleep(0.05)
             
-            # Choose heading source: prefer LIDAR if confident, else STM32
-            LIDAR_CONFIDENCE_THRESHOLD = 0.5
-            if lidar_confidence >= LIDAR_CONFIDENCE_THRESHOLD and lidar_yaw is not None:
-                # LIDAR-based heading correction
-                # Note: LIDAR yaw is in LIDAR frame; convert to world frame
-                # LIDAR rotation sign may differ from world convention
-                applied_world = lidar_yaw  # Positive = CCW in LIDAR frame
-                self.logger.info(
-                    "Using LIDAR yaw for heading update: %.1f° (STM32 would be: %.1f°)",
-                    applied_world, stm32_applied_world if stm32_applied_world else 0.0
-                )
-            elif stm32_applied_world is not None:
+            # Always use STM32 odom for pose update (or fallback to quantized command)
+            # LIDAR yaw kept for diagnostic logging only - not used for pose update
+            # (sign convention issues and no sanity checks make it unreliable for now)
+            if stm32_applied_world is not None:
                 applied_world = stm32_applied_world
-                self.logger.info(
-                    "Using STM32 odom for heading update: %.1f° (LIDAR confidence too low: %.2f < %.2f)",
-                    applied_world, lidar_confidence, LIDAR_CONFIDENCE_THRESHOLD
-                )
             else:
-                applied_world = None
+                # fallback: use the intended world delta (already computed)
+                applied_world = world_delta
+            
+            # Log LIDAR yaw for diagnostics only (not used for pose update)
+            if lidar_yaw is not None:
+                self.logger.info(
+                    "LIDAR yaw (diagnostic only): %.1f° conf=%.2f (STM32 used: %.1f°)",
+                    lidar_yaw, lidar_confidence, applied_world if applied_world else 0.0
+                )
             
             if applied_world is not None:
                 # Odom có đổi góc → coi là thành công bình thường
