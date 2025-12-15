@@ -351,9 +351,19 @@ class STM32Tester:
         if abs(quantized_angle) < 0.1:
             return True
         
-        # Step 2: Get rotation primitive (scale + drift)
+        # Step 2: Get rotation primitive (scale + drift + motor params)
         primitive = self.get_rotation_primitive(quantized_angle)
         calibrated_angle = quantized_angle * primitive['scale']
+        
+        # Step 3: Apply per-angle motor parameters if specified
+        per_angle_min_duty = primitive.get('min_duty_rotate')
+        per_angle_angular_k = primitive.get('angular_k')
+        if per_angle_min_duty is not None:
+            self._send_command(f"SET_PARAM min_duty_rotate {per_angle_min_duty:.6f}")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+        if per_angle_angular_k is not None:
+            self._send_command(f"SET_PARAM angular_k {per_angle_angular_k:.6f}")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
         
         if repeat_count > 1:
             self.logger.info(

@@ -824,6 +824,16 @@ class OdomOnlyNavigator:
         primitive = get_rotation_primitive(quantized_angle)
         calibrated_angle = quantized_angle * primitive['scale']
         
+        # Step 2.5: Apply per-angle motor parameters if specified
+        per_angle_min_duty = primitive.get('min_duty_rotate')
+        per_angle_angular_k = primitive.get('angular_k')
+        if per_angle_min_duty is not None:
+            self._send_raw_command(f"SET_PARAM min_duty_rotate {per_angle_min_duty:.6f}")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+        if per_angle_angular_k is not None:
+            self._send_raw_command(f"SET_PARAM angular_k {per_angle_angular_k:.6f}")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+        
         self.logger.info(
             f"ROTATE: requested={desired_angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
             f"scale={primitive['scale']:.4f}, calibrated={calibrated_angle:.2f}°"
