@@ -373,6 +373,15 @@ class ScanMatchingCalibrator:
             scan_before = capture_lidar_scan(self.lidar)
             if scan_before is not None:
                 self.logger.info(f"Captured {len(scan_before)} points")
+            
+            # Stop LIDAR motor before rotation to prevent buffer overflow
+            try:
+                self.logger.info("Stopping LIDAR motor before rotation...")
+                self.lidar.stop()
+                self.lidar.stop_motor()
+                time.sleep(0.5)  # Let motor stop completely
+            except Exception as e:
+                self.logger.warning(f"Error stopping LIDAR: {e}")
         
         # Execute rotations
         self.logger.info(f"Executing {repeats} rotations of {angle_deg}°...")
@@ -386,6 +395,14 @@ class ScanMatchingCalibrator:
         
         scan_after = None
         if self.lidar:
+            # Restart LIDAR motor after rotation
+            try:
+                self.logger.info("Restarting LIDAR motor after rotation...")
+                self.lidar.start_motor()
+                time.sleep(2.0)  # Wait for motor to spin up
+            except Exception as e:
+                self.logger.warning(f"Error restarting LIDAR: {e}")
+            
             self.logger.info("Capturing final LIDAR scan...")
             scan_after = capture_lidar_scan(self.lidar)
             if scan_after is not None:
