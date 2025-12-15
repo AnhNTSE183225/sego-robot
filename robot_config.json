@@ -81,30 +81,30 @@
             "drift_y_m": 0.0
         },
         "60": {
-            "scale": 1.00,
-            "min_duty_rotate": 0.53,
-            "angular_k": 0.53,
+            "scale": 0.98,
+            "min_duty_rotate": 0.50,
+            "angular_k": 0.50,
             "drift_x_m": 0.004,
             "drift_y_m": 0.0
         },
         "90": {
-            "scale": 1.00,
-            "min_duty_rotate": 0.55,
-            "angular_k": 0.55,
+            "scale": 0.963,
+            "min_duty_rotate": 0.50,
+            "angular_k": 0.50,
             "drift_x_m": 0.008,
             "drift_y_m": 0.0
         },
         "120": {
-            "scale": 1.00,
-            "min_duty_rotate": 0.56,
-            "angular_k": 0.56,
+            "scale": 0.969,
+            "min_duty_rotate": 0.50,
+            "angular_k": 0.50,
             "drift_x_m": 0.010,
             "drift_y_m": 0.0
         },
         "180": {
-            "scale": 1.00,
-            "min_duty_rotate": 0.58,
-            "angular_k": 0.58,
+            "scale": 0.97,
+            "min_duty_rotate": 0.50,
+            "angular_k": 0.50,
             "drift_x_m": 0.015,
             "drift_y_m": 0.0
         }
