@@ -75,7 +75,7 @@
         ],
         "min_angle_threshold_deg": 15,
         "30": {
-            "scale": 1.0441,
+            "scale": 1.0345,
             "drift_x_m": 0.002,
             "drift_y_m": 0.0
         },
