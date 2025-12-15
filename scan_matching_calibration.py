@@ -31,6 +31,18 @@ from typing import Optional, Tuple, List
 try:
     from rplidar import RPLidar, RPLidarException
     LIDAR_AVAILABLE = True
+    
+    # Patch for rplidar library that returns 3 values from get_health() instead of 2
+    _orig_get_health = RPLidar.get_health
+
+    def _get_health_two_fields(self):
+        result = _orig_get_health(self)
+        if isinstance(result, (list, tuple)) and len(result) >= 2:
+            return result[0], result[1]
+        return result, 0
+
+    RPLidar.get_health = _get_health_two_fields
+    
 except ImportError:
     LIDAR_AVAILABLE = False
     RPLidar = None
