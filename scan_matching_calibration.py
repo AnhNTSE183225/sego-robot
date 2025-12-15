@@ -57,10 +57,10 @@ from test_rotate import STM32Tester, load_config, configure_logging
 # =============================================================================
 
 SCAN_MATCH_CONFIG = {
-    'min_confidence': 0.8,        # Minimum scan-matching confidence to accept
+    'min_confidence': 0.7,        # Minimum scan-matching confidence to accept
     'scan_settle_time_sec': 0.5,  # Wait time for robot to settle before scan
-    'repeats_per_angle': 12,      # Number of rotations per calibration run
-    'angle_search_range_deg': 30, # Search range for scan matching (±30°)
+    'trials_per_angle': 10,       # Number of trials (each = 1 rotation)
+    'angle_search_range_deg': 15, # Search range around expected (±15°)
     'angle_resolution_deg': 0.5,  # Resolution for correlative matching
 }
 
@@ -146,7 +146,8 @@ def rotate_points(points: np.ndarray, angle_deg: float) -> np.ndarray:
 
 def correlative_scan_match(scan_before: np.ndarray, scan_after: np.ndarray,
                            search_range_deg: float = 30.0,
-                           resolution_deg: float = 0.5) -> Tuple[float, float]:
+                           resolution_deg: float = 0.5,
+                           center_deg: float = 0.0) -> Tuple[float, float]:
     """Find rotation angle between two scans using correlative matching.
     
     This is a simple but robust method for rotation-only matching.
@@ -154,8 +155,9 @@ def correlative_scan_match(scan_before: np.ndarray, scan_after: np.ndarray,
     Args:
         scan_before: Scan before rotation (polar: angle, distance)
         scan_after: Scan after rotation (polar: angle, distance)
-        search_range_deg: Search range ±degrees
+        search_range_deg: Search range ±degrees around center
         resolution_deg: Search resolution
+        center_deg: Center of search (expected rotation angle)
     
     Returns:
         Tuple of (best_angle_deg, confidence)
@@ -173,10 +175,13 @@ def correlative_scan_match(scan_before: np.ndarray, scan_after: np.ndarray,
         return 0.0, 0.0
     
     # Try different rotation angles and find best match
-    best_angle = 0.0
+    best_angle = center_deg
     best_score = -float('inf')
     
-    angles_to_try = np.arange(-search_range_deg, search_range_deg + resolution_deg, resolution_deg)
+    # Search around center (expected angle)
+    angles_to_try = np.arange(center_deg - search_range_deg, 
+                              center_deg + search_range_deg + resolution_deg, 
+                              resolution_deg)
     
     for test_angle in angles_to_try:
         # Rotate "before" points by test angle
@@ -299,13 +304,13 @@ class ScanMatchingCalibrator:
             self.tester.disconnect()
     
     def calibrate_angle(self, angle_deg: int, direction: str = 'both',
-                        repeats: int = 12) -> dict:
-        """Calibrate a specific rotation angle.
+                        trials: int = 10) -> dict:
+        """Calibrate a specific rotation angle using multiple trials.
         
         Args:
             angle_deg: Angle to calibrate (30, 60, 90, etc.)
             direction: 'cw', 'ccw', or 'both'
-            repeats: Number of rotations per test
+            trials: Number of trials (each = 1 rotation)
         
         Returns:
             Dict with calibration results
@@ -313,7 +318,7 @@ class ScanMatchingCalibrator:
         results = {
             'angle': angle_deg,
             'direction': direction,
-            'repeats': repeats,
+            'trials': trials,
             'tests': [],
             'scale_cw': None,
             'scale_ccw': None,
@@ -322,15 +327,15 @@ class ScanMatchingCalibrator:
         }
         
         if direction in ['cw', 'both']:
-            # Clockwise test (positive angle in robot frame)
-            result = self._run_calibration_test(angle_deg, repeats)
+            # Clockwise test (positive angle in robot frame) - multiple trials
+            result = self._run_calibration_trials(angle_deg, trials)
             results['tests'].append({'direction': 'cw', **result})
             if result['confidence'] >= SCAN_MATCH_CONFIG['min_confidence']:
                 results['scale_cw'] = result['scale']
         
         if direction in ['ccw', 'both']:
-            # Counter-clockwise test (negative angle in robot frame)
-            result = self._run_calibration_test(-angle_deg, repeats)
+            # Counter-clockwise test (negative angle in robot frame) - multiple trials
+            result = self._run_calibration_trials(-angle_deg, trials)
             results['tests'].append({'direction': 'ccw', **result})
             if result['confidence'] >= SCAN_MATCH_CONFIG['min_confidence']:
                 results['scale_ccw'] = result['scale']
@@ -349,43 +354,86 @@ class ScanMatchingCalibrator:
         
         return results
     
-    def _run_calibration_test(self, angle_deg: int, repeats: int) -> dict:
-        """Run a single calibration test.
+    def _run_calibration_trials(self, angle_deg: int, trials: int) -> dict:
+        """Run multiple calibration trials and average results.
         
         Args:
             angle_deg: Target angle (positive = CW in robot frame)
-            repeats: Number of times to repeat
+            trials: Number of trials (each = 1 rotation)
         
         Returns:
             Dict with {expected, measured_encoder, measured_lidar, scale, confidence}
         """
-        expected_total = abs(angle_deg) * repeats
+        self.logger.info(f"Running {trials} trials of {angle_deg}°...")
         
-        self.logger.info(f"Running calibration: {angle_deg}° x {repeats} = {expected_total}° expected")
+        trial_results = []
+        for trial_num in range(trials):
+            self.logger.info(f"\n--- Trial {trial_num + 1}/{trials} ---")
+            result = self._run_single_trial(angle_deg)
+            trial_results.append(result)
         
+        # Average the measurements
+        valid_lidar = [r['measured_lidar'] for r in trial_results 
+                       if r['measured_lidar'] is not None and r['confidence'] >= SCAN_MATCH_CONFIG['min_confidence']]
+        
+        if valid_lidar:
+            avg_lidar = np.mean([abs(m) for m in valid_lidar])
+            avg_confidence = np.mean([r['confidence'] for r in trial_results if r['measured_lidar'] is not None])
+            scale = abs(angle_deg) / avg_lidar if avg_lidar > 0.1 else 1.0
+            measurement_source = 'lidar'
+        else:
+            # Fallback to encoder
+            avg_encoder = np.mean([abs(r['measured_encoder']) for r in trial_results])
+            avg_lidar = None
+            avg_confidence = 0.5
+            scale = abs(angle_deg) / avg_encoder if avg_encoder > 0.1 else 1.0
+            measurement_source = 'encoder'
+        
+        self.logger.info(
+            f"Trials complete: expected={abs(angle_deg):.1f}°, "
+            f"measured={avg_lidar if avg_lidar else avg_encoder:.1f}° ({measurement_source}), "
+            f"scale={scale:.4f}, confidence={avg_confidence:.2f}"
+        )
+        
+        return {
+            'expected': abs(angle_deg),
+            'measured_encoder': avg_encoder if not valid_lidar else trial_results[0]['measured_encoder'],
+            'measured_lidar': avg_lidar,
+            'measured_used': avg_lidar if avg_lidar else avg_encoder,
+            'measurement_source': measurement_source,
+            'scale': scale,
+            'confidence': avg_confidence,
+        }
+    
+    def _run_single_trial(self, angle_deg: int) -> dict:
+        """Run a single calibration trial (1 rotation).
+        
+        Args:
+            angle_deg: Target angle (positive = CW in robot frame)
+        
+        Returns:
+            Dict with {expected, measured_encoder, measured_lidar, scale, confidence}
+        """
         # Capture initial scan
         settle_time = SCAN_MATCH_CONFIG['scan_settle_time_sec']
         time.sleep(settle_time)
         
         scan_before = None
         if self.lidar:
-            self.logger.info("Capturing initial LIDAR scan...")
+            # Flush serial buffer before scan
+            try:
+                if hasattr(self.lidar, '_serial'):
+                    self.lidar._serial.reset_input_buffer()
+                    self.lidar._serial.reset_output_buffer()
+            except:
+                pass
+            
             scan_before = capture_lidar_scan(self.lidar)
             if scan_before is not None:
-                self.logger.info(f"Captured {len(scan_before)} points")
-            
-            # Stop LIDAR motor before rotation to prevent buffer overflow
-            try:
-                self.logger.info("Stopping LIDAR motor before rotation...")
-                self.lidar.stop()
-                self.lidar.stop_motor()
-                time.sleep(0.5)  # Let motor stop completely
-            except Exception as e:
-                self.logger.warning(f"Error stopping LIDAR: {e}")
+                self.logger.info(f"Captured {len(scan_before)} points (before)")
         
-        # Execute rotations
-        self.logger.info(f"Executing {repeats} rotations of {angle_deg}°...")
-        success = self.tester.rotate_deg(angle_deg, repeat_count=repeats)
+        # Execute single rotation (no need to stop LIDAR for 1 rotation)
+        success = self.tester.rotate_deg(angle_deg, repeat_count=1)
         
         if not success:
             self.logger.warning("Rotation command failed during execution")
@@ -395,18 +443,18 @@ class ScanMatchingCalibrator:
         
         scan_after = None
         if self.lidar:
-            # Restart LIDAR motor after rotation
+            # Flush serial buffer before scan
             try:
-                self.logger.info("Restarting LIDAR motor after rotation...")
-                self.lidar.start_motor()
-                time.sleep(2.0)  # Wait for motor to spin up
-            except Exception as e:
-                self.logger.warning(f"Error restarting LIDAR: {e}")
+                if hasattr(self.lidar, '_serial'):
+                    self.lidar._serial.reset_input_buffer()
+                    self.lidar._serial.reset_output_buffer()
+            except:
+                pass
             
-            self.logger.info("Capturing final LIDAR scan...")
+            time.sleep(0.2)  # Brief settle
             scan_after = capture_lidar_scan(self.lidar)
             if scan_after is not None:
-                self.logger.info(f"Captured {len(scan_after)} points")
+                self.logger.info(f"Captured {len(scan_after)} points (after)")
         
         # Get encoder measurement
         odom = self.tester.get_odom()
@@ -417,15 +465,23 @@ class ScanMatchingCalibrator:
         confidence = 0.5  # Default confidence for encoder-only
         
         if scan_before is not None and scan_after is not None:
-            search_range = SCAN_MATCH_CONFIG['angle_search_range_deg'] * repeats
-            search_range = min(search_range, 180)  # Cap at 180°
+            search_range = SCAN_MATCH_CONFIG['angle_search_range_deg']
+            
+            # Use commanded angle as search center (prior)
+            # Note: angle_deg is in robot frame (CW+), scan-match returns world frame (CCW+)
+            # So we expect scan-match to return approximately -angle_deg
+            expected_scan_match = -angle_deg  # Robot CW+ → World CCW+
             
             measured_lidar, confidence = correlative_scan_match(
                 scan_before, scan_after,
                 search_range_deg=search_range,
+                center_deg=expected_scan_match,
                 resolution_deg=SCAN_MATCH_CONFIG['angle_resolution_deg']
             )
-            self.logger.info(f"Scan-matching result: {measured_lidar:.2f}° (confidence: {confidence:.2f})")
+            self.logger.info(
+                f"Scan-match: commanded={angle_deg:.1f}°, measured={measured_lidar:.2f}°, "
+                f"confidence={confidence:.2f}"
+            )
         
         # Use LIDAR measurement if available and confident, otherwise encoder
         if measured_lidar is not None and confidence >= SCAN_MATCH_CONFIG['min_confidence']:
@@ -437,15 +493,16 @@ class ScanMatchingCalibrator:
             if measured_lidar is not None:
                 self.logger.warning(f"Low confidence ({confidence:.2f}), using encoder measurement")
         
-        # Calculate scale factor
+        # Calculate scale factor (for single rotation)
+        expected_single = abs(angle_deg)
         if measured > 0.1:
-            scale = expected_total / measured
+            scale = expected_single / measured
         else:
             scale = 1.0
             self.logger.warning("Measured rotation near zero, using default scale")
         
         result = {
-            'expected': expected_total,
+            'expected': expected_single,
             'measured_encoder': measured_encoder,
             'measured_lidar': measured_lidar,
             'measured_used': measured,
@@ -454,10 +511,7 @@ class ScanMatchingCalibrator:
             'confidence': confidence,
         }
         
-        self.logger.info(
-            f"Result: expected={expected_total:.1f}°, measured={measured:.1f}° ({measurement_source}), "
-            f"scale={scale:.4f}, confidence={confidence:.2f}"
-        )
+
         
         return result
     
@@ -475,7 +529,7 @@ class ScanMatchingCalibrator:
             primitives = self.config.get('rotation_primitives', {})
             angles = primitives.get('allowed_angles', [30, 60, 90, 120, 150, 180])
         
-        repeats = SCAN_MATCH_CONFIG['repeats_per_angle']
+        trials = SCAN_MATCH_CONFIG['trials_per_angle']
         all_results = {}
         
         for angle in angles:
@@ -483,7 +537,7 @@ class ScanMatchingCalibrator:
             self.logger.info(f"Calibrating {angle}°")
             self.logger.info(f"{'='*60}")
             
-            result = self.calibrate_angle(angle, direction, repeats)
+            result = self.calibrate_angle(angle, direction, trials)
             all_results[angle] = result
             
             # Short pause between angles
