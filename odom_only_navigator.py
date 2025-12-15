@@ -300,6 +300,8 @@ def get_rotation_primitive(angle_deg: float) -> dict:
             'scale': primitive.get('scale', 1.0),
             'drift_x_m': primitive.get('drift_x_m', 0.0),
             'drift_y_m': primitive.get('drift_y_m', 0.0),
+            'min_duty_rotate': primitive.get('min_duty_rotate'),
+            'angular_k': primitive.get('angular_k'),
         }
     else:
         # Legacy format (just a number for scale)
@@ -307,6 +309,8 @@ def get_rotation_primitive(angle_deg: float) -> dict:
             'scale': float(primitive) if primitive else 1.0,
             'drift_x_m': 0.0,
             'drift_y_m': 0.0,
+            'min_duty_rotate': None,
+            'angular_k': None,
         }
 
 
