@@ -82,7 +82,7 @@
             "drift_y_m": 0.0
         },
         "45": {
-            "scale": 0.963,
+            "scale": 1.01,
             "min_duty_rotate": 0.50,
             "angular_k": 0.50,
             "drift_x_m": 0.008,
