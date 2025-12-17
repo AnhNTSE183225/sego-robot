@@ -1695,6 +1695,8 @@ class OdomOnlyNavigator:
         if self.boundary_polygon:
             if self._navigate_with_planner(goal, tolerance_m=tolerance):
                 self.logger.info("Goal reached.")
+                # Check if goal is at a corner and apply pose correction if so
+                self._apply_corner_correction_if_applicable(goal)
             else:
                 self.logger.warning("Navigation ended without reaching goal.")
             return
@@ -1708,6 +1710,32 @@ class OdomOnlyNavigator:
         ):
             return
         self.logger.info("Goal reached.")
+        # Check if goal is at a corner and apply pose correction if so
+        self._apply_corner_correction_if_applicable(goal)
+    
+    def _apply_corner_correction_if_applicable(self, goal_position):
+        """
+        Check if the goal position is near a corner and apply pose correction if so.
+        
+        Args:
+            goal_position: (x, y) tuple of the reached goal
+        """
+        if not self.boundary_polygon:
+            return
+        
+        # Check if this goal is at a boundary corner
+        corner_info = self._is_poi_at_corner(goal_position)
+        if corner_info:
+            self.logger.info(
+                "Goal at corner detected (angle=%.1f°). Applying LIDAR-based pose correction...",
+                corner_info['interior_angle']
+            )
+            # Wait a moment for robot to fully settle after movement
+            time.sleep(0.3)
+            # Apply correction
+            self._correct_pose_at_corner(corner_info)
+        else:
+            self.logger.debug("Goal not near any boundary corner; skipping pose correction.")
 
 
     # --- CLI loop ---
@@ -2520,6 +2548,436 @@ class OdomOnlyNavigator:
             if not self._execute_segment_move(seg['heading'], seg['distance']):
                 return False
         return True
+
+    def _find_boundary_corners(self, angle_threshold=45.0):
+        """
+        Detect corner vertices in boundary polygon.
+        
+        A corner is a vertex where the angle between incoming/outgoing edges
+        is significantly different from 180° (not a straight line).
+        
+        Args:
+            angle_threshold: Minimum deviation from 180° to consider a corner
+        
+        Returns:
+            List of corner dicts with {position, interior_angle, wall_headings}
+        """
+        if not self.boundary_polygon or len(self.boundary_polygon) < 3:
+            return []
+        
+        corners = []
+        points = self.boundary_polygon
+        n = len(points)
+        
+        for i in range(n):
+            p_prev = points[(i - 1) % n]
+            p_curr = points[i]
+            p_next = points[(i + 1) % n]
+            
+            # Compute vectors from current point
+            v1 = (p_prev[0] - p_curr[0], p_prev[1] - p_curr[1])
+            v2 = (p_next[0] - p_curr[0], p_next[1] - p_curr[1])
+            
+            # Compute angle between vectors
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            mag1 = math.hypot(v1[0], v1[1])
+            mag2 = math.hypot(v2[0], v2[1])
+            
+            if mag1 < 0.01 or mag2 < 0.01:
+                continue  # Skip degenerate edges
+            
+            cos_angle = dot / (mag1 * mag2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))  # Clamp for numerical stability
+            angle_deg = math.degrees(math.acos(cos_angle))
+            
+            # A corner is where angle deviates significantly from 180°
+            angle_deviation = abs(180.0 - angle_deg)
+            
+            if angle_deviation > angle_threshold:
+                # Compute wall headings for this corner
+                heading1 = normalize_angle_deg(math.degrees(math.atan2(v1[1], v1[0])))
+                heading2 = normalize_angle_deg(math.degrees(math.atan2(v2[1], v2[0])))
+                
+                corners.append({
+                    'position': p_curr,
+                    'interior_angle': angle_deg,
+                    'wall_headings': [heading1, heading2],
+                    'angle_deviation': angle_deviation
+                })
+        
+        return corners
+    
+    def _is_poi_at_corner(self, poi_position, corner_tolerance=0.3):
+        """
+        Check if a POI is close to a boundary corner.
+        
+        Args:
+            poi_position: (x, y) tuple of POI location
+            corner_tolerance: Maximum distance from corner to consider match (meters)
+        
+        Returns:
+            Corner info dict if near corner, None otherwise
+        """
+        corners = self._find_boundary_corners()
+        
+        for corner in corners:
+            dist = math.hypot(
+                poi_position[0] - corner['position'][0],
+                poi_position[1] - corner['position'][1]
+            )
+            if dist <= corner_tolerance:
+                self.logger.info(
+                    "POI (%.2f, %.2f) matched to corner at (%.2f, %.2f) - "
+                    "distance=%.2fm, interior_angle=%.1f°",
+                    poi_position[0], poi_position[1],
+                    corner['position'][0], corner['position'][1],
+                    dist, corner['interior_angle']
+                )
+                return corner
+        
+        return None
+    
+    def _detect_walls_in_scan(self, scan, min_wall_points=10, max_dist_variation=0.1):
+        """
+        Detect wall segments from LIDAR scan.
+        
+        A wall is a sequence of consecutive scan points at similar distance
+        that span a reasonable angular range.
+        
+        Args:
+            scan: Raw LIDAR scan data
+            min_wall_points: Minimum number of points to consider a wall
+            max_dist_variation: Maximum distance variation between consecutive points (meters)
+        
+        Returns:
+            List of wall dicts with {angle, distance, span_deg, point_count}
+        """
+        if not scan:
+            return []
+        
+        walls = []
+        current_wall = []
+        
+        # Sort by angle for sequential processing
+        sorted_scan = sorted(scan, key=lambda x: x[1])
+        
+        for quality, angle_deg, dist_mm in sorted_scan:
+            if quality < 10 or dist_mm < 200 or dist_mm > 2000:
+                if current_wall and len(current_wall) >= min_wall_points:
+                    walls.append(self._process_wall_segment(current_wall))
+                current_wall = []
+                continue
+            
+            dist_m = dist_mm / 1000.0
+            robot_angle = lidar_angle_to_robot(angle_deg)
+            
+            if not current_wall:
+                current_wall = [(robot_angle, dist_m)]
+            else:
+                last_angle, last_dist = current_wall[-1]
+                # Check if point continues the wall
+                if (abs(dist_m - last_dist) < max_dist_variation and
+                    abs(robot_angle - last_angle) < 5.0):  # Within 5° of previous point
+                    current_wall.append((robot_angle, dist_m))
+                else:
+                    # Wall segment ended, save if long enough
+                    if len(current_wall) >= min_wall_points:
+                        walls.append(self._process_wall_segment(current_wall))
+                    current_wall = [(robot_angle, dist_m)]
+        
+        # Don't forget last wall
+        if len(current_wall) >= min_wall_points:
+            walls.append(self._process_wall_segment(current_wall))
+        
+        return walls
+    
+    def _process_wall_segment(self, wall_points):
+        """
+        Process a list of wall points into a wall descriptor.
+        
+        Args:
+            wall_points: List of (angle, distance) tuples
+        
+        Returns:
+            Dict with wall properties
+        """
+        angles = [p[0] for p in wall_points]
+        dists = [p[1] for p in wall_points]
+        
+        # Wall heading is perpendicular to the direction toward the wall
+        # Average angle points roughly at the wall's center
+        avg_angle = sum(angles) / len(angles)
+        avg_dist = sum(dists) / len(dists)
+        
+        # Wall heading (perpendicular to radial direction)
+        wall_heading = normalize_angle_deg(avg_angle + 90.0)
+        
+        span_deg = max(angles) - min(angles)
+        
+        return {
+            'angle': avg_angle,  # Angle toward wall center
+            'distance': avg_dist,
+            'heading': wall_heading,  # Wall's orientation
+            'span_deg': span_deg,
+            'point_count': len(wall_points)
+        }
+    
+    def _match_walls_to_corner(self, walls, expected_headings, tolerance_deg=30.0):
+        """
+        Match detected LIDAR walls to expected corner wall headings.
+        
+        Args:
+            walls: List of wall dicts from _detect_walls_in_scan
+            expected_headings: List of expected wall headings from corner definition
+            tolerance_deg: Maximum angle difference to consider a match
+        
+        Returns:
+            List of matched wall dicts, or None if insufficient matches
+        """
+        if len(walls) < 2 or len(expected_headings) < 2:
+            return None
+        
+        matched = []
+        used_walls = set()
+        
+        for expected_heading in expected_headings:
+            best_wall = None
+            best_diff = float('inf')
+            best_idx = None
+            
+            for idx, wall in enumerate(walls):
+                if idx in used_walls:
+                    continue
+                
+                # Compare wall heading with expected heading
+                diff = abs(normalize_angle_deg(wall['heading'] - expected_heading))
+                # Also check perpendicular (walls can be described from either side)
+                diff_perp = abs(normalize_angle_deg(diff - 180.0))
+                actual_diff = min(diff, diff_perp)
+                
+                if actual_diff < best_diff and actual_diff < tolerance_deg:
+                    best_diff = actual_diff
+                    best_wall = wall
+                    best_idx = idx
+            
+            if best_wall:
+                matched.append(best_wall)
+                used_walls.add(best_idx)
+        
+        if len(matched) < 2:
+            return None
+        
+        return matched[:2]  # Only need 2 walls for corner correction
+    
+    def _compute_heading_from_walls(self, walls):
+        """
+        Compute robot heading from two detected walls.
+        
+        Uses the angle bisector of the two wall headings to estimate
+        the robot's orientation at a corner.
+        
+        Args:
+            walls: List of at least 2 wall dicts with 'heading' field
+        
+        Returns:
+            Estimated robot heading in degrees
+        """
+        if len(walls) < 2:
+            return None
+        
+        # Take first two walls
+        h1 = walls[0]['heading']
+        h2 = walls[1]['heading']
+        
+        # Compute angle bisector (heading that splits the corner)
+        # This is the heading the robot should have if perfectly aligned
+        delta = normalize_angle_deg(h2 - h1)
+        
+        if abs(delta) > 120.0:
+            # Walls form an obtuse angle - bisector is ambiguous
+            # Use the wall that's closest (most likely to be accurate)
+            if walls[0]['distance'] < walls[1]['distance']:
+                return normalize_angle_deg(h1 - 90.0)
+            else:
+                return normalize_angle_deg(h2 - 90.0)
+        
+        # Bisector is midpoint between the two headings
+        bisector = normalize_angle_deg(h1 + delta / 2.0)
+        # Robot heading is perpendicular to bisector (facing into corner)
+        robot_heading = normalize_angle_deg(bisector - 90.0)
+        
+        return robot_heading
+    
+    def _compute_position_from_corner_walls(self, corner_position, walls, robot_heading):
+        """
+        Compute corrected robot position from wall distances at a known corner.
+        
+        Args:
+            corner_position: (x, y) of the corner in world frame
+            walls: List of matched wall dicts
+            robot_heading: Robot heading in degrees
+        
+        Returns:
+            Corrected (x, y) position, or None if computation fails
+        """
+        if len(walls) < 2:
+            return None
+        
+        # Use wall distances to triangulate position relative to corner
+        # Assumption: robot is near corner, walls are the corner's edges
+        
+        # For now, use a simple approach: project wall distances onto world axes
+        # More sophisticated: use wall angles + distances to solve for position
+        
+        # Wall 1 and Wall 2 distances
+        d1 = walls[0]['distance']
+        d2 = walls[1]['distance']
+        
+        # Wall angles relative to robot
+        a1 = walls[0]['angle']
+        a2 = walls[1]['angle']
+        
+        # Convert to world frame
+        world_a1 = normalize_angle_deg(robot_heading + a1)
+        world_a2 = normalize_angle_deg(robot_heading + a2)
+        
+        # Compute robot position that would produce these observations
+        # Robot is at: corner + offset perpendicular to each wall
+        # This is a simplified approximation - proper solution needs wall line equations
+        
+        # For a corner at (cx, cy), if walls are at angles w1, w2
+        # and distances d1, d2, robot is offset by those distances
+        # perpendicular to each wall
+        
+        # Simple approach: average the two position estimates
+        rad1 = math.radians(world_a1)
+        rad2 = math.radians(world_a2)
+        
+        # Position estimate from wall 1
+        x1 = corner_position[0] + d1 * math.cos(rad1)
+        y1 = corner_position[1] + d1 * math.sin(rad1)
+        
+        # Position estimate from wall 2
+        x2 = corner_position[0] + d2 * math.cos(rad2)
+        y2 = corner_position[1] + d2 * math.sin(rad2)
+        
+        # Average
+        corrected_x = (x1 + x2) / 2.0
+        corrected_y = (y1 + y2) / 2.0
+        
+        return (corrected_x, corrected_y)
+    
+    def _correct_pose_at_corner(self, corner_info):
+        """
+        Use LIDAR to correct pose when at a known corner.
+        
+        Steps:
+        1. Detect walls in LIDAR scan
+        2. Match walls to corner's expected wall headings
+        3. Compute heading correction from wall angles
+        4. Compute position correction from wall distances
+        5. Update pose if correction is confident
+        
+        Args:
+            corner_info: Corner dict from _is_poi_at_corner
+        """
+        scan = self._get_scan_snapshot()
+        if not scan:
+            self.logger.warning("Corner correction: no LIDAR data")
+            return
+        
+        # Detect walls
+        walls = self._detect_walls_in_scan(scan)
+        if len(walls) < 2:
+            self.logger.warning(
+                "Corner correction: insufficient walls detected (%d < 2)",
+                len(walls)
+            )
+            return
+        
+        self.logger.info(
+            "Corner correction: detected %d walls from LIDAR scan",
+            len(walls)
+        )
+        
+        # Match walls to corner geometry
+        expected_headings = corner_info['wall_headings']
+        matched_walls = self._match_walls_to_corner(walls, expected_headings)
+        
+        if not matched_walls or len(matched_walls) < 2:
+            self.logger.warning(
+                "Corner correction: could not match walls to corner (expected headings: %s)",
+                expected_headings
+            )
+            return
+        
+        self.logger.info(
+            "Corner correction: matched %d walls to corner",
+            len(matched_walls)
+        )
+        
+        # Compute heading correction
+        measured_heading = self._compute_heading_from_walls(matched_walls)
+        if measured_heading is None:
+            self.logger.warning("Corner correction: failed to compute heading from walls")
+            return
+        
+        current_pose = self._get_pose()
+        heading_error = normalize_angle_deg(measured_heading - current_pose['heading_deg'])
+        
+        # Apply heading correction if significant (threshold: 3°)
+        heading_threshold = 3.0
+        if abs(heading_error) > heading_threshold:
+            self.logger.info(
+                "Corner correction: heading %.1f° → %.1f° (Δ%.1f°)",
+                current_pose['heading_deg'],
+                measured_heading,
+                heading_error
+            )
+            with self.pose_lock:
+                self.cmd_pose['heading_deg'] = measured_heading
+        else:
+            self.logger.info(
+                "Corner correction: heading error %.1f° < %.1f° threshold, no correction needed",
+                abs(heading_error),
+                heading_threshold
+            )
+        
+        # Compute position correction from wall intersections
+        corrected_pos = self._compute_position_from_corner_walls(
+            corner_info['position'],
+            matched_walls,
+            measured_heading
+        )
+        
+        if corrected_pos:
+            pos_error = math.hypot(
+                corrected_pos[0] - current_pose['x'],
+                corrected_pos[1] - current_pose['y']
+            )
+            
+            # Apply position correction if significant (threshold: 5cm)
+            position_threshold = 0.05
+            if pos_error > position_threshold:
+                self.logger.info(
+                    "Corner correction: position (%.2f,%.2f) → (%.2f,%.2f) (Δ%.2fcm)",
+                    current_pose['x'],
+                    current_pose['y'],
+                    corrected_pos[0],
+                    corrected_pos[1],
+                    pos_error * 100
+                )
+                with self.pose_lock:
+                    self.cmd_pose['x'] = corrected_pos[0]
+                    self.cmd_pose['y'] = corrected_pos[1]
+            else:
+                self.logger.info(
+                    "Corner correction: position error %.2fcm < %.2fcm threshold, no correction needed",
+                    pos_error * 100,
+                    position_threshold * 100
+                )
+        else:
+            self.logger.warning("Corner correction: failed to compute position from walls")
 
     def _goal_valid(self, goal):
         if self.boundary_polygon and not self._point_in_polygon(goal, self.boundary_polygon):
