@@ -958,10 +958,29 @@ class OdomOnlyNavigator:
             f"ROTATE: angle={desired_angle_deg:.1f}°, scale={primitive['scale']:.4f}, calibrated={calibrated_angle:.2f}°"
         )
         
+        # Ensure robot is fully stopped before rotation (critical after MOVE commands)
+        self._send_raw_command("STOP")
+        self._wait_for_response(["OK STOP"], ["ERR"], timeout=0.5)
+        time.sleep(0.2)  # Let motors fully stop
+        
         # Reset STM32 odom cache before ROTATE
         self._reset_stm32_odom()
         
-        # Send calibrated angle to STM32
+        # Reset odometry on STM32 and wait for it to settle
+        self._send_raw_command("RESET_ODOM")
+        self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+        time.sleep(0.3)  # Increased from 0.1s - critical for back-to-back MOVE→ROTATE
+        
+        # Verify odometry actually reset (prevent stuck rotations from residual position)
+        check_odom = self._get_stm32_odom()
+        if abs(check_odom['x']) > 0.02 or abs(check_odom['y']) > 0.02:
+            self.logger.warning(
+                f"Odometry not fully reset before ROTATE: x={check_odom['x']:.3f}, y={check_odom['y']:.3f}. "
+                "Adding extra settling time..."
+            )
+            time.sleep(0.2)
+        
+        # Send calibrated angle to STM32 (odometry should now be clean)
         cmd = f"ROTATE_DEG {calibrated_angle:.2f}"
         self.logger.info(f">>> {cmd}")
         self._clear_response_queue()
@@ -1001,8 +1020,6 @@ class OdomOnlyNavigator:
             self.logger.info(f"Rotation completed: {line}")
             # Trust commanded angle for pose update (single source of truth)
             self._update_pose_after_rotate(world_delta)
-            self._send_raw_command("RESET_ODOM")
-            time.sleep(0.1)
             with self.active_motion_lock:
                 self.active_motion = None
             return True
@@ -1010,8 +1027,6 @@ class OdomOnlyNavigator:
         # Rotation timed out - trust commanded angle anyway since we snapped to allowed angles
         self.logger.warning(f"Rotation timeout/failed: {line}. Using commanded angle for pose update.")
         self._update_pose_after_rotate(world_delta)
-        self._send_raw_command("RESET_ODOM")
-        time.sleep(0.1)
         with self.active_motion_lock:
             self.active_motion = None
         return False
@@ -1114,9 +1129,6 @@ class OdomOnlyNavigator:
         if result and line and "TARGET_REACHED" in line:
             # MOVE hoàn thành thành công -> trust commanded distance
             self._update_pose_after_move(target_distance)
-            # Reset STM32 odometry cho lệnh tiếp theo
-            self._send_raw_command("RESET_ODOM")
-            time.sleep(0.1)
             with self.active_motion_lock:
                 self.active_motion = None
             # Publish latest pose so UI sees translation promptly
@@ -1146,10 +1158,6 @@ class OdomOnlyNavigator:
             self._update_pose_after_move(actual_distance)
         else:
             self.logger.info(f"Movement barely started (odom x={stm32_odom['x']:.3f})")
-
-        # Reset STM32 odometry cho lệnh tiếp theo
-        self._send_raw_command("RESET_ODOM")
-        time.sleep(0.1)
 
         with self.active_motion_lock:
             self.active_motion = None
