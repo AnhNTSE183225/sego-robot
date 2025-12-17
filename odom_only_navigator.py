@@ -600,8 +600,7 @@ class OdomOnlyNavigator:
             if self.active_motion.get('mode') == 'rotate':
                 incr = abs(delta.get('heading_deg', 0.0))
             else:
-                # Forward-only progress for MOVE; ignore lateral drift/noise.
-                incr = max(0.0, delta.get('x', 0.0))
+                incr = abs(delta.get('x', 0.0)) + abs(delta.get('y', 0.0))
             if incr > 0:
                 target_cap = self.active_motion.get('target', float('inf'))
                 self.active_motion['progress'] = min(
@@ -940,7 +939,7 @@ class OdomOnlyNavigator:
         
         Angle must already be an allowed angle (snapped by caller).
         Uses per-angle calibration scale for STM32 command.
-        Updates pose only on successful completion (TARGET_REACHED).
+        Trusts commanded angle for pose update (single source of truth).
         
         STM32 ROTATE_DEG behavior:
         - "OK ROTATE_DEG" = command received, rotation started
@@ -1021,8 +1020,9 @@ class OdomOnlyNavigator:
                 self.active_motion = None
             return True
         
-        # Rotation timed out/failed - do not update pose unless TARGET_REACHED.
-        self.logger.warning(f"Rotation timeout/failed: {line}. Pose not updated.")
+        # Rotation timed out - trust commanded angle anyway since we snapped to allowed angles
+        self.logger.warning(f"Rotation timeout/failed: {line}. Using commanded angle for pose update.")
+        self._update_pose_after_rotate(world_delta)
         self._send_raw_command("RESET_ODOM")
         time.sleep(0.1)
         with self.active_motion_lock:
@@ -1142,13 +1142,24 @@ class OdomOnlyNavigator:
         # odom.y ≈ 0 (lateral drift), không cần đọc
         time.sleep(0.1)  # Cho STM32 cập nhật odom
         stm32_odom = self._get_stm32_odom()
-        actual_distance = max(0.0, stm32_odom.get('x', 0.0))  # forward-only; ignore lateral drift
+        actual_distance = stm32_odom['x']  # Forward distance
+        # Prefer accumulated progress magnitude (capped) when available, so STOP retains mid-position
+        with self.active_motion_lock:
+            if self.active_motion:
+                progress_capped = min(
+                    self.active_motion.get('progress', 0.0),
+                    self.active_motion.get('target', float('inf'))
+                )
+                actual_distance = max(actual_distance, progress_capped)
+        if actual_distance < 0:
+            self.logger.warning(f"Negative odom.x ({actual_distance:.3f}m) - robot drifted backward?")
+            actual_distance = 0.0  # Don't update pose if robot went backward
         
         if actual_distance > DISTANCE_TOLERANCE_M:
             self.logger.info(f"Movement interrupted at {actual_distance:.3f}m (commanded: {target_distance:.3f}m)")
             self._update_pose_after_move(actual_distance)
         else:
-            self.logger.info(f"Movement barely started (odom x={stm32_odom.get('x', 0.0):.3f})")
+            self.logger.info(f"Movement barely started (odom x={stm32_odom['x']:.3f})")
 
         # Reset STM32 odometry cho lệnh tiếp theo
         self._send_raw_command("RESET_ODOM")
