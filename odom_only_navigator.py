@@ -1066,6 +1066,11 @@ class OdomOnlyNavigator:
         # MOVE commands are NOT clamped - only rotations are clamped/quantized
         # Robot can move any distance in a single command
         
+        # Ensure robot is fully stopped before movement (critical after previous commands)
+        self._send_raw_command("STOP")
+        self._wait_for_response(["OK STOP"], ["ERR"], timeout=0.5)
+        time.sleep(0.2)  # Let motors fully stop
+        
         # Reset STM32 odom cache trước khi MOVE để đo được khoảng cách thực tế
         self._reset_stm32_odom()
         
@@ -2484,7 +2489,6 @@ class OdomOnlyNavigator:
                 if not self._rotate_to_heading(heading_world):
                     return False
             step = min(remaining, MAX_MOVE_COMMAND_M)
-            step = self._clamp_move_command(step)
             if self._segment_blocked_by_lidar(heading_world, step):
                 # Try a quick right-hand sidestep to clear the blockage
                 if self._escape_right_detour(heading_world, step):
