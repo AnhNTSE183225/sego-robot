@@ -1,15 +1,22 @@
 # Active Context
 
 ## Current Work Focus
-- Diagnose why `perimeter_validate` (“map verification”) does not behave as intended.
+- LIDAR-based pose correction to address positioning drift during obstacle renavigation.
 
-## Recent Findings (from `robot.log` + code)
-- Perimeter verification uses `_navigate_segment()` which issues a single `_send_move(distance)` to reach each boundary vertex.
-- `_send_move()` clamps distances to `motion.max_move_command_m` (currently 1.0m), so long perimeter edges are not actually completed in one command.
-- Rotations are quantized/clamped (e.g., `motion.min_rotate_deg=30` plus discrete allowed angles), which can leave large residual heading error on diagonal segments.
-- Rotations frequently TIMEOUT on the STM32 side during `perimeter_validate`, preventing the routine from reaching the “VALID/INVALID” verdict path reliably.
+## Recent Changes (2025-12-18)
+- **Implemented LIDAR-based pose correction system** for POI navigation
+  - Auto-detects boundary corners from polygon geometry (angle deviation >45°)
+  - Detects wall segments in LIDAR scans
+  - Corrects heading (threshold: 3°) and position (threshold: 5cm) when reaching POIs near corners
+  - Integrated into `navigate_to()` - triggers automatically after reaching any goal near a corner (within 30cm)
+
+## Key Learnings
+- **Positioning drift root cause**: Accumulated odometry errors during obstacle detours cause 10-20cm position errors at POIs
+- **Solution approach**: Use LIDAR wall detection at known corners to correct pose rather than relying solely on dead reckoning
+- **Corner detection**: No map changes needed - corners auto-detected from existing boundary polygon geometry
+- **Scope**: Correction currently applies to POI navigation but NOT to perimeter verification (`_navigate_segment()` is separate path)
 
 ## Next Steps
-- Make `perimeter_validate` respect move/rotate clamping (split long edges into multiple steps or change semantics).
-- Reduce rotation TIMEOUT rate during verification by aligning tolerances/params with observed drift during rotations.
-
+- Test pose correction with real obstacle scenarios to validate 10-20cm drift is reduced
+- Consider adding pose correction to perimeter verification for more accurate map validation
+- Monitor logs for correction frequency and magnitude to tune thresholds if needed
