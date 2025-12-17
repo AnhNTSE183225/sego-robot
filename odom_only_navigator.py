@@ -842,6 +842,31 @@ class OdomOnlyNavigator:
 
         return sign * clamped
 
+    def _snap_to_allowed_angle(self, angle_deg):
+        """Snap angle to nearest allowed rotation angle.
+        
+        This ensures rotation commands use only configured allowed angles
+        (e.g., 30, 60, 90, 120, 180 degrees).
+        
+        Args:
+            angle_deg: Requested rotation angle
+            
+        Returns:
+            Snapped angle (one of ROTATION_ALLOWED_ANGLES with original sign)
+            Returns 0.0 if angle is too small
+        """
+        abs_angle = abs(angle_deg)
+        sign = 1 if angle_deg >= 0 else -1
+        
+        if abs_angle < ROTATION_MIN_THRESHOLD_DEG:
+            return 0.0
+        
+        if not ROTATION_ALLOWED_ANGLES:
+            return angle_deg  # Fallback if no angles configured
+        
+        nearest = min(ROTATION_ALLOWED_ANGLES, key=lambda x: abs(x - abs_angle))
+        return sign * nearest
+
     # --- Command helpers ---
     def _send_raw_command(self, text):
         if not self.serial_conn:
@@ -912,9 +937,9 @@ class OdomOnlyNavigator:
     def _send_rotate(self, desired_angle_deg, target_heading_world=None, world_delta=None):
         """Rotate by desired_angle_deg relative to current heading.
         
-        Uses discrete angle quantization and per-angle calibration.
-        
-        TEMPORARY: Quantization is executor-level. Phase 2 moves to planner.
+        Angle must already be an allowed angle (snapped by caller).
+        Uses per-angle calibration scale for STM32 command.
+        Trusts commanded angle for pose update (single source of truth).
         
         STM32 ROTATE_DEG behavior:
         - "OK ROTATE_DEG" = command received, rotation started
@@ -923,22 +948,16 @@ class OdomOnlyNavigator:
         
         Returns:
             True if rotation completed successfully
-            False if rotation failed/interrupted (pose updated with actual rotation)
+            False if rotation failed/interrupted
         """
         if abs(desired_angle_deg) < 0.1:
             return True
         
-        # Step 1: Apply discrete angle quantization
-        quantized_angle = quantize_rotation_angle(desired_angle_deg)
-        if abs(quantized_angle) < 0.1:
-            self.logger.info(f"Rotation {desired_angle_deg:.1f}° too small after quantization, skipping")
-            return True
+        # Get calibration from rotation primitive (angle must already be an allowed angle)
+        primitive = get_rotation_primitive(desired_angle_deg)
+        calibrated_angle = desired_angle_deg * primitive['scale']
         
-        # Step 2: Get calibration from rotation primitive
-        primitive = get_rotation_primitive(quantized_angle)
-        calibrated_angle = quantized_angle * primitive['scale']
-        
-        # Step 2.5: Apply per-angle motor parameters if specified
+        # Apply per-angle motor parameters if specified
         per_angle_min_duty = primitive.get('min_duty_rotate')
         per_angle_angular_k = primitive.get('angular_k')
         if per_angle_min_duty is not None:
@@ -949,42 +968,31 @@ class OdomOnlyNavigator:
             self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
         
         self.logger.info(
-            f"ROTATE: requested={desired_angle_deg:.1f}°, quantized={quantized_angle:.1f}°, "
-            f"scale={primitive['scale']:.4f}, calibrated={calibrated_angle:.2f}°"
+            f"ROTATE: angle={desired_angle_deg:.1f}°, scale={primitive['scale']:.4f}, calibrated={calibrated_angle:.2f}°"
         )
         
         # Reset STM32 odom cache before ROTATE
         self._reset_stm32_odom()
         
-        # LIDAR heading correction: capture scan profile BEFORE rotation
-        scan_before = None
-        profile_before = None
-        counts_before = None
-        if self.first_scan_event.is_set():
-            scan_before = self._get_scan_snapshot()
-            profile_before, counts_before = self._build_scan_profile(scan_before)
-            self.logger.debug("Captured pre-rotation scan profile (%d valid bins)", sum(1 for c in counts_before if c > 0))
-        
-        # Step 3: Send calibrated angle to STM32 (uses frame conversion: world->robot)
-        # Note: The angle here is already in the expected direction for STM32
+        # Send calibrated angle to STM32
         cmd = f"ROTATE_DEG {calibrated_angle:.2f}"
         self.logger.info(f">>> {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
         
-        # Step 1: wait for OK ROTATE_DEG (command acknowledged)
+        # Wait for ACK
         result, line = self._wait_for_response(
             success_tokens=["OK ROTATE_DEG"],
             failure_tokens=["ERR"],
-            timeout=2.0  # Short timeout for ACK
+            timeout=2.0
         )
         if not result:
             self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
             return False
 
         # Track active rotation for live status fusion
-        # Use quantized angle for tracking (what we're actually commanding)
-        world_delta = world_delta if world_delta is not None else robot_to_world_rotation(quantized_angle)
+        # world_delta is the intended rotation in world frame
+        world_delta = world_delta if world_delta is not None else robot_to_world_rotation(desired_angle_deg)
         with self.active_motion_lock:
             self.active_motion = {
                 'mode': 'rotate',
@@ -995,7 +1003,7 @@ class OdomOnlyNavigator:
                 'progress': 0.0,
             }
         
-        # Step 4: wait for TARGET_REACHED or TIMEOUT
+        # Wait for TARGET_REACHED or TIMEOUT
         result, line = self._wait_for_response(
             success_tokens=["TARGET_REACHED"],
             failure_tokens=["TIMEOUT"],
@@ -1004,98 +1012,21 @@ class OdomOnlyNavigator:
         
         if result:
             self.logger.info(f"Rotation completed: {line}")
-            
-            # LIDAR heading correction: capture scan profile AFTER rotation
-            lidar_yaw = None
-            lidar_confidence = 0.0
-            if profile_before is not None and self.first_scan_event.is_set():
-                time.sleep(0.1)  # Brief pause to let LIDAR stabilize after rotation
-                scan_after = self._get_scan_snapshot()
-                profile_after, counts_after = self._build_scan_profile(scan_after)
-                lidar_yaw, lidar_confidence = self._estimate_yaw_from_scans(
-                    profile_before, profile_after, counts_before, counts_after
-                )
-                self.logger.info(
-                    "LIDAR heading correction: yaw=%.1f°, confidence=%.2f (threshold=0.5)",
-                    lidar_yaw, lidar_confidence
-                )
-            
-            # Get STM32 odom rotation as fallback/comparison
-            stm32_applied_world = None
-            for _ in range(3):
-                stm32_odom = self._get_stm32_odom()
-                actual_rotation = stm32_odom.get('heading_deg', 0.0)
-                if abs(actual_rotation) > 0.1:
-                    stm32_applied_world = robot_to_world_rotation(actual_rotation)
-                    break
-                time.sleep(0.05)
-            
-            # Always use STM32 odom for pose update (or fallback to quantized command)
-            # LIDAR yaw kept for diagnostic logging only - not used for pose update
-            # (sign convention issues and no sanity checks make it unreliable for now)
-            if stm32_applied_world is not None:
-                applied_world = stm32_applied_world
-            else:
-                # fallback: use the intended world delta (already computed)
-                applied_world = world_delta
-            
-            # Log LIDAR yaw for diagnostics only (not used for pose update)
-            if lidar_yaw is not None:
-                self.logger.info(
-                    "LIDAR yaw (diagnostic only): %.1f° conf=%.2f (STM32 used: %.1f°)",
-                    lidar_yaw, lidar_confidence, applied_world if applied_world else 0.0
-                )
-            
-            if applied_world is not None:
-                # Odom có đổi góc → coi là thành công bình thường
-                self._update_pose_after_rotate(applied_world)
-                self._send_raw_command("RESET_ODOM")
-                time.sleep(0.1)
-                with self.active_motion_lock:
-                    self.active_motion = None
-                return True
-            else:
-                # Odom KHÔNG đổi (gần 0°) → coi là FAIL để _rotate_to_heading tăng attempts và bỏ.
-                self.logger.warning(
-                    "Rotation completed but odom heading ~0; treating as FAILED rotation."
-                )
-                self._send_raw_command("RESET_ODOM")
-                time.sleep(0.1)
-                with self.active_motion_lock:
-                    self.active_motion = None
-                return False
-        
-        # Rotation was interrupted/timed out: use STM32 odom to see how far it got
-        stm32_odom = self._get_stm32_odom()
-        actual_rotation = stm32_odom['heading_deg']
-        target_delta_mcu = desired_angle_deg  # MCU frame (same sign as command)
-        rotation_err_mcu = abs(actual_rotation - target_delta_mcu)
-        if rotation_err_mcu <= ROTATE_TIMEOUT_TOLERANCE_DEG:
-            self.logger.warning(
-                "Rotation TIMEOUT but odom within tolerance in MCU frame (actual=%.1f°, target=%.1f°, err=%.1f° <= %.1f°); accepting.",
-                actual_rotation, target_delta_mcu, rotation_err_mcu, ROTATE_TIMEOUT_TOLERANCE_DEG
-            )
-            applied_world = robot_to_world_rotation(actual_rotation)  # Use frame conversion
-            self._update_pose_after_rotate(applied_world)
+            # Trust commanded angle for pose update (single source of truth)
+            self._update_pose_after_rotate(world_delta)
             self._send_raw_command("RESET_ODOM")
             time.sleep(0.1)
             with self.active_motion_lock:
                 self.active_motion = None
             return True
         
-        if abs(actual_rotation) > 0.5:  # At least some rotation happened
-            self.logger.info(f"Rotation interrupted at {actual_rotation:.1f}deg (commanded: {desired_angle_deg:.1f}deg)")
-        
-        # Reset STM32 odometry for the next command
+        # Rotation timed out - trust commanded angle anyway since we snapped to allowed angles
+        self.logger.warning(f"Rotation timeout/failed: {line}. Using commanded angle for pose update.")
+        self._update_pose_after_rotate(world_delta)
         self._send_raw_command("RESET_ODOM")
         time.sleep(0.1)
         with self.active_motion_lock:
             self.active_motion = None
-        
-        if result is False:
-            self.logger.warning(f"Rotation failed ({line}).")
-        else:
-            self.logger.warning("Rotation timeout with no MCU response.")
         return False
 
     def _send_stop(self):
@@ -1620,7 +1551,12 @@ class OdomOnlyNavigator:
             # MCU expects clockwise positive, so invert sign
             command_delta = -world_delta
             command_delta = self._clamp_rotate_command(command_delta)
-            world_delta = -command_delta  # keep world delta in sync after clamp
+            # Snap to allowed angles (30, 60, 90, 120, 180)
+            command_delta = self._snap_to_allowed_angle(command_delta)
+            if abs(command_delta) < 0.1:
+                self.logger.info("Rotation snapped to 0; accepting current heading.")
+                return True
+            world_delta = -command_delta  # keep world delta in sync after snap
 
             self.logger.info(
                 "Rotate_to_heading: current=%.1f°, target=%.1f°, step_world=%.1f°, command_delta=%.1f°",
@@ -1628,7 +1564,7 @@ class OdomOnlyNavigator:
             )
             ok = self._send_rotate(command_delta, target_heading_world, world_delta=world_delta)
             if ok:
-                # Pose already updated inside _send_rotate using actual odom; do not add again.
+                # Pose updated inside _send_rotate using commanded angle (single source of truth)
                 continue
 
             attempts += 1
