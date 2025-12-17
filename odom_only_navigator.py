@@ -804,21 +804,8 @@ class OdomOnlyNavigator:
 
 
     # --- Command clamps ---
-    def _clamp_move_command(self, distance):
-        """Clamp MOVE distance to configured min/max to avoid too-small or oversized commands."""
-        sign = 1.0 if distance >= 0 else -1.0
-        abs_val = abs(distance)
-        clamped = min(max(abs_val, MIN_MOVE_COMMAND_M), MAX_MOVE_COMMAND_M)
-        if clamped != abs_val:
-            self.logger.info(
-                "MOVE command clamped from %.3fm to %.3fm (min=%.3fm, max=%.3fm)",
-                abs_val * sign,
-                clamped * sign,
-                MIN_MOVE_COMMAND_M,
-                MAX_MOVE_COMMAND_M,
-            )
-        return sign * clamped
-
+    # NOTE: Only ROTATE commands are clamped/quantized. MOVE commands are NOT clamped.
+    
     def _clamp_rotate_command(self, angle_deg):
         """Clamp ROTATE_DEG to configured min/max magnitude."""
         sign = 1.0 if angle_deg >= 0 else -1.0
@@ -1061,9 +1048,8 @@ class OdomOnlyNavigator:
         if target_distance < DISTANCE_TOLERANCE_M:
             return True
 
-        commanded_distance = self._clamp_move_command(target_distance)
-        if commanded_distance != target_distance:
-            target_distance = commanded_distance
+        # MOVE commands are NOT clamped - only rotations are clamped/quantized
+        # Robot can move any distance in a single command
         
         # Reset STM32 odom cache trước khi MOVE để đo được khoảng cách thực tế
         self._reset_stm32_odom()
