@@ -2327,6 +2327,15 @@ class OdomOnlyNavigator:
                 nb = (current[0] + dx, current[1] + dy)
                 if nb not in free:
                     continue
+                
+                # BORDER-AWARE: Validate that segment from current->neighbor stays within boundary
+                current_wx = min_x + current[0] * ASTAR_GRID_STEP_M
+                current_wy = min_y + current[1] * ASTAR_GRID_STEP_M
+                nb_wx = min_x + nb[0] * ASTAR_GRID_STEP_M
+                nb_wy = min_y + nb[1] * ASTAR_GRID_STEP_M
+                if self._segment_leaves_boundary((current_wx, current_wy), (nb_wx, nb_wy)):
+                    continue  # Reject this edge - it would cross the boundary
+                
                 # Use move_cost instead of fixed cost of 1
                 tentative = g_score[current] + move_cost(current, nb)
                 if tentative < g_score.get(nb, math.inf):

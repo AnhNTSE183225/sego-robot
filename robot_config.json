@@ -67,6 +67,7 @@
         "_note": "TEMPORARY: Quantization is executor-level. Phase 2 moves to planner.",
         "allowed_angles": [
             30,
+            45,
             60,
             90,
             120,
@@ -78,6 +79,13 @@
             "min_duty_rotate": 0.50,
             "angular_k": 0.50,
             "drift_x_m": 0.018,
+            "drift_y_m": 0.0
+        },
+        "45": {
+            "scale": 0.963,
+            "min_duty_rotate": 0.50,
+            "angular_k": 0.50,
+            "drift_x_m": 0.008,
             "drift_y_m": 0.0
         },
         "60": {
