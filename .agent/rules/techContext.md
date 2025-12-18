@@ -1,3 +1,7 @@
+---
+trigger: always_on
+---
+
 # Tech Context
 
 ## Runtime
@@ -12,4 +16,3 @@
 
 ## Hardware/Protocols (high level)
 - STM32 receives commands like `MOVE <m>` and `ROTATE_DEG <deg>` and emits status lines including `OK ...`, `TARGET_REACHED`, `TIMEOUT`.
-

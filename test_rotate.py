@@ -428,6 +428,12 @@ class STM32Tester:
                     self.logger.info(f"Rotation {i+1} completed: {line}")
                 else:
                     self.logger.info(f"Rotation completed: {line}")
+                
+                # Send STOP to clear STM32 state before next command (prevents timeouts)
+                self._send_command("STOP")
+                self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+                time.sleep(0.1)
+                
                 # Don't reset odom between repetitions - only at the end
                 if i == repeat_count - 1:
                     # Final rotation done - show cumulative result
@@ -444,7 +450,10 @@ class STM32Tester:
                     time.sleep(0.1)
                 continue
             else:
-                # Rotation failed
+                # Rotation failed - send STOP to clear state
+                self._send_command("STOP")
+                self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+                time.sleep(0.1)
                 all_success = False
                 break
         

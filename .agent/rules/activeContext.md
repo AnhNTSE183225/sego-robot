@@ -1,3 +1,7 @@
+---
+trigger: always_on
+---
+
 # Active Context
 
 ## Current Work Focus

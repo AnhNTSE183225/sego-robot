@@ -1,3 +1,7 @@
+---
+trigger: always_on
+---
+
 # Product Context
 
 ## Why this exists
@@ -13,4 +17,3 @@
 ## UX / Operational Expectations
 - Commands should ACK deterministically (success/failure) and not hang indefinitely.
 - `perimeter_validate` should traverse the boundary edges (not cut diagonals) and finish with a verdict message.
-
