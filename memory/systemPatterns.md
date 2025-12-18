@@ -14,5 +14,5 @@ trigger: always_on
 - **Map anchoring**: Rotate/translate boundary/obstacles/POIs so the first boundary edge aligns to current pose heading at load time.
 - **Command clamping**: Motion commands are clamped by config (`motion.min_*`, `motion.max_*`) to keep STM32 behavior stable.
 - **Discrete rotation primitives**: Rotations are snapped to allowed angles (e.g., 30/60/90/120/180) with per-angle calibration/params.
+- **Dead-reckoning position tracking**: Position updates use accumulated X-axis magnitude from STM32 odometry, ignoring Y-axis noise during forward movement. Both normal completion and emergency stops use this consistent approach.
 - **Perimeter verification**: Implemented as a sequence of “rotate + move” segments to boundary vertices (no detours).
-

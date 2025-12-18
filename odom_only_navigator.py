@@ -1140,23 +1140,26 @@ class OdomOnlyNavigator:
             self._send_status()
             return True
         
-        # Movement bị gián đoạn -> dùng STM32 odom.x để biết thực tế đã đi bao xa
-        # Chỉ đọc odom.x vì MOVE = forward motion = robot's local X axis
-        # odom.y ≈ 0 (lateral drift), không cần đọc
-        time.sleep(0.1)  # Cho STM32 cập nhật odom
-        stm32_odom = self._get_stm32_odom()
-        actual_distance = stm32_odom['x']  # Forward distance
-        # Prefer accumulated progress magnitude (capped) when available, so STOP retains mid-position
+        # Movement bị gián đoạn -> dùng accumulated dead-reckoning progress
+        # Không dùng raw STM32 odom vì Y-axis có nhiều noise khi di chuyển forward
+        # Dead-reckoning chỉ dùng X-axis magnitude nên tránh được offset từ Y-axis noise
+        actual_distance = 0.0
         with self.active_motion_lock:
             if self.active_motion:
+                # Use accumulated progress from dead-reckoning (capped at target)
                 progress_capped = min(
                     self.active_motion.get('progress', 0.0),
                     self.active_motion.get('target', float('inf'))
                 )
-                actual_distance = max(actual_distance, progress_capped)
+                actual_distance = progress_capped
+                self.logger.info(
+                    f"Using dead-reckoning progress: {actual_distance:.3f}m "
+                    f"(target: {self.active_motion.get('target', 0.0):.3f}m)"
+                )
+        
         if actual_distance < 0:
-            self.logger.warning(f"Negative odom.x ({actual_distance:.3f}m) - robot drifted backward?")
-            actual_distance = 0.0  # Don't update pose if robot went backward
+            self.logger.warning(f"Negative progress ({actual_distance:.3f}m) - unexpected!")
+            actual_distance = 0.0  # Don't update pose if negative
         
         if actual_distance > DISTANCE_TOLERANCE_M:
             self.logger.info(f"Movement interrupted at {actual_distance:.3f}m (commanded: {target_distance:.3f}m)")
@@ -1169,12 +1172,27 @@ class OdomOnlyNavigator:
 
         if self._move_stop_reason:
             self.logger.warning(f"Move stopped by LIDAR: {self._move_stop_reason}")
+            # Reset pose and odometry to zero for manual re-alignment
+            self.logger.info("Resetting pose and odometry to zero - please re-align robot manually before next command")
+            self._reset_pose()
+            
+            # Reset STM32 odometry
+            self._send_raw_command("RESET_ODOM")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+            time.sleep(0.2)  # Let STM32 settle
+            self._reset_stm32_odom()
+            
+            # Publish reset pose so UI shows (0,0,0)
+            self._send_status()
+            self.logger.info("Pose reset complete. Robot is at (0.0, 0.0, 0.0°). Ready for next command after manual re-alignment.")
         elif result is False:
             self.logger.warning(f"Move failed ({line}).")
+            # Publish pose even on interruption so UI reflects actual stop point
+            self._send_status()
         else:
             self.logger.warning("Move timeout with no MCU response.")
-        # Publish pose even on interruption so UI reflects actual stop point
-        self._send_status()
+            # Publish pose even on interruption so UI reflects actual stop point
+            self._send_status()
         return False
     
     def _log_lidar_scan_debug(self, robot_heading, clearance_found, distance_needed):
