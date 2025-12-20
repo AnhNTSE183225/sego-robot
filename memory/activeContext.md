@@ -37,6 +37,14 @@ trigger: always_on
   - Backend changes: Added `id` field to `NavigationPointInlineRequest` DTO, updated `AreaServiceImpl` to update existing points instead of delete+recreate
   - Result: No more duplicate POIs, existing IDs preserved, efficient updates
 
+- **Fixed navigation points deletion bug**
+  - Root cause: Navigation points were soft-deleted when viewing/editing area without changes
+  - Bug chain: Soft-deleted POIs → API returns `[]` → Frontend skips loading → Sends `[]` to backend → Backend deletes all → Cycle repeats
+  - Frontend fix: Only include `navigationPoints` field when they were successfully loaded (`AreaEditPage.tsx` lines 123-140)
+  - Backend fix: Only process navigation points when explicitly provided (null check with logging in `AreaServiceImpl.java` lines 103-167)
+  - Database fix: Restored soft-deleted navigation points with `UPDATE navigation_points SET deleted_at = NULL`
+  - Result: Navigation points no longer deleted when viewing/editing area metadata
+
 - **Improved navigation point input precision**
   - Changed `step` attribute from `0.1` to `0.01` in all number inputs in `AreaDefinitionDesigner.tsx`
   - Allows 2 decimal place precision for coordinates (e.g., 1.35, 0.25)
@@ -46,6 +54,7 @@ trigger: always_on
 - Frontend: `MapCanvas.tsx`, `MapCanvas.scss`, `AreaDetailPage.tsx`, `Area.scss`, `AreaEditPage.tsx`, `AreaEditModal.tsx`, `AreaDefinitionDesigner.tsx`
 - Backend: `CreateAreaRequest.java`, `AreaServiceImpl.java`
 - Translations: `vi/area.json`, `en/area.json`
+- Database: Manual restoration of soft-deleted navigation points
 
 ## Recent Changes (2025-12-20 Morning)
 

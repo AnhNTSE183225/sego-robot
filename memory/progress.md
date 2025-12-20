@@ -39,6 +39,13 @@ trigger: always_on
   - Backend updates existing navigation points in-place
   - No more duplicate POIs with different IDs
 
+- **Navigation points deletion bug fix**
+  - Fixed bug where navigation points were soft-deleted when viewing/editing area
+  - Root cause: Frontend sent empty array when POIs weren't loaded → Backend deleted all
+  - Frontend now only sends navigationPoints when successfully loaded
+  - Backend only processes navigationPoints when explicitly provided (null check)
+  - Database restoration of soft-deleted navigation points completed
+
 - **Input precision improvement**
   - Navigation point inputs now support 2 decimal places (step="0.01")
   - Applies to all coordinate inputs in AreaDefinitionDesigner

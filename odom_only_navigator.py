@@ -1018,15 +1018,18 @@ class OdomOnlyNavigator:
         
         if result:
             self.logger.info(f"Rotation completed: {line}")
-            # Trust commanded angle for pose update (single source of truth)
-            self._update_pose_after_rotate(world_delta)
+            # FIX: Use calibrated angle for pose update to match actual robot rotation
+            # This prevents drift accumulation when scale != 1.0
+            actual_world_delta = robot_to_world_rotation(calibrated_angle)
+            self._update_pose_after_rotate(actual_world_delta)
             with self.active_motion_lock:
                 self.active_motion = None
             return True
         
-        # Rotation timed out - trust commanded angle anyway since we snapped to allowed angles
-        self.logger.warning(f"Rotation timeout/failed: {line}. Using commanded angle for pose update.")
-        self._update_pose_after_rotate(world_delta)
+        # Rotation timed out - use calibrated angle for pose update to prevent drift
+        self.logger.warning(f"Rotation timeout/failed: {line}. Using calibrated angle for pose update.")
+        actual_world_delta = robot_to_world_rotation(calibrated_angle)
+        self._update_pose_after_rotate(actual_world_delta)
         with self.active_motion_lock:
             self.active_motion = None
         return False
