@@ -96,7 +96,7 @@
             "drift_y_m": 0.0
         },
         "90": {
-            "scale": 0.947,
+            "scale": 0.952,
             "min_duty_rotate": 0.56,
             "angular_k": 0.56,
             "drift_x_m": 0.008,
