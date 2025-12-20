@@ -1018,16 +1018,14 @@ class OdomOnlyNavigator:
         
         if result:
             self.logger.info(f"Rotation completed: {line}")
-            # FIX: Use the intended desired_angle_deg for pose update, NOT the calibrated_angle.
-            # This ensures software pose matches physical world (where calibrated_angle = physical desired_angle).
+            # Trust commanded angle for pose update (single source of truth)
             self._update_pose_after_rotate(world_delta)
             with self.active_motion_lock:
                 self.active_motion = None
             return True
         
-        # Rotation timed out - use intended angle for pose update to prevent drift, 
-        # but log a warning. Heading discrepancy is better than coordinate drift.
-        self.logger.warning(f"Rotation timeout/failed: {line}. Using intended angle for pose update to maintain coordinate integrity.")
+        # Rotation timed out - trust commanded angle anyway since we snapped to allowed angles
+        self.logger.warning(f"Rotation timeout/failed: {line}. Using commanded angle for pose update.")
         self._update_pose_after_rotate(world_delta)
         with self.active_motion_lock:
             self.active_motion = None
@@ -3131,22 +3129,6 @@ class OdomOnlyNavigator:
             self._send_ack(correlation_id, cmd, True, "No-op resume")
         elif cmd == "ping":
             self._send_ack(correlation_id, cmd, True, "pong")
-        elif cmd == "reset_odom":
-            # Reset robot position to (0, 0, 0°) for manual re-alignment
-            self.logger.info("Resetting pose and odometry to zero")
-            self._reset_pose()
-            
-            # Reset STM32 odometry
-            self._send_raw_command("RESET_ODOM")
-            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
-            time.sleep(0.2)  # Let STM32 settle
-            self._reset_stm32_odom()
-            
-            # Publish reset pose so UI shows (0,0,0)
-            self._send_status()
-            self.logger.info("Pose reset complete. Robot is at (0.0, 0.0, 0.0°). Ready for next command after manual re-alignment.")
-            
-            self._send_ack(correlation_id, cmd, True, "Position reset to (0,0,0)")
         else:
             self._send_ack(correlation_id, cmd, False, "Unsupported command")
 
@@ -3365,9 +3347,6 @@ class OdomOnlyNavigator:
             return False
         
         self.logger.info(f"Rotation complete. Current heading: {self._get_pose()['heading_deg']:.1f}°")
-        
-        # Settle periodically to allow LIDAR readings to stabilize relative to new heading
-        time.sleep(0.3)
 
         # LIDAR check AFTER rotation - now robot faces the goal direction
         # Check forward (0°) relative to current heading
