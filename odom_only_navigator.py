@@ -2,6 +2,7 @@ import json
 import logging
 import logging.handlers
 import math
+import os
 import queue
 import serial
 import sys
@@ -136,9 +137,9 @@ STM32_PARAMS = ROBOT_CONFIG.get('stm32_params', {
 LIDAR_PORT = ROBOT_CONFIG.get('lidar', {}).get('port', '/dev/ttyUSB0')
 LIDAR_FRONT_OFFSET_DEG = ROBOT_CONFIG.get('lidar', {}).get('front_offset_deg', 119.0)
 
-# Kafka configuration (from config file)
+# Kafka configuration (from config file, with environment variable overrides)
 _kafka_cfg = ROBOT_CONFIG.get('kafka', {})
-KAFKA_BOOTSTRAP_SERVERS = _kafka_cfg.get('bootstrap_servers', 'localhost:9092')
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', _kafka_cfg.get('bootstrap_servers', '192.168.1.14:9092'))
 KAFKA_TOPIC_COMMAND = _kafka_cfg.get('topic_command', 'robot.cmd')
 KAFKA_TOPIC_TELEMETRY = _kafka_cfg.get('topic_telemetry', 'robot.telemetry')
 KAFKA_TOPIC_MAP = _kafka_cfg.get('topic_map', 'robot.map')

@@ -12,7 +12,7 @@
         "front_offset_deg": 119.0
     },
     "kafka": {
-        "bootstrap_servers": "dev-api.sego.vn:9092",
+        "bootstrap_servers": "192.168.1.14:9092",
         "topic_command": "robot.cmd",
         "topic_telemetry": "robot.telemetry",
         "topic_map": "robot.map",
