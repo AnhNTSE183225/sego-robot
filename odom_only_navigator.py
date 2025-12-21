@@ -593,7 +593,7 @@ class OdomOnlyNavigator:
         }
 
     def _accumulate_active_motion_progress(self, current_odom):
-        """Update active motion progress using projection onto heading direction."""
+        """Update active motion progress using STM32 robot-frame forward distance."""
         with self.active_motion_lock:
             if not self.active_motion:
                 return 0.0
@@ -601,14 +601,10 @@ class OdomOnlyNavigator:
             if self.active_motion.get('mode') == 'rotate':
                 incr = abs(delta.get('heading_deg', 0.0))
             else:
-                # Project odometry delta onto heading direction
+                # STM32 odometry is in robot frame: X=forward, Y=left
+                # So delta['x'] directly represents forward movement, regardless of world heading
                 # This correctly measures forward progress, ignoring lateral drift
-                heading_rad = math.radians(self.active_motion.get('heading', 0.0))
-                dx = delta.get('x', 0.0)
-                dy = delta.get('y', 0.0)
-                # Distance along heading = dot product with heading unit vector
-                incr = dx * math.cos(heading_rad) + dy * math.sin(heading_rad)
-                incr = max(0, incr)  # Only forward progress
+                incr = max(0.0, delta.get('x', 0.0))  # Only forward progress
             if incr > 0:
                 target_cap = self.active_motion.get('target', float('inf'))
                 self.active_motion['progress'] = min(
