@@ -96,7 +96,7 @@
             "drift_y_m": 0.0
         },
         "90": {
-            "scale": 0.952,
+            "scale": 0.962,
             "min_duty_rotate": 0.56,
             "angular_k": 0.56,
             "drift_x_m": 0.008,
@@ -110,7 +110,7 @@
             "drift_y_m": 0.0
         },
         "180": {
-            "scale": 0.955,
+            "scale": 0.961,
             "min_duty_rotate": 0.56,
             "angular_k": 0.56,
             "drift_x_m": 0.015,
@@ -133,7 +133,7 @@
         "move_min_pwm": 0.35 ,
         "move_max_pwm": 0.70,
         "move_smoothing": 0.3,
-        "move_skew": 0.0075,
+        "move_skew": 0.0080,
         "move_base_pwm": 0.65,
         "move_timeout": 20000,
         "rotate_tol_dist": 0.01,
