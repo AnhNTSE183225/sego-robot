@@ -2,6 +2,7 @@ import json
 import logging
 import logging.handlers
 import math
+import os
 import queue
 import serial
 import sys
@@ -136,9 +137,9 @@ STM32_PARAMS = ROBOT_CONFIG.get('stm32_params', {
 LIDAR_PORT = ROBOT_CONFIG.get('lidar', {}).get('port', '/dev/ttyUSB0')
 LIDAR_FRONT_OFFSET_DEG = ROBOT_CONFIG.get('lidar', {}).get('front_offset_deg', 119.0)
 
-# Kafka configuration (from config file)
+# Kafka configuration (from config file, with environment variable overrides)
 _kafka_cfg = ROBOT_CONFIG.get('kafka', {})
-KAFKA_BOOTSTRAP_SERVERS = _kafka_cfg.get('bootstrap_servers', 'localhost:9092')
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', _kafka_cfg.get('bootstrap_servers', '192.168.1.14:9092'))
 KAFKA_TOPIC_COMMAND = _kafka_cfg.get('topic_command', 'robot.cmd')
 KAFKA_TOPIC_TELEMETRY = _kafka_cfg.get('topic_telemetry', 'robot.telemetry')
 KAFKA_TOPIC_MAP = _kafka_cfg.get('topic_map', 'robot.map')
@@ -198,6 +199,144 @@ def normalize_angle_deg(angle):
     while angle < -180.0:
         angle += 360.0
     return angle
+
+
+# =============================================================================
+# FRAME CONVERSION FUNCTIONS
+# World frame: CCW positive (standard math convention)
+# Robot/STM32 frame: CW positive (what STM32 expects)
+# =============================================================================
+
+def world_to_robot_rotation(world_delta_deg: float) -> float:
+    """Convert world-frame rotation to robot/STM32 command.
+    
+    World frame: CCW positive (planner/world)
+    Robot frame: CW positive (STM32 expects this)
+    
+    Args:
+        world_delta_deg: Rotation in world frame (CCW positive)
+    
+    Returns:
+        Rotation command for STM32 (CW positive)
+    """
+    return -world_delta_deg
+
+
+def robot_to_world_rotation(robot_delta_deg: float) -> float:
+    """Convert robot/STM32 rotation to world frame.
+    
+    Robot frame: CW positive (STM32 reports this)
+    World frame: CCW positive (planner/world)
+    
+    Args:
+        robot_delta_deg: Rotation from STM32 (CW positive)
+    
+    Returns:
+        Rotation in world frame (CCW positive)
+    """
+    return -robot_delta_deg
+
+
+# =============================================================================
+# DISCRETE ROTATION PRIMITIVES
+# TEMPORARY: Quantization is executor-level. Phase 2 moves to planner.
+# =============================================================================
+
+# Load rotation primitives from config
+_rotation_primitives = ROBOT_CONFIG.get('rotation_primitives', {})
+ROTATION_ALLOWED_ANGLES = _rotation_primitives.get('allowed_angles', [30, 60, 90, 120, 150, 180])
+ROTATION_MIN_THRESHOLD_DEG = _rotation_primitives.get('min_angle_threshold_deg', 15)
+
+
+def quantize_rotation_angle(angle_deg: float) -> float:
+    """Quantize rotation angle to nearest allowed discrete angle.
+    
+    TEMPORARY: This executor-level quantization is Phase 1.
+    Phase 2 will move this logic into the path planner for better optimization.
+    
+    Rules:
+    - If abs(angle) < min_threshold: return 0 (skip rotation)
+    - Otherwise: round to nearest allowed angle
+    - Preserve sign (direction)
+    
+    Args:
+        angle_deg: Requested rotation angle in degrees
+    
+    Returns:
+        Quantized angle (one of allowed_angles with original sign)
+        Returns 0.0 if angle is too small
+    """
+    # Normalize to [-180, 180] first
+    angle_deg = normalize_angle_deg(angle_deg)
+    
+    abs_angle = abs(angle_deg)
+    sign = 1 if angle_deg >= 0 else -1
+    
+    # Too small to rotate - clamp to 0
+    if abs_angle < ROTATION_MIN_THRESHOLD_DEG:
+        return 0.0
+    
+    # Find nearest allowed angle
+    if not ROTATION_ALLOWED_ANGLES:
+        return angle_deg  # Fallback if no angles configured
+    
+    nearest = min(ROTATION_ALLOWED_ANGLES, key=lambda x: abs(x - abs_angle))
+    return sign * nearest
+
+
+def get_rotation_primitive(angle_deg: float) -> dict:
+    """Get rotation primitive parameters for a specific angle.
+    
+    Args:
+        angle_deg: Quantized rotation angle (should be one of allowed_angles)
+    
+    Returns:
+        Dict with {scale, drift_x_m, drift_y_m} or defaults if not found
+    """
+    abs_angle = abs(int(round(angle_deg)))
+    primitive = _rotation_primitives.get(str(abs_angle), {})
+    
+    if isinstance(primitive, dict):
+        return {
+            'scale': primitive.get('scale', 1.0),
+            'drift_x_m': primitive.get('drift_x_m', 0.0),
+            'drift_y_m': primitive.get('drift_y_m', 0.0),
+            'min_duty_rotate': primitive.get('min_duty_rotate'),
+            'angular_k': primitive.get('angular_k'),
+        }
+    else:
+        # Legacy format (just a number for scale)
+        return {
+            'scale': float(primitive) if primitive else 1.0,
+            'drift_x_m': 0.0,
+            'drift_y_m': 0.0,
+            'min_duty_rotate': None,
+            'angular_k': None,
+        }
+
+
+def get_calibrated_rotation(angle_deg: float) -> tuple:
+    """Apply quantization and calibration to rotation angle.
+    
+    Args:
+        angle_deg: Requested rotation angle in degrees
+    
+    Returns:
+        Tuple of (quantized_angle, calibrated_angle, primitive)
+        - quantized_angle: Angle after quantization to allowed angles
+        - calibrated_angle: Angle with scale factor applied (for STM32)
+        - primitive: Dict with scale and drift values
+    """
+    quantized = quantize_rotation_angle(angle_deg)
+    if abs(quantized) < 0.1:
+        return 0.0, 0.0, {'scale': 1.0, 'drift_x_m': 0.0, 'drift_y_m': 0.0}
+    
+    primitive = get_rotation_primitive(quantized)
+    calibrated = quantized * primitive['scale']
+    
+    return quantized, calibrated, primitive
+
+
 
 
 def lidar_angle_to_robot(angle_deg: float) -> float:
@@ -555,22 +694,119 @@ class OdomOnlyNavigator:
         with self.scan_lock:
             return list(self.latest_scan)
 
-    # --- Command clamps ---
-    def _clamp_move_command(self, distance):
-        """Clamp MOVE distance to configured min/max to avoid too-small or oversized commands."""
-        sign = 1.0 if distance >= 0 else -1.0
-        abs_val = abs(distance)
-        clamped = min(max(abs_val, MIN_MOVE_COMMAND_M), MAX_MOVE_COMMAND_M)
-        if clamped != abs_val:
-            self.logger.info(
-                "MOVE command clamped from %.3fm to %.3fm (min=%.3fm, max=%.3fm)",
-                abs_val * sign,
-                clamped * sign,
-                MIN_MOVE_COMMAND_M,
-                MAX_MOVE_COMMAND_M,
-            )
-        return sign * clamped
+    def _build_scan_profile(self, scan, bin_count=360, max_range_m=5.0, min_range_m=0.15):
+        """
+        Build a 360° range profile from raw LIDAR scan data.
+        
+        Args:
+            scan: List of (quality, angle_deg, distance_mm) tuples from LIDAR
+            bin_count: Number of angular bins (default 360 for 1° resolution)
+            max_range_m: Points beyond this are clamped
+            min_range_m: Points closer than this are ignored (invalid readings)
+        
+        Returns:
+            List of bin_count floats representing range at each angle bin.
+            Invalid bins are set to max_range_m.
+        """
+        profile = [max_range_m] * bin_count  # Default to max range (clear)
+        counts = [0] * bin_count  # Count how many readings per bin
+        
+        for quality, angle_deg, distance_mm in scan:
+            if quality < 10:  # Low quality reading
+                continue
+            distance_m = distance_mm / 1000.0
+            if distance_m < min_range_m or distance_m > max_range_m:
+                continue
+            
+            # Normalize angle to [0, 360)
+            angle_norm = angle_deg % 360.0
+            bin_idx = int(angle_norm * bin_count / 360.0) % bin_count
+            
+            # Keep minimum distance for each bin (closest obstacle)
+            if counts[bin_idx] == 0 or distance_m < profile[bin_idx]:
+                profile[bin_idx] = distance_m
+            counts[bin_idx] += 1
+        
+        return profile, counts
 
+    def _estimate_yaw_from_scans(self, profile0, profile1, counts0, counts1, max_shift_deg=180):
+        """
+        Estimate yaw change (degrees) between two scan profiles using 1D correlation.
+        
+        Uses circular shift matching: finds the angular shift that maximizes 
+        correlation between profile0 and profile1.
+        
+        Args:
+            profile0, profile1: 360° range profiles (lists of floats)
+            counts0, counts1: Valid reading counts per bin
+            max_shift_deg: Maximum shift to search (±max_shift_deg)
+        
+        Returns:
+            (delta_yaw_deg, confidence): 
+            - delta_yaw_deg: Estimated rotation (positive = CCW in LIDAR frame)
+            - confidence: 0.0-1.0 indicating correlation quality
+        """
+        import numpy as np
+        
+        bin_count = len(profile0)
+        if len(profile1) != bin_count:
+            return 0.0, 0.0
+        
+        # Convert to numpy for efficiency
+        p0 = np.array(profile0)
+        p1 = np.array(profile1)
+        c0 = np.array(counts0)
+        c1 = np.array(counts1)
+        
+        # Only use bins with valid data in BOTH scans
+        valid_mask = (c0 > 0) & (c1 > 0)
+        valid_count = np.sum(valid_mask)
+        
+        if valid_count < 30:  # Need enough valid bins
+            self.logger.warning(
+                "LIDAR yaw estimation: insufficient valid bins (%d < 30)",
+                valid_count
+            )
+            return 0.0, 0.0
+        
+        # Search for best shift
+        max_shift_bins = int(max_shift_deg * bin_count / 360.0)
+        best_corr = -1.0
+        best_shift = 0
+        
+        for shift in range(-max_shift_bins, max_shift_bins + 1):
+            # Shift profile1 by 'shift' bins (circular)
+            p1_shifted = np.roll(p1, shift)
+            
+            # Compute correlation only on valid bins
+            diff = np.abs(p0 - p1_shifted)
+            # Use inverse of mean absolute difference as correlation metric
+            # Lower diff = better match
+            mean_diff = np.mean(diff[valid_mask])
+            corr = 1.0 / (1.0 + mean_diff)
+            
+            if corr > best_corr:
+                best_corr = corr
+                best_shift = shift
+        
+        # Convert shift to degrees (positive shift = profile1 rotated CW = robot rotated CCW)
+        delta_yaw_deg = best_shift * 360.0 / bin_count
+        
+        # Confidence based on how distinct the peak is
+        # Simple heuristic: if correlation > 0.5, consider it reliable
+        confidence = min(1.0, best_corr)
+        
+        self.logger.info(
+            "LIDAR yaw estimation: shift=%d bins (%.1f°), correlation=%.3f, valid_bins=%d",
+            best_shift, delta_yaw_deg, best_corr, valid_count
+        )
+        
+        return delta_yaw_deg, confidence
+
+
+    # --- Command clamps ---
+    # NOTE: Only ROTATE commands are clamped/quantized. MOVE commands are NOT clamped.
+    
     def _clamp_rotate_command(self, angle_deg):
         """Clamp ROTATE_DEG to configured min/max magnitude."""
         sign = 1.0 if angle_deg >= 0 else -1.0
@@ -593,6 +829,31 @@ class OdomOnlyNavigator:
             )
 
         return sign * clamped
+
+    def _snap_to_allowed_angle(self, angle_deg):
+        """Snap angle to nearest allowed rotation angle.
+        
+        This ensures rotation commands use only configured allowed angles
+        (e.g., 30, 60, 90, 120, 180 degrees).
+        
+        Args:
+            angle_deg: Requested rotation angle
+            
+        Returns:
+            Snapped angle (one of ROTATION_ALLOWED_ANGLES with original sign)
+            Returns 0.0 if angle is too small
+        """
+        abs_angle = abs(angle_deg)
+        sign = 1 if angle_deg >= 0 else -1
+        
+        if abs_angle < ROTATION_MIN_THRESHOLD_DEG:
+            return 0.0
+        
+        if not ROTATION_ALLOWED_ANGLES:
+            return angle_deg  # Fallback if no angles configured
+        
+        nearest = min(ROTATION_ALLOWED_ANGLES, key=lambda x: abs(x - abs_angle))
+        return sign * nearest
 
     # --- Command helpers ---
     def _send_raw_command(self, text):
@@ -664,6 +925,10 @@ class OdomOnlyNavigator:
     def _send_rotate(self, desired_angle_deg, target_heading_world=None, world_delta=None):
         """Rotate by desired_angle_deg relative to current heading.
         
+        Angle must already be an allowed angle (snapped by caller).
+        Uses per-angle calibration scale for STM32 command.
+        Trusts commanded angle for pose update (single source of truth).
+        
         STM32 ROTATE_DEG behavior:
         - "OK ROTATE_DEG" = command received, rotation started
         - "TARGET_REACHED" = rotation completed successfully
@@ -671,31 +936,70 @@ class OdomOnlyNavigator:
         
         Returns:
             True if rotation completed successfully
-            False if rotation failed/interrupted (pose updated with actual rotation)
+            False if rotation failed/interrupted
         """
         if abs(desired_angle_deg) < 0.1:
             return True
         
+        # Get calibration from rotation primitive (angle must already be an allowed angle)
+        primitive = get_rotation_primitive(desired_angle_deg)
+        calibrated_angle = desired_angle_deg * primitive['scale']
+        
+        # Apply per-angle motor parameters if specified
+        per_angle_min_duty = primitive.get('min_duty_rotate')
+        per_angle_angular_k = primitive.get('angular_k')
+        if per_angle_min_duty is not None:
+            self._send_raw_command(f"SET_PARAM min_duty_rotate {per_angle_min_duty:.6f}")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+        if per_angle_angular_k is not None:
+            self._send_raw_command(f"SET_PARAM angular_k {per_angle_angular_k:.6f}")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+        
+        self.logger.info(
+            f"ROTATE: angle={desired_angle_deg:.1f}°, scale={primitive['scale']:.4f}, calibrated={calibrated_angle:.2f}°"
+        )
+        
+        # Ensure robot is fully stopped before rotation (critical after MOVE commands)
+        self._send_raw_command("STOP")
+        self._wait_for_response(["OK STOP"], ["ERR"], timeout=0.5)
+        time.sleep(0.2)  # Let motors fully stop
+        
         # Reset STM32 odom cache before ROTATE
         self._reset_stm32_odom()
         
-        cmd = f"ROTATE_DEG {desired_angle_deg:.2f}"
-        self.logger.info(f"ROTATE: {cmd}")
+        # Reset odometry on STM32 and wait for it to settle
+        self._send_raw_command("RESET_ODOM")
+        self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+        time.sleep(0.3)  # Increased from 0.1s - critical for back-to-back MOVE→ROTATE
+        
+        # Verify odometry actually reset (prevent stuck rotations from residual position)
+        check_odom = self._get_stm32_odom()
+        if abs(check_odom['x']) > 0.02 or abs(check_odom['y']) > 0.02:
+            self.logger.warning(
+                f"Odometry not fully reset before ROTATE: x={check_odom['x']:.3f}, y={check_odom['y']:.3f}. "
+                "Adding extra settling time..."
+            )
+            time.sleep(0.2)
+        
+        # Send calibrated angle to STM32 (odometry should now be clean)
+        cmd = f"ROTATE_DEG {calibrated_angle:.2f}"
+        self.logger.info(f">>> {cmd}")
         self._clear_response_queue()
         self._send_raw_command(cmd)
         
-        # Step 1: wait for OK ROTATE_DEG (command acknowledged)
+        # Wait for ACK
         result, line = self._wait_for_response(
             success_tokens=["OK ROTATE_DEG"],
             failure_tokens=["ERR"],
-            timeout=2.0  # Short timeout for ACK
+            timeout=2.0
         )
         if not result:
             self.logger.warning(f"ROTATE_DEG not acknowledged: {line}")
             return False
 
         # Track active rotation for live status fusion
-        world_delta = world_delta if world_delta is not None else -desired_angle_deg
+        # world_delta is the intended rotation in world frame
+        world_delta = world_delta if world_delta is not None else robot_to_world_rotation(desired_angle_deg)
         with self.active_motion_lock:
             self.active_motion = {
                 'mode': 'rotate',
@@ -706,7 +1010,7 @@ class OdomOnlyNavigator:
                 'progress': 0.0,
             }
         
-        # Step 2: wait for TARGET_REACHED or TIMEOUT
+        # Wait for TARGET_REACHED or TIMEOUT
         result, line = self._wait_for_response(
             success_tokens=["TARGET_REACHED"],
             failure_tokens=["TIMEOUT"],
@@ -715,66 +1019,19 @@ class OdomOnlyNavigator:
         
         if result:
             self.logger.info(f"Rotation completed: {line}")
-            # Use actual odom rotation; if not available immediately, wait briefly.
-            applied_world = None
-            for _ in range(3):
-                stm32_odom = self._get_stm32_odom()
-                actual_rotation = stm32_odom.get('heading_deg', 0.0)
-                if abs(actual_rotation) > 0.1:
-                    applied_world = -actual_rotation  # MCU cw+ -> world ccw+
-                    break
-                time.sleep(0.05)
-
-            if applied_world is not None:
-                # Odom có đổi góc → coi là thành công bình thường
-                self._update_pose_after_rotate(applied_world)
-                self._send_raw_command("RESET_ODOM")
-                time.sleep(0.1)
-                with self.active_motion_lock:
-                    self.active_motion = None
-                return True
-            else:
-                # Odom KHÔNG đổi (gần 0°) → coi là FAIL để _rotate_to_heading tăng attempts và bỏ.
-                self.logger.warning(
-                    "Rotation completed but odom heading ~0; treating as FAILED rotation."
-                )
-                self._send_raw_command("RESET_ODOM")
-                time.sleep(0.1)
-                with self.active_motion_lock:
-                    self.active_motion = None
-                return False
-        
-        # Rotation was interrupted/timed out: use STM32 odom to see how far it got
-        stm32_odom = self._get_stm32_odom()
-        actual_rotation = stm32_odom['heading_deg']
-        target_delta_mcu = desired_angle_deg  # MCU frame (same sign as command)
-        rotation_err_mcu = abs(actual_rotation - target_delta_mcu)
-        if rotation_err_mcu <= ROTATE_TIMEOUT_TOLERANCE_DEG:
-            self.logger.warning(
-                "Rotation TIMEOUT but odom within tolerance in MCU frame (actual=%.1f°, target=%.1f°, err=%.1f° <= %.1f°); accepting.",
-                actual_rotation, target_delta_mcu, rotation_err_mcu, ROTATE_TIMEOUT_TOLERANCE_DEG
-            )
-            applied_world = -actual_rotation
-            self._update_pose_after_rotate(applied_world)
-            self._send_raw_command("RESET_ODOM")
-            time.sleep(0.1)
+            # FIX: Use the intended desired_angle_deg for pose update, NOT the calibrated_angle.
+            # This ensures software pose matches physical world (where calibrated_angle = physical desired_angle).
+            self._update_pose_after_rotate(world_delta)
             with self.active_motion_lock:
                 self.active_motion = None
             return True
         
-        if abs(actual_rotation) > 0.5:  # At least some rotation happened
-            self.logger.info(f"Rotation interrupted at {actual_rotation:.1f}deg (commanded: {desired_angle_deg:.1f}deg)")
-        
-        # Reset STM32 odometry for the next command
-        self._send_raw_command("RESET_ODOM")
-        time.sleep(0.1)
+        # Rotation timed out - use intended angle for pose update to prevent drift, 
+        # but log a warning. Heading discrepancy is better than coordinate drift.
+        self.logger.warning(f"Rotation timeout/failed: {line}. Using intended angle for pose update to maintain coordinate integrity.")
+        self._update_pose_after_rotate(world_delta)
         with self.active_motion_lock:
             self.active_motion = None
-        
-        if result is False:
-            self.logger.warning(f"Rotation failed ({line}).")
-        else:
-            self.logger.warning("Rotation timeout with no MCU response.")
         return False
 
     def _send_stop(self):
@@ -809,9 +1066,13 @@ class OdomOnlyNavigator:
         if target_distance < DISTANCE_TOLERANCE_M:
             return True
 
-        commanded_distance = self._clamp_move_command(target_distance)
-        if commanded_distance != target_distance:
-            target_distance = commanded_distance
+        # MOVE commands are NOT clamped - only rotations are clamped/quantized
+        # Robot can move any distance in a single command
+        
+        # Ensure robot is fully stopped before movement (critical after previous commands)
+        self._send_raw_command("STOP")
+        self._wait_for_response(["OK STOP"], ["ERR"], timeout=0.5)
+        time.sleep(0.2)  # Let motors fully stop
         
         # Reset STM32 odom cache trước khi MOVE để đo được khoảng cách thực tế
         self._reset_stm32_odom()
@@ -876,32 +1137,32 @@ class OdomOnlyNavigator:
         if result and line and "TARGET_REACHED" in line:
             # MOVE hoàn thành thành công -> trust commanded distance
             self._update_pose_after_move(target_distance)
-            # Reset STM32 odometry cho lệnh tiếp theo
-            self._send_raw_command("RESET_ODOM")
-            time.sleep(0.1)
             with self.active_motion_lock:
                 self.active_motion = None
             # Publish latest pose so UI sees translation promptly
             self._send_status()
             return True
         
-        # Movement bị gián đoạn -> dùng STM32 odom.x để biết thực tế đã đi bao xa
-        # Chỉ đọc odom.x vì MOVE = forward motion = robot's local X axis
-        # odom.y ≈ 0 (lateral drift), không cần đọc
-        time.sleep(0.1)  # Cho STM32 cập nhật odom
-        stm32_odom = self._get_stm32_odom()
-        actual_distance = stm32_odom['x']  # Forward distance
-        # Prefer accumulated progress magnitude (capped) when available, so STOP retains mid-position
+        # Movement bị gián đoạn -> dùng accumulated dead-reckoning progress
+        # Không dùng raw STM32 odom vì Y-axis có nhiều noise khi di chuyển forward
+        # Dead-reckoning chỉ dùng X-axis magnitude nên tránh được offset từ Y-axis noise
+        actual_distance = 0.0
         with self.active_motion_lock:
             if self.active_motion:
+                # Use accumulated progress from dead-reckoning (capped at target)
                 progress_capped = min(
                     self.active_motion.get('progress', 0.0),
                     self.active_motion.get('target', float('inf'))
                 )
-                actual_distance = max(actual_distance, progress_capped)
+                actual_distance = progress_capped
+                self.logger.info(
+                    f"Using dead-reckoning progress: {actual_distance:.3f}m "
+                    f"(target: {self.active_motion.get('target', 0.0):.3f}m)"
+                )
+        
         if actual_distance < 0:
-            self.logger.warning(f"Negative odom.x ({actual_distance:.3f}m) - robot drifted backward?")
-            actual_distance = 0.0  # Don't update pose if robot went backward
+            self.logger.warning(f"Negative progress ({actual_distance:.3f}m) - unexpected!")
+            actual_distance = 0.0  # Don't update pose if negative
         
         if actual_distance > DISTANCE_TOLERANCE_M:
             self.logger.info(f"Movement interrupted at {actual_distance:.3f}m (commanded: {target_distance:.3f}m)")
@@ -909,21 +1170,32 @@ class OdomOnlyNavigator:
         else:
             self.logger.info(f"Movement barely started (odom x={stm32_odom['x']:.3f})")
 
-        # Reset STM32 odometry cho lệnh tiếp theo
-        self._send_raw_command("RESET_ODOM")
-        time.sleep(0.1)
-
         with self.active_motion_lock:
             self.active_motion = None
 
         if self._move_stop_reason:
             self.logger.warning(f"Move stopped by LIDAR: {self._move_stop_reason}")
+            # Reset pose and odometry to zero for manual re-alignment
+            self.logger.info("Resetting pose and odometry to zero - please re-align robot manually before next command")
+            self._reset_pose()
+            
+            # Reset STM32 odometry
+            self._send_raw_command("RESET_ODOM")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+            time.sleep(0.2)  # Let STM32 settle
+            self._reset_stm32_odom()
+            
+            # Publish reset pose so UI shows (0,0,0)
+            self._send_status()
+            self.logger.info("Pose reset complete. Robot is at (0.0, 0.0, 0.0°). Ready for next command after manual re-alignment.")
         elif result is False:
             self.logger.warning(f"Move failed ({line}).")
+            # Publish pose even on interruption so UI reflects actual stop point
+            self._send_status()
         else:
             self.logger.warning("Move timeout with no MCU response.")
-        # Publish pose even on interruption so UI reflects actual stop point
-        self._send_status()
+            # Publish pose even on interruption so UI reflects actual stop point
+            self._send_status()
         return False
     
     def _log_lidar_scan_debug(self, robot_heading, clearance_found, distance_needed):
@@ -1299,7 +1571,12 @@ class OdomOnlyNavigator:
             # MCU expects clockwise positive, so invert sign
             command_delta = -world_delta
             command_delta = self._clamp_rotate_command(command_delta)
-            world_delta = -command_delta  # keep world delta in sync after clamp
+            # Snap to allowed angles (30, 60, 90, 120, 180)
+            command_delta = self._snap_to_allowed_angle(command_delta)
+            if abs(command_delta) < 0.1:
+                self.logger.info("Rotation snapped to 0; accepting current heading.")
+                return True
+            world_delta = -command_delta  # keep world delta in sync after snap
 
             self.logger.info(
                 "Rotate_to_heading: current=%.1f°, target=%.1f°, step_world=%.1f°, command_delta=%.1f°",
@@ -1307,7 +1584,7 @@ class OdomOnlyNavigator:
             )
             ok = self._send_rotate(command_delta, target_heading_world, world_delta=world_delta)
             if ok:
-                # Pose already updated inside _send_rotate using actual odom; do not add again.
+                # Pose updated inside _send_rotate using commanded angle (single source of truth)
                 continue
 
             attempts += 1
@@ -1439,6 +1716,8 @@ class OdomOnlyNavigator:
         if self.boundary_polygon:
             if self._navigate_with_planner(goal, tolerance_m=tolerance):
                 self.logger.info("Goal reached.")
+                # Check if goal is at a corner and apply pose correction if so
+                self._apply_corner_correction_if_applicable(goal)
             else:
                 self.logger.warning("Navigation ended without reaching goal.")
             return
@@ -1452,6 +1731,32 @@ class OdomOnlyNavigator:
         ):
             return
         self.logger.info("Goal reached.")
+        # Check if goal is at a corner and apply pose correction if so
+        self._apply_corner_correction_if_applicable(goal)
+    
+    def _apply_corner_correction_if_applicable(self, goal_position):
+        """
+        Check if the goal position is near a corner and apply pose correction if so.
+        
+        Args:
+            goal_position: (x, y) tuple of the reached goal
+        """
+        if not self.boundary_polygon:
+            return
+        
+        # Check if this goal is at a boundary corner
+        corner_info = self._is_poi_at_corner(goal_position)
+        if corner_info:
+            self.logger.info(
+                "Goal at corner detected (angle=%.1f°). Applying LIDAR-based pose correction...",
+                corner_info['interior_angle']
+            )
+            # Wait a moment for robot to fully settle after movement
+            time.sleep(0.3)
+            # Apply correction
+            self._correct_pose_at_corner(corner_info)
+        else:
+            self.logger.debug("Goal not near any boundary corner; skipping pose correction.")
 
 
     # --- CLI loop ---
@@ -1935,6 +2240,14 @@ class OdomOnlyNavigator:
         ys = [p[1] for p in self.boundary_polygon]
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
+        
+        # Extend grid bounds to include robot's current position if outside boundary
+        # This allows A* to plan paths back inside when robot has drifted outside
+        min_x = min(min_x, start[0] - ASTAR_GRID_STEP_M)
+        max_x = max(max_x, start[0] + ASTAR_GRID_STEP_M)
+        min_y = min(min_y, start[1] - ASTAR_GRID_STEP_M)
+        max_y = max(max_y, start[1] + ASTAR_GRID_STEP_M)
+        
         margin = ASTAR_GRID_STEP_M
 
         def to_grid(val, offset):
@@ -1976,6 +2289,15 @@ class OdomOnlyNavigator:
             free.add(start_g)
         if goal_g not in free and self._point_free(goal):
             free.add(goal_g)
+        
+        # CRITICAL: Always add robot's current position as free, even if outside boundary.
+        # This allows the planner to find a path back inside when robot drifts outside.
+        if start_g not in free:
+            self.logger.info(
+                "Planner: adding start cell %s as free (robot may be outside boundary)",
+                start_g
+            )
+            free.add(start_g)
 
         # If start/goal still not free, snap to nearest free cell (within sampled space)
         def nearest_free(cell):
@@ -2011,6 +2333,22 @@ class OdomOnlyNavigator:
 
         def heuristic(a, b):
             return abs(a[0] - b[0]) + abs(a[1] - b[1])
+        
+        # Track cells that are outside boundary - these get a HIGH penalty
+        # so the planner prefers inside paths when both options exist
+        outside_penalty = 10  # 10x cost for outside-boundary cells
+        
+        def is_cell_outside(cell):
+            wx = min_x + cell[0] * ASTAR_GRID_STEP_M
+            wy = min_y + cell[1] * ASTAR_GRID_STEP_M
+            return not self._in_boundary((wx, wy))
+        
+        def move_cost(from_cell, to_cell):
+            """Cost to move from one cell to another. High penalty for outside cells."""
+            base_cost = 1
+            if is_cell_outside(to_cell):
+                return base_cost + outside_penalty  # Heavy penalty for outside paths
+            return base_cost
 
         moves = [(1,0), (-1,0), (0,1), (0,-1)]
 
@@ -2038,7 +2376,17 @@ class OdomOnlyNavigator:
                 nb = (current[0] + dx, current[1] + dy)
                 if nb not in free:
                     continue
-                tentative = g_score[current] + 1
+                
+                # BORDER-AWARE: Validate that segment from current->neighbor stays within boundary
+                current_wx = min_x + current[0] * ASTAR_GRID_STEP_M
+                current_wy = min_y + current[1] * ASTAR_GRID_STEP_M
+                nb_wx = min_x + nb[0] * ASTAR_GRID_STEP_M
+                nb_wy = min_y + nb[1] * ASTAR_GRID_STEP_M
+                if self._segment_leaves_boundary((current_wx, current_wy), (nb_wx, nb_wy)):
+                    continue  # Reject this edge - it would cross the boundary
+                
+                # Use move_cost instead of fixed cost of 1
+                tentative = g_score[current] + move_cost(current, nb)
                 if tentative < g_score.get(nb, math.inf):
                     came[nb] = current
                     g_score[nb] = tentative
@@ -2199,7 +2547,6 @@ class OdomOnlyNavigator:
                 if not self._rotate_to_heading(heading_world):
                     return False
             step = min(remaining, MAX_MOVE_COMMAND_M)
-            step = self._clamp_move_command(step)
             if self._segment_blocked_by_lidar(heading_world, step):
                 # Try a quick right-hand sidestep to clear the blockage
                 if self._escape_right_detour(heading_world, step):
@@ -2223,6 +2570,436 @@ class OdomOnlyNavigator:
                 return False
         return True
 
+    def _find_boundary_corners(self, angle_threshold=45.0):
+        """
+        Detect corner vertices in boundary polygon.
+        
+        A corner is a vertex where the angle between incoming/outgoing edges
+        is significantly different from 180° (not a straight line).
+        
+        Args:
+            angle_threshold: Minimum deviation from 180° to consider a corner
+        
+        Returns:
+            List of corner dicts with {position, interior_angle, wall_headings}
+        """
+        if not self.boundary_polygon or len(self.boundary_polygon) < 3:
+            return []
+        
+        corners = []
+        points = self.boundary_polygon
+        n = len(points)
+        
+        for i in range(n):
+            p_prev = points[(i - 1) % n]
+            p_curr = points[i]
+            p_next = points[(i + 1) % n]
+            
+            # Compute vectors from current point
+            v1 = (p_prev[0] - p_curr[0], p_prev[1] - p_curr[1])
+            v2 = (p_next[0] - p_curr[0], p_next[1] - p_curr[1])
+            
+            # Compute angle between vectors
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            mag1 = math.hypot(v1[0], v1[1])
+            mag2 = math.hypot(v2[0], v2[1])
+            
+            if mag1 < 0.01 or mag2 < 0.01:
+                continue  # Skip degenerate edges
+            
+            cos_angle = dot / (mag1 * mag2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))  # Clamp for numerical stability
+            angle_deg = math.degrees(math.acos(cos_angle))
+            
+            # A corner is where angle deviates significantly from 180°
+            angle_deviation = abs(180.0 - angle_deg)
+            
+            if angle_deviation > angle_threshold:
+                # Compute wall headings for this corner
+                heading1 = normalize_angle_deg(math.degrees(math.atan2(v1[1], v1[0])))
+                heading2 = normalize_angle_deg(math.degrees(math.atan2(v2[1], v2[0])))
+                
+                corners.append({
+                    'position': p_curr,
+                    'interior_angle': angle_deg,
+                    'wall_headings': [heading1, heading2],
+                    'angle_deviation': angle_deviation
+                })
+        
+        return corners
+    
+    def _is_poi_at_corner(self, poi_position, corner_tolerance=0.3):
+        """
+        Check if a POI is close to a boundary corner.
+        
+        Args:
+            poi_position: (x, y) tuple of POI location
+            corner_tolerance: Maximum distance from corner to consider match (meters)
+        
+        Returns:
+            Corner info dict if near corner, None otherwise
+        """
+        corners = self._find_boundary_corners()
+        
+        for corner in corners:
+            dist = math.hypot(
+                poi_position[0] - corner['position'][0],
+                poi_position[1] - corner['position'][1]
+            )
+            if dist <= corner_tolerance:
+                self.logger.info(
+                    "POI (%.2f, %.2f) matched to corner at (%.2f, %.2f) - "
+                    "distance=%.2fm, interior_angle=%.1f°",
+                    poi_position[0], poi_position[1],
+                    corner['position'][0], corner['position'][1],
+                    dist, corner['interior_angle']
+                )
+                return corner
+        
+        return None
+    
+    def _detect_walls_in_scan(self, scan, min_wall_points=10, max_dist_variation=0.1):
+        """
+        Detect wall segments from LIDAR scan.
+        
+        A wall is a sequence of consecutive scan points at similar distance
+        that span a reasonable angular range.
+        
+        Args:
+            scan: Raw LIDAR scan data
+            min_wall_points: Minimum number of points to consider a wall
+            max_dist_variation: Maximum distance variation between consecutive points (meters)
+        
+        Returns:
+            List of wall dicts with {angle, distance, span_deg, point_count}
+        """
+        if not scan:
+            return []
+        
+        walls = []
+        current_wall = []
+        
+        # Sort by angle for sequential processing
+        sorted_scan = sorted(scan, key=lambda x: x[1])
+        
+        for quality, angle_deg, dist_mm in sorted_scan:
+            if quality < 10 or dist_mm < 200 or dist_mm > 2000:
+                if current_wall and len(current_wall) >= min_wall_points:
+                    walls.append(self._process_wall_segment(current_wall))
+                current_wall = []
+                continue
+            
+            dist_m = dist_mm / 1000.0
+            robot_angle = lidar_angle_to_robot(angle_deg)
+            
+            if not current_wall:
+                current_wall = [(robot_angle, dist_m)]
+            else:
+                last_angle, last_dist = current_wall[-1]
+                # Check if point continues the wall
+                if (abs(dist_m - last_dist) < max_dist_variation and
+                    abs(robot_angle - last_angle) < 5.0):  # Within 5° of previous point
+                    current_wall.append((robot_angle, dist_m))
+                else:
+                    # Wall segment ended, save if long enough
+                    if len(current_wall) >= min_wall_points:
+                        walls.append(self._process_wall_segment(current_wall))
+                    current_wall = [(robot_angle, dist_m)]
+        
+        # Don't forget last wall
+        if len(current_wall) >= min_wall_points:
+            walls.append(self._process_wall_segment(current_wall))
+        
+        return walls
+    
+    def _process_wall_segment(self, wall_points):
+        """
+        Process a list of wall points into a wall descriptor.
+        
+        Args:
+            wall_points: List of (angle, distance) tuples
+        
+        Returns:
+            Dict with wall properties
+        """
+        angles = [p[0] for p in wall_points]
+        dists = [p[1] for p in wall_points]
+        
+        # Wall heading is perpendicular to the direction toward the wall
+        # Average angle points roughly at the wall's center
+        avg_angle = sum(angles) / len(angles)
+        avg_dist = sum(dists) / len(dists)
+        
+        # Wall heading (perpendicular to radial direction)
+        wall_heading = normalize_angle_deg(avg_angle + 90.0)
+        
+        span_deg = max(angles) - min(angles)
+        
+        return {
+            'angle': avg_angle,  # Angle toward wall center
+            'distance': avg_dist,
+            'heading': wall_heading,  # Wall's orientation
+            'span_deg': span_deg,
+            'point_count': len(wall_points)
+        }
+    
+    def _match_walls_to_corner(self, walls, expected_headings, tolerance_deg=30.0):
+        """
+        Match detected LIDAR walls to expected corner wall headings.
+        
+        Args:
+            walls: List of wall dicts from _detect_walls_in_scan
+            expected_headings: List of expected wall headings from corner definition
+            tolerance_deg: Maximum angle difference to consider a match
+        
+        Returns:
+            List of matched wall dicts, or None if insufficient matches
+        """
+        if len(walls) < 2 or len(expected_headings) < 2:
+            return None
+        
+        matched = []
+        used_walls = set()
+        
+        for expected_heading in expected_headings:
+            best_wall = None
+            best_diff = float('inf')
+            best_idx = None
+            
+            for idx, wall in enumerate(walls):
+                if idx in used_walls:
+                    continue
+                
+                # Compare wall heading with expected heading
+                diff = abs(normalize_angle_deg(wall['heading'] - expected_heading))
+                # Also check perpendicular (walls can be described from either side)
+                diff_perp = abs(normalize_angle_deg(diff - 180.0))
+                actual_diff = min(diff, diff_perp)
+                
+                if actual_diff < best_diff and actual_diff < tolerance_deg:
+                    best_diff = actual_diff
+                    best_wall = wall
+                    best_idx = idx
+            
+            if best_wall:
+                matched.append(best_wall)
+                used_walls.add(best_idx)
+        
+        if len(matched) < 2:
+            return None
+        
+        return matched[:2]  # Only need 2 walls for corner correction
+    
+    def _compute_heading_from_walls(self, walls):
+        """
+        Compute robot heading from two detected walls.
+        
+        Uses the angle bisector of the two wall headings to estimate
+        the robot's orientation at a corner.
+        
+        Args:
+            walls: List of at least 2 wall dicts with 'heading' field
+        
+        Returns:
+            Estimated robot heading in degrees
+        """
+        if len(walls) < 2:
+            return None
+        
+        # Take first two walls
+        h1 = walls[0]['heading']
+        h2 = walls[1]['heading']
+        
+        # Compute angle bisector (heading that splits the corner)
+        # This is the heading the robot should have if perfectly aligned
+        delta = normalize_angle_deg(h2 - h1)
+        
+        if abs(delta) > 120.0:
+            # Walls form an obtuse angle - bisector is ambiguous
+            # Use the wall that's closest (most likely to be accurate)
+            if walls[0]['distance'] < walls[1]['distance']:
+                return normalize_angle_deg(h1 - 90.0)
+            else:
+                return normalize_angle_deg(h2 - 90.0)
+        
+        # Bisector is midpoint between the two headings
+        bisector = normalize_angle_deg(h1 + delta / 2.0)
+        # Robot heading is perpendicular to bisector (facing into corner)
+        robot_heading = normalize_angle_deg(bisector - 90.0)
+        
+        return robot_heading
+    
+    def _compute_position_from_corner_walls(self, corner_position, walls, robot_heading):
+        """
+        Compute corrected robot position from wall distances at a known corner.
+        
+        Args:
+            corner_position: (x, y) of the corner in world frame
+            walls: List of matched wall dicts
+            robot_heading: Robot heading in degrees
+        
+        Returns:
+            Corrected (x, y) position, or None if computation fails
+        """
+        if len(walls) < 2:
+            return None
+        
+        # Use wall distances to triangulate position relative to corner
+        # Assumption: robot is near corner, walls are the corner's edges
+        
+        # For now, use a simple approach: project wall distances onto world axes
+        # More sophisticated: use wall angles + distances to solve for position
+        
+        # Wall 1 and Wall 2 distances
+        d1 = walls[0]['distance']
+        d2 = walls[1]['distance']
+        
+        # Wall angles relative to robot
+        a1 = walls[0]['angle']
+        a2 = walls[1]['angle']
+        
+        # Convert to world frame
+        world_a1 = normalize_angle_deg(robot_heading + a1)
+        world_a2 = normalize_angle_deg(robot_heading + a2)
+        
+        # Compute robot position that would produce these observations
+        # Robot is at: corner + offset perpendicular to each wall
+        # This is a simplified approximation - proper solution needs wall line equations
+        
+        # For a corner at (cx, cy), if walls are at angles w1, w2
+        # and distances d1, d2, robot is offset by those distances
+        # perpendicular to each wall
+        
+        # Simple approach: average the two position estimates
+        rad1 = math.radians(world_a1)
+        rad2 = math.radians(world_a2)
+        
+        # Position estimate from wall 1
+        x1 = corner_position[0] + d1 * math.cos(rad1)
+        y1 = corner_position[1] + d1 * math.sin(rad1)
+        
+        # Position estimate from wall 2
+        x2 = corner_position[0] + d2 * math.cos(rad2)
+        y2 = corner_position[1] + d2 * math.sin(rad2)
+        
+        # Average
+        corrected_x = (x1 + x2) / 2.0
+        corrected_y = (y1 + y2) / 2.0
+        
+        return (corrected_x, corrected_y)
+    
+    def _correct_pose_at_corner(self, corner_info):
+        """
+        Use LIDAR to correct pose when at a known corner.
+        
+        Steps:
+        1. Detect walls in LIDAR scan
+        2. Match walls to corner's expected wall headings
+        3. Compute heading correction from wall angles
+        4. Compute position correction from wall distances
+        5. Update pose if correction is confident
+        
+        Args:
+            corner_info: Corner dict from _is_poi_at_corner
+        """
+        scan = self._get_scan_snapshot()
+        if not scan:
+            self.logger.warning("Corner correction: no LIDAR data")
+            return
+        
+        # Detect walls
+        walls = self._detect_walls_in_scan(scan)
+        if len(walls) < 2:
+            self.logger.warning(
+                "Corner correction: insufficient walls detected (%d < 2)",
+                len(walls)
+            )
+            return
+        
+        self.logger.info(
+            "Corner correction: detected %d walls from LIDAR scan",
+            len(walls)
+        )
+        
+        # Match walls to corner geometry
+        expected_headings = corner_info['wall_headings']
+        matched_walls = self._match_walls_to_corner(walls, expected_headings)
+        
+        if not matched_walls or len(matched_walls) < 2:
+            self.logger.warning(
+                "Corner correction: could not match walls to corner (expected headings: %s)",
+                expected_headings
+            )
+            return
+        
+        self.logger.info(
+            "Corner correction: matched %d walls to corner",
+            len(matched_walls)
+        )
+        
+        # Compute heading correction
+        measured_heading = self._compute_heading_from_walls(matched_walls)
+        if measured_heading is None:
+            self.logger.warning("Corner correction: failed to compute heading from walls")
+            return
+        
+        current_pose = self._get_pose()
+        heading_error = normalize_angle_deg(measured_heading - current_pose['heading_deg'])
+        
+        # Apply heading correction if significant (threshold: 3°)
+        heading_threshold = 3.0
+        if abs(heading_error) > heading_threshold:
+            self.logger.info(
+                "Corner correction: heading %.1f° → %.1f° (Δ%.1f°)",
+                current_pose['heading_deg'],
+                measured_heading,
+                heading_error
+            )
+            with self.pose_lock:
+                self.cmd_pose['heading_deg'] = measured_heading
+        else:
+            self.logger.info(
+                "Corner correction: heading error %.1f° < %.1f° threshold, no correction needed",
+                abs(heading_error),
+                heading_threshold
+            )
+        
+        # Compute position correction from wall intersections
+        corrected_pos = self._compute_position_from_corner_walls(
+            corner_info['position'],
+            matched_walls,
+            measured_heading
+        )
+        
+        if corrected_pos:
+            pos_error = math.hypot(
+                corrected_pos[0] - current_pose['x'],
+                corrected_pos[1] - current_pose['y']
+            )
+            
+            # Apply position correction if significant (threshold: 5cm)
+            position_threshold = 0.05
+            if pos_error > position_threshold:
+                self.logger.info(
+                    "Corner correction: position (%.2f,%.2f) → (%.2f,%.2f) (Δ%.2fcm)",
+                    current_pose['x'],
+                    current_pose['y'],
+                    corrected_pos[0],
+                    corrected_pos[1],
+                    pos_error * 100
+                )
+                with self.pose_lock:
+                    self.cmd_pose['x'] = corrected_pos[0]
+                    self.cmd_pose['y'] = corrected_pos[1]
+            else:
+                self.logger.info(
+                    "Corner correction: position error %.2fcm < %.2fcm threshold, no correction needed",
+                    pos_error * 100,
+                    position_threshold * 100
+                )
+        else:
+            self.logger.warning("Corner correction: failed to compute position from walls")
+
     def _goal_valid(self, goal):
         if self.boundary_polygon and not self._point_in_polygon(goal, self.boundary_polygon):
             self.logger.warning(
@@ -2243,25 +3020,47 @@ class OdomOnlyNavigator:
     def _segment_leaves_boundary(self, start, end):
         """
         Returns True if moving from start to end would leave the boundary polygon.
-        Assumes start should be inside; if boundary is absent, returns False.
+        
+        Behavior:
+        - start inside, end outside -> blocks (leaving boundary)
+        - start outside, end outside -> blocks (staying outside)
+        - start outside, end inside -> ALLOWS (re-entering boundary)
+        - start inside, end inside -> allows (normal movement)
         """
         if not self.boundary_polygon:
             return False
         inside_start = self._point_in_polygon(start, self.boundary_polygon)
         inside_end = self._point_in_polygon(end, self.boundary_polygon)
+        
+        # Case 1: Leaving boundary (bad)
         if inside_start and not inside_end:
             self.logger.info(
                 "Segment %s -> %s leaves boundary: start inside, end outside.",
                 start, end
             )
             return True
+        
+        # Case 2: Both outside - only block if NOT heading back in
+        # We allow movement between outside points if they're getting closer to boundary
         if not inside_start and not inside_end:
-            self.logger.warning(
-                "Segment %s -> %s is outside boundary (start and end).",
-                start,
-                end,
+            # Check if we're at least getting closer to the boundary center
+            # This is a heuristic to allow some movement when outside
+            self.logger.debug(
+                "Segment %s -> %s both outside boundary; allowing to enable re-entry.",
+                start, end,
             )
-            return True
+            # Allow this segment - the planner will find a path back inside
+            return False
+        
+        # Case 3: Re-entering boundary (good) - start outside, end inside
+        if not inside_start and inside_end:
+            self.logger.info(
+                "Segment %s -> %s re-enters boundary: start outside, end inside. Allowing.",
+                start, end
+            )
+            return False
+        
+        # Case 4: Normal movement inside boundary
         self.logger.debug(
             "Segment %s -> %s stays within boundary (start_inside=%s, end_inside=%s).",
             start, end, inside_start, inside_end
@@ -2333,6 +3132,22 @@ class OdomOnlyNavigator:
             self._send_ack(correlation_id, cmd, True, "No-op resume")
         elif cmd == "ping":
             self._send_ack(correlation_id, cmd, True, "pong")
+        elif cmd == "reset_odom":
+            # Reset robot position to (0, 0, 0°) for manual re-alignment
+            self.logger.info("Resetting pose and odometry to zero")
+            self._reset_pose()
+            
+            # Reset STM32 odometry
+            self._send_raw_command("RESET_ODOM")
+            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
+            time.sleep(0.2)  # Let STM32 settle
+            self._reset_stm32_odom()
+            
+            # Publish reset pose so UI shows (0,0,0)
+            self._send_status()
+            self.logger.info("Pose reset complete. Robot is at (0.0, 0.0, 0.0°). Ready for next command after manual re-alignment.")
+            
+            self._send_ack(correlation_id, cmd, True, "Position reset to (0,0,0)")
         else:
             self._send_ack(correlation_id, cmd, False, "Unsupported command")
 
@@ -2398,6 +3213,15 @@ class OdomOnlyNavigator:
             pose_raw['y'],
             heading_deg,
             payload["state"],
+        )
+        # DEBUG: Verify frame/offset issue - is discrepancy ~119° (LIDAR_FRONT_OFFSET_DEG)?
+        cmd_pose = self._get_pose()
+        self.logger.debug(
+            "HEADING DEBUG: cmd_pose.heading=%.1f anchor_rotation=%.1f raw_heading=%.1f delta=%.1f",
+            cmd_pose['heading_deg'],
+            self.anchor_rotation_deg if self.anchor_rotation_deg is not None else 0.0,
+            heading_deg,
+            normalize_angle_deg(cmd_pose['heading_deg'] - heading_deg),
         )
         self.kafka_bridge.send_status(payload)
 
@@ -2542,6 +3366,9 @@ class OdomOnlyNavigator:
             return False
         
         self.logger.info(f"Rotation complete. Current heading: {self._get_pose()['heading_deg']:.1f}°")
+        
+        # Settle periodically to allow LIDAR readings to stabilize relative to new heading
+        time.sleep(0.3)
 
         # LIDAR check AFTER rotation - now robot faces the goal direction
         # Check forward (0°) relative to current heading

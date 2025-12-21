@@ -12,7 +12,7 @@
         "front_offset_deg": 119.0
     },
     "kafka": {
-        "bootstrap_servers": "192.168.1.15:9092",
+        "bootstrap_servers": "192.168.1.14:9092",
         "topic_command": "robot.cmd",
         "topic_telemetry": "robot.telemetry",
         "topic_map": "robot.map",
@@ -40,7 +40,7 @@
         "clearance_margin_m": 0.05,
         "obstacle_stop_distance_m": 0.25,
         "obstacle_lookahead_m": 1.2,
-        "robot_radius_m": 0.15,
+        "robot_radius_m": 0.18,
         "corridor_half_width_m": 0.20,
         "side_wall_min_m": 0.05,
         "side_wall_max_m": 0.80,
@@ -61,26 +61,82 @@
         "astar_max_nodes": 20000,
         "max_replans": 10
     },
+    "rotation_primitives": {
+        "_comment": "Motion primitives for discrete rotations - unified config",
+        "_usage": "scale = correction factor, drift = expected x/y movement during rotation",
+        "_note": "TEMPORARY: Quantization is executor-level. Phase 2 moves to planner.",
+        "allowed_angles": [
+            30,
+            45,
+            60,
+            90,
+            120,
+            180
+        ],
+        "min_angle_threshold_deg": 15,
+        "30": {
+            "scale": 1.083,
+            "min_duty_rotate": 0.56,
+            "angular_k": 0.56,
+            "drift_x_m": 0.018,
+            "drift_y_m": 0.0
+        },
+        "45": {
+            "scale": 0.98,
+            "min_duty_rotate": 0.56,
+            "angular_k": 0.56,
+            "drift_x_m": 0.008,
+            "drift_y_m": 0.0
+        },
+        "60": {
+            "scale": 0.956,
+            "min_duty_rotate": 0.56,
+            "angular_k": 0.56,
+            "drift_x_m": 0.004,
+            "drift_y_m": 0.0
+        },
+        "90": {
+            "scale": 0.952,
+            "min_duty_rotate": 0.56,
+            "angular_k": 0.56,
+            "drift_x_m": 0.008,
+            "drift_y_m": 0.0
+        },
+        "120": {
+            "scale": 0.949,
+            "min_duty_rotate": 0.56,
+            "angular_k": 0.56,
+            "drift_x_m": 0.010,
+            "drift_y_m": 0.0
+        },
+        "180": {
+            "scale": 0.955,
+            "min_duty_rotate": 0.56,
+            "angular_k": 0.56,
+            "drift_x_m": 0.015,
+            "drift_y_m": 0.0
+        }
+    },
     "stm32_params": {
         "_comment": "These are sent to STM32 via SET_PARAM on startup",
-        "odom_scale": 0.902521,
-        "odom_angular_scale": 1.05,
+        "odom_scale": 0.89,
+        "odom_angular_scale": 1.0,
         "linear_k": 1.0,
-        "angular_k": 0.55,
+        "angular_k": 0.52,
         "max_speed": 0.8,
         "min_duty_linear": 0.45,
-        "min_duty_rotate": 0.55,
+        "min_duty_rotate": 0.52,
         "min_duty_brake": 0.18,
-        "move_kp": -0.0040,
+        "move_kp": -0.0100,
         "move_ki": -0.00015,
-        "move_kd": -0.0008,
-        "move_min_pwm": 0.46,
+        "move_kd": -0.0004,
+        "move_min_pwm": 0.35 ,
         "move_max_pwm": 0.70,
-        "move_smoothing": 0.25,
-        "move_skew": 0.017,
-        "move_base_pwm": 0.62,
+        "move_smoothing": 0.3,
+        "move_skew": 0.0075,
+        "move_base_pwm": 0.65,
         "move_timeout": 20000,
-        "rotate_tol_dist": 0.02,
+        "rotate_tol_dist": 0.01,
         "rotate_tol_angle": 0.087,
         "rotate_timeout": 10000,
         "move_dist_tol_dist": 0.01,
