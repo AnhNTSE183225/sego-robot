@@ -95,7 +95,12 @@ class KafkaBridge:
             "seq": seq or int(time.time() * 1000),
             "payload": payload or {},
         }
-        self.log(f"Kafka send {msg_type} to {topic} cid={envelope['correlationId']} seq={envelope['seq']}")
+        # Log heartbeats at DEBUG level to reduce clutter, other messages at INFO
+        log_msg = f"Kafka send {msg_type} to {topic} cid={envelope['correlationId']} seq={envelope['seq']}"
+        if msg_type == "HEARTBEAT":
+            logging.getLogger("odom.navigator").debug(log_msg)
+        else:
+            self.log(log_msg)
         try:
             self.producer.produce(topic, key=self.robot_id, value=json.dumps(envelope))
             self.producer.poll(0)

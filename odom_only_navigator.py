@@ -1251,6 +1251,22 @@ class OdomOnlyNavigator:
         
         while not self._move_stop_flag:
             if self.first_scan_event.is_set():
+                # Check if robot has already reached destination (within tolerance)
+                # This prevents false obstacle detection when robot is at target and detects nearby walls
+                current_progress = 0.0
+                with self.active_motion_lock:
+                    if self.active_motion and self.active_motion.get('mode') == 'move':
+                        current_progress = self.active_motion.get('progress', 0.0)
+                
+                # If we've reached the target (within tolerance), stop monitoring
+                # No need to check for obstacles when we're already at destination
+                if current_progress >= target_distance - DISTANCE_TOLERANCE_M:
+                    self.logger.info(
+                        f"[LIDAR Monitor] Target reached (progress={current_progress:.3f}m >= target={target_distance:.3f}m), "
+                        "stopping obstacle monitoring"
+                    )
+                    break
+                
                 # Check forward direction for obstacles
                 current_heading = self._get_pose()['heading_deg']
                 clearance = self._heading_clearance(
