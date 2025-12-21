@@ -16,6 +16,20 @@ trigger: always_on
 - **POI duplication fix** - navigation points now update in-place instead of delete+recreate, preserving IDs and preventing duplicates.
 
 
+## Recent Fixes (2025-12-20 Late Night)
+
+### Perimeter Validation
+- **Fixed Perimeter Verification Drift**
+  - Resolved cumulative coordinate errors caused by recording motor-command angles (85.2°) instead of world-frame angles (90°)
+  - Added 0.3s post-rotation settling delay to improve sensor reliability
+  - Ensured coordinate integrity during rotation timeouts
+
+### Management Tools
+- **Implemented Background Process Management**
+  - Created `start.sh` and `stop.sh` for detached robot execution
+  - Created `start_dev.sh` with environment variable override for Kafka bootstrap servers
+  - Added environment variable support to `odom_only_navigator.py` for flexible configuration
+
 ## Recent Fixes (2025-12-20 Evening)
 
 ### Interactive Map Features
@@ -127,9 +141,8 @@ trigger: always_on
 ## Known Issues
 - **Cumulative rotation error in long sequences**: After 10+ consecutive rotations, cumulative error can exceed tolerance (`rotate_tol_angle=0.087` rad), causing timeout
   - Consider increasing tolerance slightly or implementing periodic odometry resets
-- `perimeter_validate` does not reliably complete in practice due to rotation TIMEOUTs.
-- Perimeter traversal logic assumes segments can be executed as a single MOVE; with `max_move_command_m=1.0`, it can deviate from the boundary and cut diagonals.
-- Pose correction not yet integrated into perimeter verification (separate navigation path).
+- **Perimeter traversal logic**: Assumes segments can be executed as a single MOVE; with `max_move_command_m=1.0`, it can deviate from the boundary and cut diagonals if heading isn't perfectly maintained.
+- **Ocassional physical-logical rotation mismatch**: Cases observed where STM32 reports `TARGET_REACHED` but robot hasn't physically turned the full amount, potentially causing "Blocked" verdict immediately after turn.
 
 ## What's Next
 - Test calibrated rotation and motion parameters in real navigation scenarios

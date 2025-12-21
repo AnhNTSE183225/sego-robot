@@ -14,5 +14,6 @@ trigger: always_on
 - Support Kafka-driven commands such as `navigate_to_xy`, `navigate_to_poi`, and `perimeter_validate`.
 
 ## Current Focus
-- Investigating why `perimeter_validate` (“map verification”) does not reliably complete and does not accurately follow the map perimeter when motion commands are clamped (e.g., `motion.max_move_command_m=1.0`).
+- Investigating recent hardware-odometry discrepancies where STM32 reports `TARGET_REACHED` but physical rotation is incomplete/incorrect.
+- Improving perimeter validation stability and sensor settling after rotations.
 

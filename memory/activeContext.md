@@ -11,6 +11,27 @@ trigger: always_on
 - Navigation point input precision improved to 2 decimal places
 
 
+## Recent Changes (2025-12-20 Late Night)
+
+### Perimeter Validation Fixes
+- **Resolved Perimeter Verification Drift**
+  - Root cause: Software was recording "calibrated" angles (e.g., 85.2°) in the pose instead of "intended" angles (90°). This 4.8° error caused "straight" moves to become diagonal drifts, ending at X=1.46m instead of X=1.35m.
+  - Fix: Modified `_send_rotate` to record the intended `world_delta` in the internal pose update.
+  - Improved `_navigate_segment` by adding a 0.3s settling delay after rotations to allow sensors and motors to stabilize before LIDAR checks.
+
+### Management Tools & Infrastructure
+- **Created Robot Management Scripts**
+  - `start.sh`: Cleans logs and runs `odom_only_navigator.py` detached via `nohup`.
+  - `stop.sh`: Safely terminates background navigator processes using `pkill`.
+  - `start_dev.sh`: Detached execution with Kafka bootstrap server override.
+- **Enhanced Configuration Support**
+  - Updated `odom_only_navigator.py` to honor `KAFKA_BOOTSTRAP_SERVERS` environment variable, enabling clean environment overrides during development.
+
+### Ongoing Investigation
+- **Analyzing Rotation Discrepancy (Segment 4)**
+  - Observed case where STM32 reports `TARGET_REACHED` but physical rotation is incorrect.
+  - Potential causes: Encoder slippage, motor stall, or LIDAR "ghosting" immediately after rotate causing premature "Blocked" verdict.
+
 ## Recent Changes (2025-12-20 Evening)
 
 ### Interactive Map Features
