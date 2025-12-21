@@ -593,7 +593,7 @@ class OdomOnlyNavigator:
         }
 
     def _accumulate_active_motion_progress(self, current_odom):
-        """Update active motion progress using odom delta magnitude; ignore sign/axis drift."""
+        """Update active motion progress using projection onto heading direction."""
         with self.active_motion_lock:
             if not self.active_motion:
                 return 0.0
@@ -601,7 +601,14 @@ class OdomOnlyNavigator:
             if self.active_motion.get('mode') == 'rotate':
                 incr = abs(delta.get('heading_deg', 0.0))
             else:
-                incr = abs(delta.get('x', 0.0)) + abs(delta.get('y', 0.0))
+                # Project odometry delta onto heading direction
+                # This correctly measures forward progress, ignoring lateral drift
+                heading_rad = math.radians(self.active_motion.get('heading', 0.0))
+                dx = delta.get('x', 0.0)
+                dy = delta.get('y', 0.0)
+                # Distance along heading = dot product with heading unit vector
+                incr = dx * math.cos(heading_rad) + dy * math.sin(heading_rad)
+                incr = max(0, incr)  # Only forward progress
             if incr > 0:
                 target_cap = self.active_motion.get('target', float('inf'))
                 self.active_motion['progress'] = min(
