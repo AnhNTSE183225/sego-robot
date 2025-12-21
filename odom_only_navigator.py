@@ -1175,19 +1175,10 @@ class OdomOnlyNavigator:
 
         if self._move_stop_reason:
             self.logger.warning(f"Move stopped by LIDAR: {self._move_stop_reason}")
-            # Reset pose and odometry to zero for manual re-alignment
-            self.logger.info("Resetting pose and odometry to zero - please re-align robot manually before next command")
-            self._reset_pose()
-            
-            # Reset STM32 odometry
-            self._send_raw_command("RESET_ODOM")
-            self._wait_for_response(["OK"], ["ERR"], timeout=0.5)
-            time.sleep(0.2)  # Let STM32 settle
-            self._reset_stm32_odom()
-            
-            # Publish reset pose so UI shows (0,0,0)
-            self._send_status()
-            self.logger.info("Pose reset complete. Robot is at (0.0, 0.0, 0.0°). Ready for next command after manual re-alignment.")
+            # DO NOT reset pose - autonomous navigation needs accurate position tracking
+            # The pose has already been updated with actual distance traveled (line 1169)
+            # Resetting to (0,0,0) would break path planning and cause robot to get lost
+            self._send_status()  # Publish current pose so UI shows where robot actually stopped
         elif result is False:
             self.logger.warning(f"Move failed ({line}).")
             # Publish pose even on interruption so UI reflects actual stop point
@@ -3123,7 +3114,17 @@ class OdomOnlyNavigator:
             if not self.map_loaded_event.is_set():
                 self.logger.info("Waiting for map definition before executing navigate_to_poi...")
                 self.map_loaded_event.wait(timeout=3.0)
-            goal = self._find_poi(poi_id)
+            
+            # Retry POI lookup a few times to handle race condition where map loads but POIs aren't processed yet
+            goal = None
+            for attempt in range(3):
+                goal = self._find_poi(poi_id)
+                if goal is not None:
+                    break
+                if attempt < 2:  # Don't sleep on last attempt
+                    self.logger.info(f"POI {poi_id} not found yet, retrying in 0.5s (attempt {attempt + 1}/3)...")
+                    time.sleep(0.5)
+            
             if goal is None:
                 self._send_ack(correlation_id, cmd, False, f"POI {poi_id} not found or map not loaded")
                 return
