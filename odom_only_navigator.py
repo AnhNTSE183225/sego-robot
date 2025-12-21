@@ -604,7 +604,15 @@ class OdomOnlyNavigator:
                 # STM32 odometry is in robot frame: X=forward, Y=left
                 # So delta['x'] directly represents forward movement, regardless of world heading
                 # This correctly measures forward progress, ignoring lateral drift
-                incr = max(0.0, delta.get('x', 0.0))  # Only forward progress
+                dx = delta.get('x', 0.0)
+                dy = delta.get('y', 0.0)
+                incr = max(0.0, dx)  # Only forward progress
+               
+                # Debug logging every 10th update
+                old_progress = self.active_motion.get('progress', 0.0)
+                if int(old_progress * 100) % 10 == 0 and incr > 0:
+                    self.logger.info(f"Progress: dx={dx:.3f}, dy={dy:.3f}, incr={incr:.3f}, total={old_progress + incr:.3f}")
+                    
             if incr > 0:
                 target_cap = self.active_motion.get('target', float('inf'))
                 self.active_motion['progress'] = min(
