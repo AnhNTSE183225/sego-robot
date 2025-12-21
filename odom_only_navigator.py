@@ -608,10 +608,11 @@ class OdomOnlyNavigator:
                 dy = delta.get('y', 0.0)
                 incr = max(0.0, dx)  # Only forward progress
                
-                # Debug logging every 10th update
-                old_progress = self.active_motion.get('progress', 0.0)
-                if int(old_progress * 100) % 10 == 0 and incr > 0:
-                    self.logger.info(f"Progress: dx={dx:.3f}, dy={dy:.3f}, incr={incr:.3f}, total={old_progress + incr:.3f}")
+                # Debug logging - log if we have meaningful increments
+                if incr > 0.001:  # More than 1mm
+                    new_total = self.active_motion.get('progress', 0.0) + incr
+                    if int(new_total * 20) != int(self.active_motion.get('progress', 0.0) * 20):  # Every 5cm
+                        self.logger.info(f"Progress: dx={dx:.3f}m incr={incr:.3f}m total={new_total:.3f}m")
                     
             if incr > 0:
                 target_cap = self.active_motion.get('target', float('inf'))
