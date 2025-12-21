@@ -95,9 +95,9 @@ class KafkaBridge:
             "seq": seq or int(time.time() * 1000),
             "payload": payload or {},
         }
-        # Log heartbeats at DEBUG level to reduce clutter, other messages at INFO
+        # Log heartbeats and status updates at DEBUG level to reduce clutter
         log_msg = f"Kafka send {msg_type} to {topic} cid={envelope['correlationId']} seq={envelope['seq']}"
-        if msg_type == "HEARTBEAT":
+        if msg_type in ("HEARTBEAT", "STATUS"):
             logging.getLogger("odom.navigator").debug(log_msg)
         else:
             self.log(log_msg)

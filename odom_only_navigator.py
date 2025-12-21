@@ -1764,13 +1764,17 @@ class OdomOnlyNavigator:
         corner_info = self._is_poi_at_corner(goal_position)
         if corner_info:
             self.logger.info(
-                "Goal at corner detected (angle=%.1f°). Applying LIDAR-based pose correction...",
+                "Goal at corner detected (angle=%.1f°). LIDAR-based pose correction DISABLED (buggy geometry)",
                 corner_info['interior_angle']
             )
-            # Wait a moment for robot to fully settle after movement
-            time.sleep(0.3)
-            # Apply correction
-            self._correct_pose_at_corner(corner_info)
+            # DISABLED: Corner correction has a bug in _compute_position_from_corner_walls
+            # It adds wall distances along wall angles instead of perpendicular to walls
+            # This causes large position errors (e.g., 98cm) that put robot out of bounds
+            # TODO: Fix the geometric calculation before re-enabling
+            # # Wait a moment for robot to fully settle after movement
+            # time.sleep(0.3)
+            # # Apply correction
+            # self._correct_pose_at_corner(corner_info)
         else:
             self.logger.debug("Goal not near any boundary corner; skipping pose correction.")
 
@@ -3220,7 +3224,8 @@ class OdomOnlyNavigator:
             },
             "state": "IDLE",
         }
-        self.logger.info(
+        # Log STATUS at DEBUG level to reduce clutter (sent every 1s when idle)
+        self.logger.debug(
             "STATUS anchor=(%.2f,%.2f,%.1fdeg) raw=(%.2f,%.2f,%.1fdeg) state=%s",
             pose_anchor['x'],
             pose_anchor['y'],
