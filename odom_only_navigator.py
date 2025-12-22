@@ -1322,11 +1322,21 @@ class OdomOnlyNavigator:
         stop_distance = OBSTACLE_STOP_DISTANCE_M
         check_count = 0
         min_clearance_seen = math.inf
+        start_time = time.time()
+        # Minimum time and checks before trusting progress data (avoids stale odom delta issues)
+        initial_settle_time = 0.15
+        min_checks_for_target = 3
         
         self.logger.info(f"[LIDAR Monitor] Started - target_distance={target_distance:.2f}m, stop_distance={stop_distance:.2f}m")
         
         while not self._move_stop_flag:
             if self.first_scan_event.is_set():
+                # Skip early checks to allow active_motion progress to stabilize
+                elapsed = time.time() - start_time
+                if elapsed < initial_settle_time:
+                    time.sleep(check_interval)
+                    continue
+                
                 # Check if robot has already reached destination (within tolerance)
                 # This prevents false obstacle detection when robot is at target and detects nearby walls
                 current_progress = 0.0
@@ -1335,8 +1345,8 @@ class OdomOnlyNavigator:
                         current_progress = self.active_motion.get('progress', 0.0)
                 
                 # If we've reached the target (within tolerance), stop monitoring
-                # No need to check for obstacles when we're already at destination
-                if current_progress >= target_distance - DISTANCE_TOLERANCE_M:
+                # Require minimum checks to avoid stale progress false-positive
+                if check_count >= min_checks_for_target and current_progress >= target_distance - DISTANCE_TOLERANCE_M:
                     self.logger.info(
                         f"[LIDAR Monitor] Target reached (progress={current_progress:.3f}m >= target={target_distance:.3f}m), "
                         "stopping obstacle monitoring"
@@ -2718,18 +2728,82 @@ class OdomOnlyNavigator:
                 i + 1, side_heading, step, side_clear
             )
 
+
             if not self._rotate_to_heading(side_heading):
                 continue
             if not self._send_move(step):
                 continue
             
-            # Successful escape move! Return True immediately to allow caller to trigger
-            # a full replan from the new position, rather than just checking forward.
-            self.logger.info(
-                "Escape successful - moved %.2fm at heading %.1f°. Triggering replan.",
-                step, side_heading
+            # Successful escape step! Check if forward is now clear.
+            # If not, try more steps in the same direction (up to 4 total).
+            for escape_step in range(4):
+                time.sleep(0.2)
+                pose = self._get_pose()
+                forward_clear = self._heading_clearance(
+                    forward_heading,
+                    pose['heading_deg'],
+                    FORWARD_SCAN_ANGLE_DEG,
+                    forward_step + CLEARANCE_MARGIN_M,
+                )
+                required = min(forward_step, OBSTACLE_STOP_DISTANCE_M)
+                
+                if forward_clear >= required:
+                    self.logger.info(
+                        "Escape successful after %d step(s) - forward now clear (%.2fm >= %.2fm). Triggering replan.",
+                        escape_step + 1, forward_clear, required
+                    )
+                    return True
+                
+                # Forward still blocked - try another step in same escape direction
+                if not self._step_static_clear(pose, side_heading, step):
+                    self.logger.info(
+                        "Escape step %d: can't continue at %.1f° (boundary/static). Trying different direction.",
+                        escape_step + 1, side_heading
+                    )
+                    break  # Try next clockwise direction
+                    
+                side_clear = self._heading_clearance(
+                    side_heading,
+                    pose['heading_deg'],
+                    FORWARD_SCAN_ANGLE_DEG,
+                    step + CLEARANCE_MARGIN_M,
+                )
+                if side_clear < min(step, OBSTACLE_STOP_DISTANCE_M * 0.8):
+                    self.logger.info(
+                        "Escape step %d: LIDAR blocks continuing at %.1f° (clear=%.2fm). Trying different direction.",
+                        escape_step + 1, side_heading, side_clear
+                    )
+                    break  # Try next clockwise direction
+                
+                # Take another step in same escape direction
+                self.logger.info(
+                    "Escape continuing: step %d at heading %.1f° (forward still blocked: %.2fm < %.2fm)",
+                    escape_step + 2, side_heading, forward_clear, required
+                )
+                if not self._rotate_to_heading(side_heading):
+                    break
+                if not self._send_move(step):
+                    break
+            
+            # Finished escape attempts in this direction, check forward one more time
+            pose = self._get_pose()
+            forward_clear = self._heading_clearance(
+                forward_heading,
+                pose['heading_deg'],
+                FORWARD_SCAN_ANGLE_DEG,
+                forward_step + CLEARANCE_MARGIN_M,
             )
-            return True
+            required = min(forward_step, OBSTACLE_STOP_DISTANCE_M)
+            if forward_clear >= required:
+                self.logger.info(
+                    "Escape complete - forward clear after multiple steps. Triggering replan."
+                )
+                return True
+            
+            self.logger.info(
+                "Escape direction %.1f° exhausted (forward still %.2fm < %.2fm). Trying another direction.",
+                side_heading, forward_clear, required
+            )
             
         return False
 
