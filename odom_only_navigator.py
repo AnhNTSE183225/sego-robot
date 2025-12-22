@@ -2263,20 +2263,28 @@ class OdomOnlyNavigator:
             proj_y = ay + t * aby
             return math.hypot(px - proj_x, py - proj_y)
 
-        # Helper: check if segment passes too close to any obstacle
+        # Helper: minimum distance between two line segments
+        def segment_to_segment_dist(a1, a2, b1, b2):
+            """Compute minimum distance between segment a1-a2 and segment b1-b2."""
+            # Check distance from each endpoint to the other segment
+            d1 = point_to_segment_dist(a1[0], a1[1], b1[0], b1[1], b2[0], b2[1])
+            d2 = point_to_segment_dist(a2[0], a2[1], b1[0], b1[1], b2[0], b2[1])
+            d3 = point_to_segment_dist(b1[0], b1[1], a1[0], a1[1], a2[0], a2[1])
+            d4 = point_to_segment_dist(b2[0], b2[1], a1[0], a1[1], a2[0], a2[1])
+            return min(d1, d2, d3, d4)
+
+        # Helper: check if segment passes too close to any obstacle edge
         def segment_too_close_to_obstacle(a, b, min_clearance):
             for obs in self.obstacles:
                 if len(obs) < 3:
                     continue
-                # Check distance to obstacle centroid
-                cx = sum(p[0] for p in obs) / len(obs)
-                cy = sum(p[1] for p in obs) / len(obs)
-                dist_to_center = point_to_segment_dist(cx, cy, a[0], a[1], b[0], b[1])
-                # Estimate obstacle "radius" as max distance from centroid to any vertex
-                obs_radius = max(math.hypot(p[0] - cx, p[1] - cy) for p in obs)
-                # Segment must not get closer than obstacle_radius + robot_clearance
-                if dist_to_center < (obs_radius + min_clearance):
-                    return True
+                m = len(obs)
+                for i in range(m):
+                    edge_a = obs[i]
+                    edge_b = obs[(i + 1) % m]
+                    dist = segment_to_segment_dist(a, b, edge_a, edge_b)
+                    if dist < min_clearance:
+                        return True
             return False
 
         for i in range(n):
@@ -3214,17 +3222,13 @@ class OdomOnlyNavigator:
             )
             return True
         
-        # Case 2: Both outside - only block if NOT heading back in
-        # We allow movement between outside points if they're getting closer to boundary
+        # Case 2: Both outside - BLOCK for planner (should not plan paths outside boundary)
         if not inside_start and not inside_end:
-            # Check if we're at least getting closer to the boundary center
-            # This is a heuristic to allow some movement when outside
-            self.logger.debug(
-                "Segment %s -> %s both outside boundary; allowing to enable re-entry.",
+            self.logger.info(
+                "Segment %s -> %s blocked: both points outside boundary.",
                 start, end,
             )
-            # Allow this segment - the planner will find a path back inside
-            return False
+            return True
         
         # Case 3: Re-entering boundary (good) - start outside, end inside
         if not inside_start and inside_end:
