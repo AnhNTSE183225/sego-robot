@@ -267,11 +267,11 @@ class STM32Tester:
             distance_m: Distance to move forward in meters
         
         Returns:
-            True if movement completed successfully
+            Tuple: (success: bool, move_duration_sec: float or None, velocity_m_per_sec: float or None)
         """
         if distance_m < 0.01:  # Less than 1cm
             self.logger.info("Distance too small, skipping move.")
-            return True
+            return True, None, None
         
         move_timeout = self.config.get('motion', {}).get('move_timeout_sec', 25.0)
         
@@ -292,7 +292,10 @@ class STM32Tester:
         )
         if not result:
             self.logger.warning(f"MOVE not acknowledged: {line}")
-            return False
+            return False, None, None
+        
+        # === TIMING: Start clock when movement actually begins ===
+        move_start_time = time.time()
         
         self.logger.info(f"Move started. Waiting for completion (timeout={move_timeout}s)...")
         
@@ -303,8 +306,23 @@ class STM32Tester:
             timeout=move_timeout
         )
         
+        # === TIMING: Stop clock when movement ends ===
+        move_end_time = time.time()
+        move_duration = move_end_time - move_start_time
+        
         if result and line and "TARGET_REACHED" in line:
+            # Calculate velocity
+            velocity = distance_m / move_duration if move_duration > 0 else 0
+            
             self.logger.info(f"Move completed: {line}")
+            self.logger.info(f"")
+            self.logger.info(f"========== TIMING RESULTS ==========")
+            self.logger.info(f"  Distance:  {distance_m:.3f} m")
+            self.logger.info(f"  Duration:  {move_duration:.3f} sec")
+            self.logger.info(f"  Velocity:  {velocity:.4f} m/s")
+            self.logger.info(f"=====================================")
+            self.logger.info(f"")
+            
             # Update pose tracking
             heading_rad = math.radians(self.pose['heading_deg'])
             self.pose['x'] += distance_m * math.cos(heading_rad)
@@ -313,14 +331,16 @@ class STM32Tester:
             # Reset STM32 odom after successful move
             self._send_command("RESET_ODOM")
             time.sleep(0.1)
-            return True
+            return True, move_duration, velocity
         
         # Movement was interrupted/timed out - check actual distance from odom
         time.sleep(0.1)
         actual_distance = self.odom['x']  # Forward distance in robot frame
         
         if actual_distance > 0.01:
+            velocity = actual_distance / move_duration if move_duration > 0 else 0
             self.logger.info(f"Move interrupted at {actual_distance:.3f}m (commanded: {distance_m:.3f}m)")
+            self.logger.info(f"  Duration: {move_duration:.3f} sec, Velocity: {velocity:.4f} m/s")
             # Update pose with actual distance
             heading_rad = math.radians(self.pose['heading_deg'])
             self.pose['x'] += actual_distance * math.cos(heading_rad)
@@ -336,7 +356,8 @@ class STM32Tester:
             self.logger.warning(f"Move failed: {line}")
         else:
             self.logger.warning("Move timeout with no MCU response.")
-        return False
+        return False, move_duration, None
+    
     
     def stop(self):
         """Emergency stop"""

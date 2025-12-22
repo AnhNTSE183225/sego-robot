@@ -166,6 +166,7 @@ DETOUR_AXIS_ALIGNED = _motion_cfg.get('detour_axis_aligned', True)  # Detours sn
 PREFER_CW_FOR_180 = _motion_cfg.get('prefer_cw_for_180', True)  # Prefer clockwise when delta ~180°
 MIN_MOVE_COMMAND_M = _motion_cfg.get('min_move_command_m', 0.05)
 MAX_MOVE_COMMAND_M = _motion_cfg.get('max_move_command_m', 1.0)
+MOVE_VELOCITY_M_PER_SEC = _motion_cfg.get('move_velocity_m_per_sec', 0.19)  # Calibrated robot velocity
 MIN_ROTATE_COMMAND_DEG = _motion_cfg.get('min_rotate_deg', 5.0)
 MAX_ROTATE_COMMAND_DEG = _motion_cfg.get('max_rotate_deg', 180.0)
 
@@ -650,23 +651,38 @@ class OdomOnlyNavigator:
         }
 
     def _accumulate_active_motion_progress(self, current_odom):
-        """Update active motion progress using odom delta magnitude; ignore sign/axis drift."""
+        """
+        Update active motion progress using TIME-BASED calculation for moves.
+        
+        For 'move' mode: progress = elapsed_time × velocity (avoids stale odom issues)
+        For 'rotate' mode: still uses odom delta (rotation is more reliable)
+        """
         with self.active_motion_lock:
             if not self.active_motion:
                 return 0.0
-            delta = self._odom_delta(self.active_motion['odom_start'], current_odom)
+            
             if self.active_motion.get('mode') == 'rotate':
+                # Rotation: use odom delta (more reliable for rotation)
+                delta = self._odom_delta(self.active_motion['odom_start'], current_odom)
                 incr = abs(delta.get('heading_deg', 0.0))
+                if incr > 0:
+                    target_cap = self.active_motion.get('target', float('inf'))
+                    self.active_motion['progress'] = min(
+                        target_cap,
+                        self.active_motion.get('progress', 0.0) + incr
+                    )
+                    self.active_motion['odom_start'] = dict(current_odom)
             else:
-                incr = abs(delta.get('x', 0.0)) + abs(delta.get('y', 0.0))
-            if incr > 0:
-                target_cap = self.active_motion.get('target', float('inf'))
-                self.active_motion['progress'] = min(
-                    target_cap,
-                    self.active_motion.get('progress', 0.0) + incr
-                )
-                # Reset baseline so we only accumulate fresh delta next time
-                self.active_motion['odom_start'] = dict(current_odom)
+                # Move: use TIME-BASED calculation to avoid stale odom issues
+                # progress = elapsed_time × velocity
+                start_time = self.active_motion.get('start_time')
+                if start_time:
+                    elapsed = time.time() - start_time
+                    target_cap = self.active_motion.get('target', float('inf'))
+                    # Calculate progress from time and configured velocity
+                    time_based_progress = elapsed * MOVE_VELOCITY_M_PER_SEC
+                    self.active_motion['progress'] = min(target_cap, time_based_progress)
+            
             return self.active_motion.get('progress', 0.0)
 
     def _get_pose(self):
@@ -1193,6 +1209,11 @@ class OdomOnlyNavigator:
             with self.active_motion_lock:
                 self.active_motion = None
             return False
+        
+        # === TIME-BASED PROGRESS: Record start time when movement actually begins ===
+        with self.active_motion_lock:
+            if self.active_motion:
+                self.active_motion['start_time'] = time.time()
         
         # Bước 2: Monitor LIDAR trong khi chờ MOVE TARGET_REACHED
         # Nếu phát hiện obstacle, gửi STOP ngay lập tức
