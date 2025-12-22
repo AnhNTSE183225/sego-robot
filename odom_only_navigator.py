@@ -716,6 +716,9 @@ class OdomOnlyNavigator:
             self.lidar_thread = None
 
     def _lidar_reader_loop(self):
+        consecutive_errors = 0
+        max_consecutive_errors = 5  # After this many errors, do a full restart
+        
         while self.lidar_running and self.lidar:
             try:
                 # Standard scan mode is more widely compatible across firmware variants.
@@ -726,15 +729,40 @@ class OdomOnlyNavigator:
                         self.latest_scan = scan
                     if not self.first_scan_event.is_set():
                         self.first_scan_event.set()
+                    # Reset error counter on successful scan
+                    consecutive_errors = 0
             except RPLidarException as exc:
-                self.logger.warning(f"LIDAR read error: {exc}")
-                try:
-                    # Buffer desync errors (incorrect descriptor / data in buffer) need a flush.
-                    self.lidar.clean_input()
-                    self.logger.debug("LIDAR input buffer cleaned after error.")
-                except Exception as clean_exc:
-                    self.logger.debug(f"Failed to clean LIDAR buffer: {clean_exc}")
-                time.sleep(0.5)
+                consecutive_errors += 1
+                self.logger.warning(f"LIDAR read error ({consecutive_errors}/{max_consecutive_errors}): {exc}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    # Too many consecutive errors - do a full LIDAR restart
+                    self.logger.warning("Too many consecutive LIDAR errors. Performing full LIDAR restart...")
+                    try:
+                        self.lidar.stop()
+                        self.lidar.stop_motor()
+                        time.sleep(0.5)
+                        self.lidar.disconnect()
+                    except Exception:
+                        pass
+                    
+                    try:
+                        time.sleep(1.0)  # Give hardware time to settle
+                        self.lidar = RPLidar(LIDAR_PORT)
+                        self.lidar.start_motor()
+                        self.logger.info("LIDAR restarted successfully after errors.")
+                        consecutive_errors = 0
+                    except Exception as restart_exc:
+                        self.logger.error(f"Failed to restart LIDAR: {restart_exc}")
+                        time.sleep(2.0)  # Wait longer before next attempt
+                else:
+                    try:
+                        # Buffer desync errors (incorrect descriptor / data in buffer) need a flush.
+                        self.lidar.clean_input()
+                        self.logger.debug("LIDAR input buffer cleaned after error.")
+                    except Exception as clean_exc:
+                        self.logger.debug(f"Failed to clean LIDAR buffer: {clean_exc}")
+                    time.sleep(0.5)
             except Exception as exc:
                 # Log full traceback so we can pinpoint parser/driver issues.
                 self.logger.exception("Unexpected LIDAR error")
