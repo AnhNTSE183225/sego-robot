@@ -419,12 +419,67 @@ class OdomOnlyNavigator:
             self.logger.error(f"Error opening {SERIAL_PORT}: {exc}")
             return False
 
-        try:
-            self.lidar = RPLidar(LIDAR_PORT)
-            self.lidar.start_motor()
-            self._start_lidar_listener()
-        except RPLidarException as exc:
-            self.logger.error(f"Error connecting to LIDAR on {LIDAR_PORT}: {exc}")
+        # Initialize LIDAR with startup validation and retry logic
+        max_lidar_retries = 5
+        lidar_ready = False
+        
+        for attempt in range(1, max_lidar_retries + 1):
+            try:
+                self.logger.info(f"LIDAR initialization attempt {attempt}/{max_lidar_retries}...")
+                
+                # Clean up any previous LIDAR state
+                if self.lidar:
+                    self._stop_lidar_listener()
+                    try:
+                        self.lidar.stop()
+                        self.lidar.stop_motor()
+                        self.lidar.disconnect()
+                    except Exception:
+                        pass
+                    self.lidar = None
+                    self.first_scan_event.clear()
+                    with self.scan_lock:
+                        self.latest_scan = []
+                
+                # Connect fresh
+                self.lidar = RPLidar(LIDAR_PORT)
+                self.lidar.start_motor()
+                self._start_lidar_listener()
+                
+                # Wait for first scan with a reasonable timeout
+                if not self.first_scan_event.wait(timeout=5.0):
+                    self.logger.warning(f"Attempt {attempt}: No LIDAR scan received within 5s, retrying...")
+                    continue
+                
+                # Validate we can get multiple clean scans (not just one)
+                # Wait a bit and check if scan data looks valid
+                time.sleep(1.0)
+                scan = self._get_scan_snapshot()
+                
+                if len(scan) < 50:  # A valid scan should have many readings
+                    self.logger.warning(
+                        f"Attempt {attempt}: LIDAR scan has too few readings ({len(scan)}), "
+                        "possible buffer desync. Retrying..."
+                    )
+                    continue
+                
+                # Scan looks good!
+                self.logger.info(f"LIDAR initialized successfully with {len(scan)} readings.")
+                lidar_ready = True
+                break
+                
+            except RPLidarException as exc:
+                self.logger.warning(f"Attempt {attempt}: LIDAR error during startup: {exc}")
+                if attempt < max_lidar_retries:
+                    self.logger.info("Will retry LIDAR initialization...")
+                    time.sleep(1.0)
+                continue
+        
+        if not lidar_ready:
+            self.logger.error(
+                f"Failed to initialize LIDAR after {max_lidar_retries} attempts. "
+                "Check LIDAR connection and restart the script."
+            )
             self._safe_close_serial()
             return False
 
@@ -438,11 +493,7 @@ class OdomOnlyNavigator:
         self._reset_pose()  # Reset internal pose tracking
         self._reset_stm32_odom()  # Reset STM32 odom cache
 
-        # Give the scanner a moment to deliver its first frames
-        if not self.first_scan_event.wait(timeout=3.0):
-            self.logger.warning("No LIDAR data received yet; motion will pause until scans arrive.")
-
-        self.logger.info("Connected. Pose reset to (0,0,0).")
+        self.logger.info("Connected. Pose reset to (0,0,0). LIDAR validated.")
         return True
 
     def _safe_close_serial(self):
@@ -2099,25 +2150,100 @@ class OdomOnlyNavigator:
             return False
         return True
 
+    def _inflate_polygon(self, polygon, inflation_distance):
+        """
+        Inflate a polygon outward by pushing each vertex away from the polygon centroid.
+        This creates a safety margin around obstacles for path planning.
+        
+        Args:
+            polygon: List of (x, y) tuples representing polygon vertices
+            inflation_distance: Distance to push vertices outward (meters)
+            
+        Returns:
+            List of inflated (x, y) tuples
+        """
+        if not polygon or len(polygon) < 3:
+            return polygon
+            
+        # Calculate centroid
+        cx = sum(p[0] for p in polygon) / len(polygon)
+        cy = sum(p[1] for p in polygon) / len(polygon)
+        
+        inflated = []
+        for px, py in polygon:
+            # Vector from centroid to vertex
+            dx = px - cx
+            dy = py - cy
+            dist = math.hypot(dx, dy)
+            if dist < 0.001:  # Vertex at centroid (shouldn't happen for valid polygons)
+                inflated.append((px, py))
+                continue
+            # Normalize and scale by inflation distance
+            scale = (dist + inflation_distance) / dist
+            inflated.append((cx + dx * scale, cy + dy * scale))
+        
+        return inflated
+
     def _plan_path_visibility(self, start, goal):
         """
         Simple visibility-graph planner using polygon vertices.
         Returns list of waypoints (including goal) or None if no path.
+        
+        Obstacle vertices are inflated by robot radius + margin to ensure
+        planned paths maintain safe distance from obstacles.
         """
         if self._direct_path_clear(start, goal):
             return [goal]
 
+        # Inflation distance: robot radius + safety margin
+        inflation_dist = ROBOT_RADIUS_M + CLEARANCE_MARGIN_M
+
         nodes = [start, goal]
-        # Add boundary vertices
+        # Add boundary vertices (shrunk inward to keep robot inside)
         if self.boundary_polygon:
+            # For boundary, we could shrink inward, but for simplicity just use as-is
+            # The robot should stay inside anyway
             nodes.extend(self.boundary_polygon)
-        # Add obstacle vertices
+        # Add INFLATED obstacle vertices (pushed outward for safety)
         for obs in self.obstacles:
-            nodes.extend(obs)
+            inflated_obs = self._inflate_polygon(obs, inflation_dist)
+            # Only add inflated vertices that are still inside the boundary and not inside other obstacles
+            for pt in inflated_obs:
+                if self._in_boundary(pt) and self._point_free(pt):
+                    nodes.append(pt)
 
         # Build visibility edges
         n = len(nodes)
         graph = {i: [] for i in range(n)}
+
+        # Helper: minimum distance from point to line segment
+        def point_to_segment_dist(px, py, ax, ay, bx, by):
+            """Compute minimum distance from point (px,py) to segment (ax,ay)-(bx,by)."""
+            abx, aby = bx - ax, by - ay
+            apx, apy = px - ax, py - ay
+            ab_len_sq = abx * abx + aby * aby
+            if ab_len_sq < 1e-9:
+                return math.hypot(apx, apy)
+            t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab_len_sq))
+            proj_x = ax + t * abx
+            proj_y = ay + t * aby
+            return math.hypot(px - proj_x, py - proj_y)
+
+        # Helper: check if segment passes too close to any obstacle
+        def segment_too_close_to_obstacle(a, b, min_clearance):
+            for obs in self.obstacles:
+                if len(obs) < 3:
+                    continue
+                # Check distance to obstacle centroid
+                cx = sum(p[0] for p in obs) / len(obs)
+                cy = sum(p[1] for p in obs) / len(obs)
+                dist_to_center = point_to_segment_dist(cx, cy, a[0], a[1], b[0], b[1])
+                # Estimate obstacle "radius" as max distance from centroid to any vertex
+                obs_radius = max(math.hypot(p[0] - cx, p[1] - cy) for p in obs)
+                # Segment must not get closer than obstacle_radius + robot_clearance
+                if dist_to_center < (obs_radius + min_clearance):
+                    return True
+            return False
 
         for i in range(n):
             for j in range(i + 1, n):
@@ -2126,6 +2252,9 @@ class OdomOnlyNavigator:
                 if self._segment_crosses_obstacles(a, b):
                     continue
                 if self._segment_leaves_boundary(a, b):
+                    continue
+                # Additional check: segment must not pass too close to obstacles
+                if segment_too_close_to_obstacle(a, b, inflation_dist):
                     continue
                 dist = math.hypot(b[0] - a[0], b[1] - a[1])
                 graph[i].append((j, dist))
