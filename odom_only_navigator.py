@@ -1324,8 +1324,9 @@ class OdomOnlyNavigator:
         min_clearance_seen = math.inf
         start_time = time.time()
         # Minimum time and checks before trusting progress data (avoids stale odom delta issues)
-        initial_settle_time = 0.15
-        min_checks_for_target = 3
+        # Robot needs time to actually start moving before odom is accurate
+        initial_settle_time = 0.5  # 500ms - wait for robot to start moving
+        min_checks_for_target = 15  # At 50ms each = 750ms of confirmed progress
         
         self.logger.info(f"[LIDAR Monitor] Started - target_distance={target_distance:.2f}m, stop_distance={stop_distance:.2f}m")
         
