@@ -2815,12 +2815,26 @@ class OdomOnlyNavigator:
                 if not self._rotate_to_heading(heading_world):
                     return False
             step = min(remaining, MAX_MOVE_COMMAND_M)
+            
+            # Check static obstacles before moving - robot may be in new position after escape
+            pose = self._get_pose()
+            if not self._step_static_clear(pose, heading_world, step):
+                self.logger.info(
+                    "Static obstacle blocks segment from (%.2f, %.2f) heading=%.1f° step=%.2f -> replan",
+                    pose['x'], pose['y'], heading_world, step
+                )
+                return False
+            
             if self._segment_blocked_by_lidar(heading_world, step):
                 # Try a quick right-hand sidestep to clear the blockage
                 if self._escape_right_detour(heading_world, step):
-                    continue  # After detour, re-evaluate the same segment from new pose
+                    # After escape, force replan - new position may require different path
+                    self.logger.info("Escape detour successful, triggering replan from new position")
+                    return False
                 if self._escape_clockwise_loop(heading_world, step):
-                    continue
+                    # After escape, force replan - new position may require different path
+                    self.logger.info("Escape loop successful, triggering replan from new position")
+                    return False
                 return False
             if not self._send_move(step):
                 return False
