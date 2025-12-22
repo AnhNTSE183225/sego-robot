@@ -3483,6 +3483,10 @@ class OdomOnlyNavigator:
             success = self._navigate_segment(goal, snap_heading=False)
             if not success:
                 self.logger.warning("Perimeter blocked; marking INVALID.")
+                # Reset pose and odometry to (0,0,0) so operator can reposition robot
+                self._send_raw_command("RESET_ODOM")
+                self._reset_pose()
+                self.logger.info("Pose and odometry reset to (0,0,0) after perimeter failure.")
                 if self.kafka_bridge:
                     self.kafka_bridge.send_map_verdict(
                         self.map_definition_correlation, map_id, "INVALID", reason="BLOCKED_PATH",
