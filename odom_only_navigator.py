@@ -2907,16 +2907,23 @@ class OdomOnlyNavigator:
                 return False
             
             if self._segment_blocked_by_lidar(heading_world, step):
-                # Try a quick right-hand sidestep to clear the blockage
+                # Try escape maneuvers to clear the blockage
+                escaped = False
                 if self._escape_right_detour(heading_world, step):
-                    # After escape, force replan - new position may require different path
-                    self.logger.info("Escape detour successful, triggering replan from new position")
-                    return False
-                if self._escape_clockwise_loop(heading_world, step):
-                    # After escape, force replan - new position may require different path
-                    self.logger.info("Escape loop successful, triggering replan from new position")
-                    return False
+                    self.logger.info("Escape detour successful, continuing segment from new position")
+                    escaped = True
+                elif self._escape_clockwise_loop(heading_world, step):
+                    self.logger.info("Escape loop successful, continuing segment from new position")
+                    escaped = True
+                
+                if escaped:
+                    # After escape, continue trying to execute this segment from new position
+                    # Don't replan - just try to make forward progress
+                    continue
+                
+                # All escape attempts failed - need to replan
                 return False
+            
             if not self._send_move(step):
                 return False
             remaining = max(0.0, remaining - step)
