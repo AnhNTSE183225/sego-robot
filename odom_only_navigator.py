@@ -2910,16 +2910,47 @@ class OdomOnlyNavigator:
                 # Try escape maneuvers to clear the blockage
                 escaped = False
                 if self._escape_right_detour(heading_world, step):
-                    self.logger.info("Escape detour successful, continuing segment from new position")
+                    self.logger.info("Escape detour successful")
                     escaped = True
                 elif self._escape_clockwise_loop(heading_world, step):
-                    self.logger.info("Escape loop successful, continuing segment from new position")
+                    self.logger.info("Escape loop successful")
                     escaped = True
                 
                 if escaped:
-                    # After escape, continue trying to execute this segment from new position
-                    # Don't replan - just try to make forward progress
-                    continue
+                    # After escape, try a SHORT forward move (LIDAR-only, ignore static check)
+                    # This implements zigzag skirting: sidestep -> short forward -> continue
+                    short_step = min(0.30, step, remaining)
+                    pose = self._get_pose()
+                    
+                    # Check LIDAR clearance for short forward step
+                    fwd_clear = self._heading_clearance(
+                        heading_world,
+                        pose['heading_deg'],
+                        FORWARD_SCAN_ANGLE_DEG,
+                        short_step + CLEARANCE_MARGIN_M,
+                    )
+                    
+                    if fwd_clear >= short_step:
+                        # LIDAR says forward is clear - try the short forward move
+                        self.logger.info(
+                            "Zigzag skirting: forward clear (%.2fm), trying short %.2fm move",
+                            fwd_clear, short_step
+                        )
+                        if not self._close_enough_heading(heading_world):
+                            if not self._rotate_to_heading(heading_world):
+                                return False  # Rotation failed, replan needed
+                        if self._send_move(short_step):
+                            remaining = max(0.0, remaining - short_step)
+                            continue  # Successfully moved forward, continue with segment
+                        # Move failed, fall through to replan
+                    else:
+                        self.logger.info(
+                            "Zigzag skirting: forward still blocked (clear=%.2fm < step=%.2fm), replan needed",
+                            fwd_clear, short_step
+                        )
+                    
+                    # Short forward move not possible, replan from new position
+                    return False
                 
                 # All escape attempts failed - need to replan
                 return False
