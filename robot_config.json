@@ -20,7 +20,8 @@
     },
     "logging": {
         "file": "robot.log",
-        "level": "INFO"
+        "level": "INFO",
+        "disable_file": true
     },
     "motion": {
         "distance_tolerance_m": 0.02,
@@ -130,7 +131,7 @@
         "move_kp": -0.0100,
         "move_ki": -0.00015,
         "move_kd": -0.0004,
-        "move_min_pwm": 0.35 ,
+        "move_min_pwm": 0.35,
         "move_max_pwm": 0.70,
         "move_smoothing": 0.3,
         "move_skew": 0.0080,

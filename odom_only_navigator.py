@@ -38,9 +38,12 @@ def configure_logging():
     
     Console: INFO level (or ROBOT_LOG_LEVEL env var)
     File: INFO level to keep logs from being too noisy
+    
+    Set logging.disable_file=true in robot_config.json to disable file logging.
     """
     console_level = getattr(logging, LOG_LEVEL, logging.INFO)
     file_level = logging.INFO  # File logs at INFO to reduce noise
+    disable_file_log = ROBOT_CONFIG.get('logging', {}).get('disable_file', False)
     
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
@@ -53,20 +56,23 @@ def configure_logging():
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(console_level)
     console.setFormatter(formatter)
-
-    # File: INFO (luôn luôn để debug chi tiết)
-    file_handler = logging.handlers.RotatingFileHandler(
-        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
-    )
-    file_handler.setLevel(file_level)
-    file_handler.setFormatter(formatter)
-
     root.addHandler(console)
-    root.addHandler(file_handler)
+
+    # File: INFO (unless disabled via config)
+    if not disable_file_log:
+        file_handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
+        )
+        file_handler.setLevel(file_level)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
     
-    # Log startup info (shows in both console and file)
+    # Log startup info
     logger = logging.getLogger("odom.navigator")
-    logger.info(f"Logging configured: Console={logging.getLevelName(console_level)}, File={logging.getLevelName(file_level)} -> {LOG_FILE}")
+    if disable_file_log:
+        logger.info(f"Logging configured: Console={logging.getLevelName(console_level)}, File=DISABLED")
+    else:
+        logger.info(f"Logging configured: Console={logging.getLevelName(console_level)}, File={logging.getLevelName(file_level)} -> {LOG_FILE}")
 
 
 try:
