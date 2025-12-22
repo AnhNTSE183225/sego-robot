@@ -1478,18 +1478,34 @@ class OdomOnlyNavigator:
         """
         Check whether a forward step of step_distance along heading_world_deg stays within boundary
         and does not cut through any static obstacle.
+        
+        Uses corridor-based checking: validates not just the centerline but also offset lines
+        at ±robot_clearance_radius to ensure the robot body doesn't clip obstacle corners.
         """
         sx, sy = pose['x'], pose['y']
         rad = math.radians(heading_world_deg)
-        ex = sx + step_distance * math.cos(rad)
-        ey = sy + step_distance * math.sin(rad)
-        start = (sx, sy)
-        end = (ex, ey)
-
-        if self._segment_leaves_boundary(start, end):
-            return False
-        if self._segment_crosses_obstacles(start, end):
-            return False
+        cos_h, sin_h = math.cos(rad), math.sin(rad)
+        ex = sx + step_distance * cos_h
+        ey = sy + step_distance * sin_h
+        
+        # Perpendicular offsets for robot width (90° left and right)
+        # Robot clearance radius - half the robot's effective width
+        clearance_radius = 0.12  # ~24cm robot width / 2 with small margin
+        perp_x = -sin_h * clearance_radius  # perpendicular X component
+        perp_y = cos_h * clearance_radius   # perpendicular Y component
+        
+        # Check three parallel lines: centerline, left offset, right offset
+        lines_to_check = [
+            ((sx, sy), (ex, ey)),                                    # centerline
+            ((sx + perp_x, sy + perp_y), (ex + perp_x, ey + perp_y)),  # left edge
+            ((sx - perp_x, sy - perp_y), (ex - perp_x, ey - perp_y)),  # right edge
+        ]
+        
+        for start, end in lines_to_check:
+            if self._segment_leaves_boundary(start, end):
+                return False
+            if self._segment_crosses_obstacles(start, end):
+                return False
         return True
 
     def _choose_heading_with_avoidance(
