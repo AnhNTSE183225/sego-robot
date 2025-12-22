@@ -1775,6 +1775,11 @@ class OdomOnlyNavigator:
         resilient to temporary obstacles. It will log periodic warnings every 10 replans.
         """
         replan_count = 0
+        stuck_count = 0  # Track consecutive replans where robot hasn't moved
+        last_pose = None
+        STUCK_THRESHOLD = 5  # After this many replans without progress, try backup
+        STUCK_MOVE_THRESHOLD = 0.05  # Minimum movement to consider "progress"
+        
         while True:
             pose = self._get_pose()
             dx = goal[0] - pose['x']
@@ -1782,6 +1787,47 @@ class OdomOnlyNavigator:
             distance = math.hypot(dx, dy)
             if distance < tolerance_m:
                 return True
+            
+            # Check if we're stuck (not moving between replans)
+            if last_pose is not None:
+                moved = math.hypot(pose['x'] - last_pose['x'], pose['y'] - last_pose['y'])
+                if moved < STUCK_MOVE_THRESHOLD:
+                    stuck_count += 1
+                else:
+                    stuck_count = 0  # Reset on movement
+            last_pose = {'x': pose['x'], 'y': pose['y']}
+            
+            # If stuck, try backing up to escape obstacle corner
+            if stuck_count >= STUCK_THRESHOLD:
+                self.logger.warning(
+                    "Robot stuck after %d replans without movement. Attempting backup escape...",
+                    stuck_count
+                )
+                # Try backing up (opposite of current heading)
+                backup_heading = normalize_angle_deg(pose['heading_deg'] + 180.0)
+                backup_step = 0.20
+                
+                # Check if backup is safe
+                if self._step_static_clear(pose, backup_heading, backup_step):
+                    backup_clear = self._heading_clearance(
+                        backup_heading, pose['heading_deg'],
+                        FORWARD_SCAN_ANGLE_DEG, backup_step + CLEARANCE_MARGIN_M
+                    )
+                    if backup_clear >= backup_step:
+                        self.logger.info("Backup direction clear (%.2fm). Executing...", backup_clear)
+                        self._rotate_to_heading(backup_heading)
+                        self._send_move(backup_step)
+                        stuck_count = 0  # Reset after backup attempt
+                        continue
+                
+                self.logger.warning("Backup blocked. Trying lateral escape...")
+                # Try any escape direction
+                if self._escape_clockwise_loop(pose['heading_deg'], 0.20):
+                    stuck_count = 0
+                    continue
+                
+                self.logger.error("All escape directions blocked. Will keep trying...")
+                stuck_count = 0  # Reset to prevent spam
 
             # Try visibility-graph planner first for small/tight maps
             path = self._plan_path_visibility((pose['x'], pose['y']), goal)
