@@ -1353,29 +1353,9 @@ class OdomOnlyNavigator:
         
         while not self._move_stop_flag:
             if self.first_scan_event.is_set():
-                # Skip early checks to allow active_motion progress to stabilize
                 elapsed = time.time() - start_time
-                if elapsed < initial_settle_time:
-                    time.sleep(check_interval)
-                    continue
                 
-                # Check if robot has already reached destination (within tolerance)
-                # This prevents false obstacle detection when robot is at target and detects nearby walls
-                current_progress = 0.0
-                with self.active_motion_lock:
-                    if self.active_motion and self.active_motion.get('mode') == 'move':
-                        current_progress = self.active_motion.get('progress', 0.0)
-                
-                # If we've reached the target (within tolerance), stop monitoring
-                # Require minimum checks to avoid stale progress false-positive
-                if check_count >= min_checks_for_target and current_progress >= target_distance - DISTANCE_TOLERANCE_M:
-                    self.logger.info(
-                        f"[LIDAR Monitor] Target reached (progress={current_progress:.3f}m >= target={target_distance:.3f}m), "
-                        "stopping obstacle monitoring"
-                    )
-                    break
-                
-                # Check forward direction for obstacles
+                # ALWAYS check for obstacles immediately - safety first!
                 current_heading = self._get_pose()['heading_deg']
                 clearance = self._heading_clearance(
                     current_heading,
@@ -1394,12 +1374,28 @@ class OdomOnlyNavigator:
                         check_count, clearance, min_clearance_seen, current_heading
                     )
                 
+                # Stop immediately if obstacle detected
                 if clearance < stop_distance:
                     self.logger.warning(f"[LIDAR Monitor] OBSTACLE DETECTED at {clearance:.2f}m! (stop_distance={stop_distance:.2f}m)")
                     self._log_lidar_scan_debug(current_heading, clearance, target_distance)
                     self._move_stop_reason = f"Obstacle at {clearance:.2f}m"
                     self._send_stop()
                     break
+                
+                # Target-reached check: only after settle time + minimum checks
+                # This prevents false positives from stale progress data
+                if elapsed >= initial_settle_time and check_count >= min_checks_for_target:
+                    current_progress = 0.0
+                    with self.active_motion_lock:
+                        if self.active_motion and self.active_motion.get('mode') == 'move':
+                            current_progress = self.active_motion.get('progress', 0.0)
+                    
+                    if current_progress >= target_distance - DISTANCE_TOLERANCE_M:
+                        self.logger.info(
+                            f"[LIDAR Monitor] Target reached (progress={current_progress:.3f}m >= target={target_distance:.3f}m), "
+                            "stopping obstacle monitoring"
+                        )
+                        break
             else:
                 self.logger.warning("[LIDAR Monitor] No scan data available!")
             
