@@ -1759,7 +1759,11 @@ class OdomOnlyNavigator:
 
     # --- Navigation logic ---
     def _navigate_with_planner(self, goal, tolerance_m=DISTANCE_TOLERANCE_M):
-        """Navigate to goal using A* over static + live LIDAR obstacles with replans on interruption."""
+        """Navigate to goal using A* over static + live LIDAR obstacles with replans on interruption.
+        
+        This function retries indefinitely until the goal is reached, making the robot
+        resilient to temporary obstacles. It will log periodic warnings every 10 replans.
+        """
         replan_count = 0
         while True:
             pose = self._get_pose()
@@ -1788,10 +1792,14 @@ class OdomOnlyNavigator:
                 continue  # Check distance again; may need another short plan
 
             replan_count += 1
-            if replan_count >= PLANNER_MAX_REPLANS:
-                self.logger.warning("Navigation aborted after %d replans.", replan_count)
-                return False
-            self.logger.info("Replanning after interruption (attempt %d/%d)...", replan_count, PLANNER_MAX_REPLANS)
+            # Log warning every 10 replans, but keep trying indefinitely
+            if replan_count % 10 == 0:
+                self.logger.warning(
+                    "Navigation still trying after %d replans (distance to goal: %.2fm). Retrying...",
+                    replan_count, distance
+                )
+            else:
+                self.logger.info("Replanning after interruption (attempt %d)...", replan_count)
             time.sleep(0.1)
 
     def navigate_to(self, goal, allow_detour=True, tolerance_m=None):
@@ -2675,14 +2683,23 @@ class OdomOnlyNavigator:
         """
         Stronger escape: try up to 4 clockwise headings (90° increments), moving a short
         distance if clear, then returning to the original forward heading.
+        
+        Returns True if we successfully moved, allowing caller to trigger a full replan.
         """
         base_heading = self._get_pose()['heading_deg']
         step = max(MIN_MOVE_COMMAND_M, min(0.25, MAX_MOVE_COMMAND_M))
         for i in range(4):
             side_heading = normalize_angle_deg(base_heading - 90.0 * (i + 1))
             pose = self._get_pose()
+            
+            # Check if this escape direction would exit the boundary
             if not self._step_static_clear(pose, side_heading, step):
+                self.logger.debug(
+                    "Escape attempt %d: heading=%.1f° blocked by static/boundary",
+                    i + 1, side_heading
+                )
                 continue
+            
             side_clear = self._heading_clearance(
                 side_heading,
                 pose['heading_deg'],
@@ -2690,6 +2707,10 @@ class OdomOnlyNavigator:
                 step + CLEARANCE_MARGIN_M,
             )
             if side_clear < min(step, OBSTACLE_STOP_DISTANCE_M * 0.8):
+                self.logger.debug(
+                    "Escape attempt %d: heading=%.1f° blocked by LIDAR (clear=%.2fm)",
+                    i + 1, side_heading, side_clear
+                )
                 continue
 
             self.logger.info(
@@ -2701,24 +2722,15 @@ class OdomOnlyNavigator:
                 continue
             if not self._send_move(step):
                 continue
-            if not self._rotate_to_heading(base_heading):
-                continue
-            time.sleep(0.2)
-
-            pose = self._get_pose()
-            forward_clear = self._heading_clearance(
-                forward_heading,
-                pose['heading_deg'],
-                FORWARD_SCAN_ANGLE_DEG,
-                forward_step + CLEARANCE_MARGIN_M,
-            )
-            required = min(forward_step, OBSTACLE_STOP_DISTANCE_M)
+            
+            # Successful escape move! Return True immediately to allow caller to trigger
+            # a full replan from the new position, rather than just checking forward.
             self.logger.info(
-                "Post-escape forward check: heading=%.1f°, clear=%.2f required=%.2f",
-                forward_heading, forward_clear, required
+                "Escape successful - moved %.2fm at heading %.1f°. Triggering replan.",
+                step, side_heading
             )
-            if forward_clear >= required:
-                return True
+            return True
+            
         return False
 
     def _execute_segment_move(self, heading_world, distance):
