@@ -677,7 +677,10 @@ class OdomOnlyNavigator:
                 # progress = elapsed_time × velocity
                 start_time = self.active_motion.get('start_time')
                 if start_time:
-                    elapsed = time.time() - start_time
+                    # Use stop_time if set (obstacle detected), otherwise use current time
+                    stop_time = self.active_motion.get('stop_time')
+                    end_time = stop_time if stop_time else time.time()
+                    elapsed = end_time - start_time
                     target_cap = self.active_motion.get('target', float('inf'))
                     # Calculate progress from time and configured velocity
                     time_based_progress = elapsed * MOVE_VELOCITY_M_PER_SEC
@@ -1379,6 +1382,11 @@ class OdomOnlyNavigator:
                     self.logger.warning(f"[LIDAR Monitor] OBSTACLE DETECTED at {clearance:.2f}m! (stop_distance={stop_distance:.2f}m)")
                     self._log_lidar_scan_debug(current_heading, clearance, target_distance)
                     self._move_stop_reason = f"Obstacle at {clearance:.2f}m"
+                    # Freeze progress by recording stop_time BEFORE sending stop command
+                    # This prevents time-based progress from continuing to accumulate during timeout wait
+                    with self.active_motion_lock:
+                        if self.active_motion:
+                            self.active_motion['stop_time'] = time.time()
                     self._send_stop()
                     break
                 
@@ -2051,8 +2059,10 @@ class OdomOnlyNavigator:
         incoming_map_id = self.map_definition.get('mapId') if self.map_definition else None
         if self.map_anchor_applied and self.current_map_id == incoming_map_id:
             # Already anchored this mapId; keep existing anchor to avoid "teleporting" pose
+            # BUT reload POIs/obstacles with the existing anchor transform (in case they changed)
+            self._reload_map_data_with_existing_anchor()
             self.logger.info(
-                "Map definition received again for mapId=%s; keeping existing anchor.",
+                "Map definition received again for mapId=%s; keeping existing anchor, reloaded POIs/obstacles.",
                 incoming_map_id
             )
         else:
@@ -2064,6 +2074,65 @@ class OdomOnlyNavigator:
                 incoming_map_id if incoming_map_id else 'unknown'
             )
         self.map_loaded_event.set()
+
+    def _reload_map_data_with_existing_anchor(self):
+        """
+        Reload POIs and obstacles from self.map_definition using the existing anchor transform.
+        This is called when the same mapId is received again (e.g., after POI updates in the app).
+        The boundary and anchor metadata are preserved to avoid pose "teleportation".
+        """
+        if not self.map_definition:
+            return
+        if self.anchor_rotation_deg is None or self.anchor_p0_raw is None or self.anchor_pose_at_load is None:
+            self.logger.warning("Cannot reload with existing anchor: anchor metadata missing.")
+            return
+
+        # Rebuild the rotation/translation transform from stored anchor metadata
+        rot = math.radians(self.anchor_rotation_deg)
+        cos_r = math.cos(rot)
+        sin_r = math.sin(rot)
+        p0 = self.anchor_p0_raw
+        pose_for_anchor = self.anchor_pose_at_load
+
+        def _rotate_translate_point(pt):
+            rx = pt[0] - p0[0]
+            ry = pt[1] - p0[1]
+            x_rot = rx * cos_r - ry * sin_r
+            y_rot = rx * sin_r + ry * cos_r
+            x_world = x_rot + p0[0]
+            y_world = y_rot + p0[1]
+            x_world += pose_for_anchor['x'] - p0[0]
+            y_world += pose_for_anchor['y'] - p0[1]
+            return (x_world, y_world)
+
+        # Reload obstacles with existing anchor
+        raw_obstacles = (self.map_definition.get("obstacles") or []) + (self.map_definition.get("restricted") or [])
+        self.obstacles = []
+        for obs in raw_obstacles:
+            pts = obs.get("points") or []
+            polygon = [(float(p.get("x", 0)), float(p.get("y", 0))) for p in pts if p.get("x") is not None and p.get("y") is not None]
+            if not polygon:
+                continue
+            polygon = [_rotate_translate_point(pt) for pt in polygon]
+            self.obstacles.append(polygon)
+
+        # Reload POIs with existing anchor
+        raw_pois = self.map_definition.get("pointsOfInterest") or []
+        self.points_of_interest = []
+        for poi in raw_pois:
+            x = float(poi.get("x", 0.0))
+            y = float(poi.get("y", 0.0))
+            x, y = _rotate_translate_point((x, y))
+            new_poi = dict(poi)
+            new_poi["x"] = x
+            new_poi["y"] = y
+            self.points_of_interest.append(new_poi)
+
+        self.logger.info(
+            "Reloaded map data with existing anchor: obstacles=%d, pois=%d",
+            len(self.obstacles),
+            len(self.points_of_interest),
+        )
 
     # --- Map helpers (obstacles & POIs) ---
     def _load_static_map_data(self, force_reanchor=False):
