@@ -1502,7 +1502,8 @@ class OdomOnlyNavigator:
         
         # Obstacle check: use corridor (centerline + offsets) to prevent corner clipping
         # Robot clearance radius - half the robot's effective width
-        clearance_radius = 0.10  # ~20cm robot width / 2
+        # Set to 0 to allow corner-scraping (centerline only) when robot_radius_m=0
+        clearance_radius = 0.0
         perp_x = -sin_h * clearance_radius  # perpendicular X component
         perp_y = cos_h * clearance_radius   # perpendicular Y component
         
@@ -2343,13 +2344,44 @@ class OdomOnlyNavigator:
         return True
 
     def _direct_path_clear(self, start, goal):
-        """Check if straight line from start->goal is free of static obstacles and within boundary."""
+        """Check if straight line from start->goal is free of static obstacles and within boundary.
+        
+        Uses corridor checking (centerline + left/right edges) to match the execution-time
+        checks in _step_static_clear, preventing the planner from approving paths that would
+        fail during execution due to the robot's body clipping obstacle corners.
+        """
         if not self._in_boundary(goal):
-            return False
-        if self._segment_crosses_obstacles(start, goal):
             return False
         if self._segment_leaves_boundary(start, goal):
             return False
+        
+        # Corridor check: centerline + left/right edges (matches _step_static_clear)
+        dx = goal[0] - start[0]
+        dy = goal[1] - start[1]
+        dist = math.hypot(dx, dy)
+        if dist < 0.001:
+            return True  # Start and goal are same point
+        
+        # Heading from start to goal
+        cos_h = dx / dist
+        sin_h = dy / dist
+        
+        # Robot clearance radius - must match _step_static_clear
+        # Set to 0 to allow corner-scraping (centerline only) when robot_radius_m=0
+        clearance_radius = 0.0
+        perp_x = -sin_h * clearance_radius  # perpendicular X component
+        perp_y = cos_h * clearance_radius   # perpendicular Y component
+        
+        lines_to_check = [
+            (start, goal),  # centerline
+            ((start[0] + perp_x, start[1] + perp_y), (goal[0] + perp_x, goal[1] + perp_y)),  # left edge
+            ((start[0] - perp_x, start[1] - perp_y), (goal[0] - perp_x, goal[1] - perp_y)),  # right edge
+        ]
+        
+        for seg_start, seg_end in lines_to_check:
+            if self._segment_crosses_obstacles(seg_start, seg_end):
+                return False
+        
         return True
 
     def _inflate_polygon(self, polygon, inflation_distance):
