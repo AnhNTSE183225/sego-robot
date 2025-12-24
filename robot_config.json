@@ -33,7 +33,7 @@
         "heading_offset_deg": 0.0,
         "min_move_command_m": 0.05,
         "max_move_command_m": 1.0,
-        "min_rotate_deg": 30.0,
+        "min_rotate_deg": 15.0,
         "max_rotate_deg": 150.0,
         "move_velocity_m_per_sec": 0.172
     },
