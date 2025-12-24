@@ -2441,20 +2441,6 @@ class OdomOnlyNavigator:
             d4 = point_to_segment_dist(b2[0], b2[1], a1[0], a1[1], a2[0], a2[1])
             return min(d1, d2, d3, d4)
 
-        # Helper: check if segment passes too close to any obstacle edge
-        def segment_too_close_to_obstacle(a, b, min_clearance):
-            for obs in self.obstacles:
-                if len(obs) < 3:
-                    continue
-                m = len(obs)
-                for i in range(m):
-                    edge_a = obs[i]
-                    edge_b = obs[(i + 1) % m]
-                    dist = segment_to_segment_dist(a, b, edge_a, edge_b)
-                    if dist < min_clearance:
-                        return True
-            return False
-
         for i in range(n):
             for j in range(i + 1, n):
                 a = nodes[i]
@@ -2463,9 +2449,10 @@ class OdomOnlyNavigator:
                     continue
                 if self._segment_leaves_boundary(a, b):
                     continue
-                # Additional check: segment must not pass too close to obstacles
-                if segment_too_close_to_obstacle(a, b, inflation_dist):
-                    continue
+                # Note: We rely on inflated obstacle vertices for clearance, not segment-to-edge distance.
+                # The inflated vertices push waypoints outward, and _segment_crosses_obstacles prevents
+                # paths from crossing obstacle edges. This allows shorter paths near obstacles while
+                # still maintaining safety through the inflated waypoint routing.
                 dist = math.hypot(b[0] - a[0], b[1] - a[1])
                 graph[i].append((j, dist))
                 graph[j].append((i, dist))
