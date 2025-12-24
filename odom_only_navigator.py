@@ -3018,10 +3018,19 @@ class OdomOnlyNavigator:
                     escaped = True
                 
                 if escaped:
-                    # After escape, try a SHORT forward move (LIDAR-only, ignore static check)
+                    # After escape, try a SHORT forward move
                     # This implements zigzag skirting: sidestep -> short forward -> continue
                     short_step = min(0.30, step, remaining)
                     pose = self._get_pose()
+                    
+                    # CRITICAL: Check static obstacles first, THEN LIDAR
+                    # The robot may have escaped into a position near a static obstacle
+                    if not self._step_static_clear(pose, heading_world, short_step):
+                        self.logger.info(
+                            "Zigzag skirting: static obstacle blocks forward at heading=%.1f° step=%.2fm -> replan",
+                            heading_world, short_step
+                        )
+                        return False  # Replan from new position
                     
                     # Check LIDAR clearance for short forward step
                     fwd_clear = self._heading_clearance(
