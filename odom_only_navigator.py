@@ -2986,13 +2986,26 @@ class OdomOnlyNavigator:
             step = min(remaining, MAX_MOVE_COMMAND_M)
             
             # Check static obstacles before moving - robot may be in new position after escape
+            # CRITICAL: Check with ACTUAL robot heading, not desired heading!
+            # The robot's heading may differ from heading_world due to rotation tolerance
             pose = self._get_pose()
-            if not self._step_static_clear(pose, heading_world, step):
+            actual_heading = pose['heading_deg']
+            
+            # Check if the actual heading path is clear (this is what the robot will actually travel)
+            if not self._step_static_clear(pose, actual_heading, step):
                 self.logger.info(
-                    "Static obstacle blocks segment from (%.2f, %.2f) heading=%.1f° step=%.2f -> replan",
-                    pose['x'], pose['y'], heading_world, step
+                    "Static obstacle blocks segment from (%.2f, %.2f) at ACTUAL heading=%.1f° step=%.2f (desired=%.1f°) -> replan",
+                    pose['x'], pose['y'], actual_heading, step, heading_world
                 )
                 return False
+            
+            # Also log if there's a significant heading difference that could cause issues
+            heading_error = abs(((actual_heading - heading_world + 180) % 360) - 180)
+            if heading_error > 10.0:
+                self.logger.warning(
+                    "Large heading error: actual=%.1f° vs desired=%.1f° (error=%.1f°). Path may deviate.",
+                    actual_heading, heading_world, heading_error
+                )
             
             if self._segment_blocked_by_lidar(heading_world, step):
                 # Try escape maneuvers to clear the blockage
@@ -3538,13 +3551,14 @@ class OdomOnlyNavigator:
             return True
         
         # Case 3: Re-entering boundary - start outside, end inside
-        # BLOCK: Robot should not be outside in the first place. Force replan.
+        # ALLOW: Robot may have drifted outside due to rotation tolerance or drift.
+        # The actual heading check should prevent this, but if it happens, allow recovery.
         if not inside_start and inside_end:
             self.logger.warning(
-                "Segment %s -> %s blocked: start is OUTSIDE boundary (robot drifted?). Force replan.",
+                "Segment %s -> %s re-enters boundary (robot drifted outside). Allowing recovery.",
                 start, end
             )
-            return True
+            return False
         
         # Case 4: Normal movement inside boundary
         self.logger.debug(

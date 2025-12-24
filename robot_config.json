@@ -68,6 +68,7 @@
         "_usage": "scale = correction factor, drift = expected x/y movement during rotation",
         "_note": "TEMPORARY: Quantization is executor-level. Phase 2 moves to planner.",
         "allowed_angles": [
+            15,
             30,
             45,
             60,
@@ -76,7 +77,14 @@
             150,
             180
         ],
-        "min_angle_threshold_deg": 15,
+        "min_angle_threshold_deg": 10,
+        "15": {
+            "scale": 1.15,
+            "min_duty_rotate": 0.58,
+            "angular_k": 0.56,
+            "drift_x_m": 0.012,
+            "drift_y_m": 0.0
+        },
         "30": {
             "scale": 1.083,
             "min_duty_rotate": 0.56,
