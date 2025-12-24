@@ -3537,13 +3537,14 @@ class OdomOnlyNavigator:
             )
             return True
         
-        # Case 3: Re-entering boundary (good) - start outside, end inside
+        # Case 3: Re-entering boundary - start outside, end inside
+        # BLOCK: Robot should not be outside in the first place. Force replan.
         if not inside_start and inside_end:
-            self.logger.info(
-                "Segment %s -> %s re-enters boundary: start outside, end inside. Allowing.",
+            self.logger.warning(
+                "Segment %s -> %s blocked: start is OUTSIDE boundary (robot drifted?). Force replan.",
                 start, end
             )
-            return False
+            return True
         
         # Case 4: Normal movement inside boundary
         self.logger.debug(
