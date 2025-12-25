@@ -79,16 +79,16 @@
         ],
         "min_angle_threshold_deg": 10,
         "15": {
-            "scale": 1.15,
-            "min_duty_rotate": 0.58,
-            "angular_k": 0.56,
+            "scale": 1.0700,
+            "min_duty_rotate": 0.8,
+            "angular_k": 0.8,
             "drift_x_m": 0.012,
             "drift_y_m": 0.0
         },
         "30": {
-            "scale": 1.083,
-            "min_duty_rotate": 0.56,
-            "angular_k": 0.56,
+            "scale": 0.98,
+            "min_duty_rotate": 0.6,
+            "angular_k": 0.6,
             "drift_x_m": 0.018,
             "drift_y_m": 0.0
         },
@@ -100,7 +100,7 @@
             "drift_y_m": 0.0
         },
         "60": {
-            "scale": 0.956,
+            "scale": 0.966,
             "min_duty_rotate": 0.56,
             "angular_k": 0.56,
             "drift_x_m": 0.004,
@@ -114,7 +114,7 @@
             "drift_y_m": 0.0
         },
         "120": {
-            "scale": 0.949,
+            "scale": 0.969,
             "min_duty_rotate": 0.56,
             "angular_k": 0.56,
             "drift_x_m": 0.010,
@@ -156,7 +156,7 @@
         "move_timeout": 20000,
         "rotate_tol_dist": 0.01,
         "rotate_tol_angle": 0.087,
-        "rotate_timeout": 10000,
+        "rotate_timeout": 5000,
         "move_dist_tol_dist": 0.01,
         "move_dist_tol_angle": 0.05,
         "move_dist_timeout": 10000,
